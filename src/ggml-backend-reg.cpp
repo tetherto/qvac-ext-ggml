@@ -580,6 +580,7 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
             // Try loading backend with just the library name, leave to dlopen path resolution.
             fs::path     filename     = backend_filename_prefix().native() + loopNamePath.native() +
                                 backend_filename_extension().native();
+            GGML_LOG_INFO("%s: trying to load %s\n", __func__, path_str(filename).c_str());
             tryEntryWithScore(filename, 1+scoreOffset);
         }
     }
