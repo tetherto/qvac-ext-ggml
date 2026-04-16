@@ -458,9 +458,9 @@ static fs::path get_executable_path() {
 
 static fs::path backend_filename_prefix() {
 #ifdef _WIN32
-    return fs::u8path("qvac-ggml-");
+    return fs::u8path("qvac-diffusion-ggml-");
 #else
-    return fs::u8path("libqvac-ggml-");
+    return fs::u8path("libqvac-diffusion-ggml-");
 #endif
 }
 

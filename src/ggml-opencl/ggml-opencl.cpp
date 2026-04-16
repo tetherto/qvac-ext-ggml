@@ -4607,6 +4607,9 @@ static ggml_backend_i ggml_backend_opencl_i = {
 
 ggml_backend_t ggml_backend_opencl_init(void) {
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_opencl_reg(), 0);
+    if (!dev) {
+        return nullptr;
+    }
     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(dev);
 
     ggml_backend_t backend = new ggml_backend {
@@ -6646,7 +6649,11 @@ static size_t ggml_backend_opencl_reg_device_count(ggml_backend_reg_t reg) {
 }
 
 static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t reg, size_t index) {
-    GGML_ASSERT(index < ggml_backend_opencl_reg_device_count(reg));
+    size_t n = ggml_backend_opencl_reg_device_count(reg);
+    if (n == 0) {
+        return nullptr;
+    }
+    GGML_ASSERT(index < n);
 
     return &g_ggml_backend_opencl_devices[index];
 
