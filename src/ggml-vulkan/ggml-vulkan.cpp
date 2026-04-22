@@ -8672,6 +8672,10 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
 static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+        // KHR coopmat1 F32 conversion is unreliable on Mali; force F16 inputs.
+        if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+            return nullptr;
+        }
         if (ctx->device->coopmat_f32_support_16x16x16_f32acc) {
             assert(ctx->device->coopmat_support);
             return ctx->device->pipeline_matmul_f32_cm1;
@@ -9881,6 +9885,11 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         }
         return aligned ? mmp->a_s : mmp->s;
     }
+    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+        if (src0_type == GGML_TYPE_F16) {
+            return aligned ? mmp->a_l : mmp->l;
+        }
+    }
 
     if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
         return aligned ? mmp->a_s : mmp->s;
@@ -10591,6 +10600,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
+    // Mali KHR_coopmat1 workaround: F16 x F16 path is the only safe coopmat path.
+    // Force both inputs to be dequantized/casted to F16.
+    const bool is_tq = src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0;
+    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq) {
+        y_f32_kernel = false;
+        quantize_y = false;
+    }
+
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
 
@@ -10602,6 +10619,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
+
+    if (src0->type == GGML_TYPE_F32 && ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+        qx_needs_dequant = true;
+    }
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
