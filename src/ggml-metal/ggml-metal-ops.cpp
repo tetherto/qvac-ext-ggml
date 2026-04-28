@@ -464,6 +464,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_im2col_3d(ctx, idx);
             } break;
+        case GGML_OP_DIAG_MASK_INF:
+            {
+                n_fuse = ggml_metal_op_diag_mask_inf(ctx, idx);
+            } break;
         default:
             {
                 GGML_LOG_ERROR("%s: error: node %3d, op = %8s not implemented\n", __func__, idx, ggml_op_name(node->op));
@@ -4280,6 +4284,38 @@ int ggml_metal_op_im2col_3d(ggml_metal_op_t ctx, int idx) {
 
     const uint64_t total = (uint64_t) args.N * args.OD * args.OH * args.OW;
     ggml_metal_encoder_dispatch_threadgroups(enc, total, 1, 1, 1, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_diag_mask_inf(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * src0 = op->src[0];
+
+    const int64_t n_past = (int64_t)((int32_t *) op->op_params)[0];
+
+    ggml_metal_kargs_diag_mask_inf args = {
+        /*.n_past =*/ (uint64_t)n_past,
+        /*.ne0    =*/ (uint64_t)src0->ne[0],
+        /*.ne1    =*/ (uint64_t)src0->ne[1],
+        /*.ne2    =*/ (uint64_t)src0->ne[2],
+        /*.ne3    =*/ (uint64_t)src0->ne[3],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_diag_mask_inf(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src0), 1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   2);
+
+    // Parallelize: dispatch over (ne0, ne1, ne2*ne3)
+    const int64_t total_z = (int64_t) src0->ne[2] * src0->ne[3];
+    ggml_metal_encoder_dispatch_threadgroups(enc, src0->ne[0], src0->ne[1], total_z, 1, 1, 1);
 
     return 1;
 }
