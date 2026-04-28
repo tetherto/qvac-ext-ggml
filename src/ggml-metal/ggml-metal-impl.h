@@ -955,6 +955,14 @@ typedef struct {
 } ggml_metal_kargs_opt_step_sgd;
 
 typedef struct {
+    uint64_t n_past;
+    uint64_t ne0;
+    uint64_t ne1;
+    uint64_t ne2;
+    uint64_t ne3;
+} ggml_metal_kargs_diag_mask_inf;
+
+typedef struct {
     uint32_t s0;
     uint32_t s1;
     uint32_t s2;

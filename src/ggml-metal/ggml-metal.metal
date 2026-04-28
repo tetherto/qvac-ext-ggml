@@ -10166,3 +10166,29 @@ kernel void kernel_op_im2col_3d_f16(
         }
     }
 }
+
+kernel void kernel_op_diag_mask_inf_f32(
+    constant ggml_metal_kargs_diag_mask_inf & args,
+    device const float * src0,
+    device float * dst,
+    uint3 tgpig[[threadgroup_position_in_grid]]
+) {
+    const uint64_t i0 = tgpig.x;
+    const uint64_t i1 = tgpig.y;
+    const uint64_t i23 = tgpig.z;
+
+    if (i0 >= args.ne0 || i1 >= args.ne1) {
+        return;
+    }
+
+    const uint64_t i2 = i23 % args.ne2;
+    const uint64_t i3 = i23 / args.ne2;
+
+    const uint64_t idx = ((i3 * args.ne2 + i2) * args.ne1 + i1) * args.ne0 + i0;
+
+    float val = src0[idx];
+    if (i0 > args.n_past + i1) {
+        val = -INFINITY;
+    }
+    dst[idx] = val;
+}
