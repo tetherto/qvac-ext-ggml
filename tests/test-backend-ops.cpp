@@ -7172,6 +7172,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // negative case: F16 input must be rejected by backends that require F32 input (e.g. Metal)
+    test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_F32));
     for (int s0 : {1, 3}) {
         for (int s1 : {1, 3}) {
             for (int s2 : {1, 3}) {
