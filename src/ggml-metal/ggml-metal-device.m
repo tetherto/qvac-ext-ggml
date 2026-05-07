@@ -1491,7 +1491,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction;
         case GGML_OP_IM2COL_3D:
             return op->src[1]->type == GGML_TYPE_F32 &&
-                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                   op->src[1]->nb[0] == sizeof(float) &&
+                   (op->type == GGML_TYPE_F32 ||
+                    (op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16));
         default:
             return false;
     }
