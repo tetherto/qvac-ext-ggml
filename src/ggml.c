@@ -1026,6 +1026,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOFT_MAX_BACK",
     "ROPE",
     "ROPE_BACK",
+    "ROPE_FLUX",
     "CLAMP",
     "CONV_TRANSPOSE_1D",
     "IM2COL",
@@ -1136,6 +1137,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "soft_max_back(x)",
     "rope(x)",
     "rope_back(x)",
+    "rope_flux(x)",
     "clamp(x)",
     "conv_transpose_1d(x)",
     "im2col(x)",
@@ -4330,6 +4332,33 @@ struct ggml_tensor * ggml_rope_custom_inplace(
 // `corr_dim(n_rot) = n_dims * log(max_pos_emb / (n_rot * 2pi)) / (2 * log(base))`
 static float ggml_rope_yarn_corr_dim(int n_dims, int n_ctx_orig, float n_rot, float base) {
     return n_dims * logf(n_ctx_orig / (n_rot * 2 * (float)M_PI)) / (2 * logf(base));
+}
+
+struct ggml_tensor * ggml_rope_flux(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    // a: [d_head, n_head, L, N]
+    // b: [2, 2, d_head/2, L] (precomputed PE), or NULL for permute-only (no rotation)
+    // result: [d_head, L, N*n_head]
+    if (b != NULL) {
+        GGML_ASSERT(a->ne[0] == 2 * b->ne[2]); // d_head == 2 * (d_head/2)
+        GGML_ASSERT(a->ne[2] == b->ne[3]);     // L matches
+    }
+
+    const int64_t d_head = a->ne[0];
+    const int64_t n_head = a->ne[1];
+    const int64_t L      = a->ne[2];
+    const int64_t N      = a->ne[3];
+
+    const int64_t ne[4] = { d_head, L, N * n_head, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
+
+    result->op     = GGML_OP_ROPE_FLUX;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
 }
 
 void ggml_rope_yarn_corr_dims(
