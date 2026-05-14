@@ -5844,95 +5844,244 @@ template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
 //template [[host_name("kernel_im2col_ext_f32")]] kernel im2col_ext_t kernel_im2col_ext<float>;
 //template [[host_name("kernel_im2col_ext_f16")]] kernel im2col_ext_t kernel_im2col_ext<half>;
 
+// Fused Flux RoPE: applies interleaved rotary embedding and permutes output layout in one pass.
+// Input x:   [d_head, n_head, L, N] (may be non-contiguous)
+// Input pe:  [2, 2, d_head/2, L]    (precomputed [[cos,-sin],[sin,cos]])
+// Output:    [d_head, L, N*n_head]  (contiguous, ready for flash attention)
+kernel void kernel_rope_flux(
+        constant ggml_metal_kargs_rope_flux & args,
+        device const char * src0,
+        device const char * src1,
+        device       float * dst,
+        uint tid [[thread_position_in_grid]]) {
+
+    const int d_head = args.d_head;
+    const int n_head = args.n_head;
+    const int L      = args.L;
+    const int N      = args.N;
+
+    const int total = d_head * L * N * n_head;
+    if ((int)tid >= total) return;
+
+    const int d  = tid % d_head;
+    const int l  = (tid / d_head) % L;
+    const int bh = tid / (d_head * L);
+    const int h  = bh % n_head;
+    const int n  = bh / n_head;
+
+    const int pair = d / 2;
+
+    const float x_even = *(device const float *)(src0 + n*args.nb03 + l*args.nb02 + h*args.nb01 + (2*pair)  *args.nb00);
+    const float x_odd  = *(device const float *)(src0 + n*args.nb03 + l*args.nb02 + h*args.nb01 + (2*pair+1)*args.nb00);
+
+    const int comp = d % 2;
+    const float pe_col0 = *(device const float *)(src1 + l*args.pe_nb3 + pair*args.pe_nb2 + comp*args.pe_nb1 + 0*args.pe_nb0);
+    const float pe_col1 = *(device const float *)(src1 + l*args.pe_nb3 + pair*args.pe_nb2 + comp*args.pe_nb1 + 1*args.pe_nb0);
+
+    dst[bh * L * d_head + l * d_head + d] = x_even * pe_col0 + x_odd * pe_col1;
+}
+
+// Fused permute(0,2,1,3)+cont: transposes dims 1 and 2 and produces contiguous output.
+// Input:  [ne0, ne1, ne2, ne3] (may be non-contiguous)
+// Output: [ne0, ne2, ne1*ne3]  (contiguous)
+kernel void kernel_permute_cont_021(
+        constant ggml_metal_kargs_rope_flux & args,
+        device const char * src0,
+        device       float * dst,
+        uint tid [[thread_position_in_grid]]) {
+
+    const int ne0 = args.d_head;
+    const int ne1 = args.n_head;
+    const int ne2 = args.L;
+    const int ne3 = args.N;
+
+    const int total = ne0 * ne1 * ne2 * ne3;
+    if ((int)tid >= total) return;
+
+    const int i0 = tid % ne0;
+    const int i2 = (tid / ne0) % ne2;
+    const int bh = tid / (ne0 * ne2);
+    const int i1 = bh % ne1;
+    const int i3 = bh / ne1;
+
+    const float val = *(device const float *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + i0*args.nb00);
+
+    dst[bh * ne2 * ne0 + i2 * ne0 + i0] = val;
+}
+
+// Implicit GEMM conv2d using simdgroup matrix operations.
+//
+// C[M,N] = A[M,K] * B[K,N] where M=OH*OW, N=OC, K=IC*KH*KW.
+// A is implicit im2col (indices computed on the fly), B is weights.
+//
+// 64×32 output tile, 8 simdgroups each owning 4 accumulators (8×32 strip).
+// Half-precision loads, float accumulators.
+// Weight loading exploits contiguity (single offset, no index decomposition).
+// A-tile loading precomputes (oh,ow) per row, uses incremental k decomposition.
+
+#define CONV2D_GEMM_M 64
+#define CONV2D_GEMM_N 64
+#define CONV2D_GEMM_K 32
+
 template <typename TK>
 kernel void kernel_conv_2d(
         constant ggml_metal_kargs_conv_2d & args,
         device const char * weights,
         device const char * src,
         device       char * dst,
+        threadgroup char * shared_mem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]],
-        uint3   tpitg[[thread_position_in_threadgroup]],
-        uint3     ntg[[threads_per_threadgroup]]) {
+        uint    tiisg[[thread_index_in_simdgroup]],
+        uint    sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    const uint threads_per_tg = ntg.x * ntg.y * ntg.z;
-    const uint tg_index = (tgpig.z * tgpg.y + tgpig.y) * tgpg.x + tgpig.x;
-    const uint local_thread = tpitg.z * (ntg.x * ntg.y) + tpitg.y * ntg.x + tpitg.x;
-    const uint thread_index = tg_index * threads_per_tg + local_thread;
-    const uint64_t total_threads = (uint64_t) threads_per_tg * tgpg.x * tgpg.y * tgpg.z;
-    const uint64_t total_outputs = (uint64_t) args.N * args.OC * args.OH * args.OW;
+    const int M   = args.OH * args.OW;
+    const int N   = args.OC;
+    const int KHW = args.KH * args.KW;
+    const int K   = args.IC * KHW;
 
-    for (uint64_t index = thread_index; index < total_outputs; index += total_threads) {
-        uint64_t tmp = index;
+    const int n_start = (int)tgpig.x * CONV2D_GEMM_N;
+    const int m_start = (int)tgpig.y * CONV2D_GEMM_M;
+    const int batch   = (int)tgpig.z;
 
-        const int32_t ow = tmp % args.OW; tmp /= args.OW;
-        const int32_t oh = tmp % args.OH; tmp /= args.OH;
-        const int32_t oc = tmp % args.OC; tmp /= args.OC;
-        const int32_t  n = tmp;
+    if (m_start >= M || n_start >= N) return;
 
-        float acc = 0.0f;
+    const uint64_t src_base = (uint64_t)batch * args.nb13;
+    const int lid = sgitg * 32 + tiisg;
 
-        const int32_t base_x = ow*args.s0 - args.p0;
-        const int32_t base_y = oh*args.s1 - args.p1;
+    // Each of 8 simdgroups owns one 8-row strip across all 64 N columns (8 sub-tiles).
+    const int sg_m = sgitg * 8;
 
-        int32_t ky_start = 0;
-        if (base_y < 0) {
-            ky_start = (-base_y + args.d1 - 1)/args.d1;
-        }
-        int32_t ky_end = args.KH;
-        const int32_t y_max = args.IH - 1 - base_y;
-        if (y_max < 0) {
-            ky_end = ky_start;
-        } else if (base_y + (args.KH - 1)*args.d1 >= args.IH) {
-            ky_end = min(ky_end, y_max/args.d1 + 1);
-        }
+    simdgroup_float8x8 C[8];
+    for (int i = 0; i < 8; i++) {
+        C[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
 
-        int32_t kx_start = 0;
-        if (base_x < 0) {
-            kx_start = (-base_x + args.d0 - 1)/args.d0;
-        }
-        int32_t kx_end = args.KW;
-        const int32_t x_max = args.IW - 1 - base_x;
-        if (x_max < 0) {
-            kx_end = kx_start;
-        } else if (base_x + (args.KW - 1)*args.d0 >= args.IW) {
-            kx_end = min(kx_end, x_max/args.d0 + 1);
-        }
+    threadgroup half * sa = (threadgroup half *)shared_mem;
+    threadgroup half * sb = sa + CONV2D_GEMM_M * CONV2D_GEMM_K;
 
-        if (ky_start < ky_end && kx_start < kx_end) {
-            const uint64_t src_base_n = (uint64_t) n  * args.nb13;
-            const uint64_t w_base_oc  = (uint64_t) oc * args.nb03;
+    // A-tile loading: 256 threads cover 64 rows × 32 cols = 2048 elements (8 per thread).
+    // Assign threads to rows so (oh,ow) is computed once and reused across k elements.
+    // 256 threads / 64 rows = 4 threads per row, each handles 8 consecutive k elements.
+    const int a_row    = lid / 4;           // 0..63
+    const int a_k_base = (lid % 4) * 8;    // 0, 8, 16, 24
+    const int a_m      = m_start + a_row;
+    const int a_oh     = a_m < M ? (a_m / args.OW) : 0;
+    const int a_ow     = a_m < M ? (a_m - a_oh * args.OW) : 0;
+    const int a_by     = a_oh * args.s1 - args.p1;
+    const int a_bx     = a_ow * args.s0 - args.p0;
 
-            for (int32_t ic = 0; ic < args.IC; ++ic) {
-                const uint64_t src_base_nc = src_base_n + (uint64_t) ic * args.nb12;
-                const uint64_t w_base_ocic = w_base_oc  + (uint64_t) ic * args.nb02;
+    // Precompute src offset for 1×1 fast path (no padding, no kernel spatial)
+    const uint64_t a_src_spatial = src_base
+        + (uint64_t)a_oh * args.nb11
+        + (uint64_t)a_ow * args.nb10;
 
-                for (int32_t ky = ky_start; ky < ky_end; ++ky) {
-                    const int32_t iy = base_y + ky*args.d1;
-                    const uint64_t src_base_row = src_base_nc + (uint64_t) iy * args.nb11;
-                    const uint64_t w_base_row   = w_base_ocic + (uint64_t) ky * args.nb01;
+    for (int k_start = 0; k_start < K; k_start += CONV2D_GEMM_K) {
+        // --- Load A tile: implicit im2col ---
+        if (KHW == 1) {
+            // Fast path for 1×1 convolutions: k maps directly to ic,
+            // no kernel spatial dims, no padding, no bounds checks needed.
+            for (int dk = 0; dk < 8; ++dk) {
+                const int ic = k_start + a_k_base + dk;
+                half val = 0;
+                if (a_m < M && ic < args.IC) {
+                    val = (half)(*(device const float *)(src + a_src_spatial
+                        + (uint64_t)ic * args.nb12));
+                }
+                sa[a_row * CONV2D_GEMM_K + a_k_base + dk] = val;
+            }
+        } else {
+            // General path with incremental (ic, ky, kx) decomposition
+            const int k0 = k_start + a_k_base;
+            int ic  = k0 / KHW;
+            int rem = k0 - ic * KHW;
+            int ky  = rem / args.KW;
+            int kx  = rem - ky * args.KW;
 
-                    for (int32_t kx = kx_start; kx < kx_end; ++kx) {
-                        const int32_t ix = base_x + kx*args.d0;
-                        const uint64_t src_offs = src_base_row + (uint64_t) ix * args.nb10;
-                        const uint64_t w_offs   = w_base_row   + (uint64_t) kx * args.nb00;
+            for (int dk = 0; dk < 8; ++dk) {
+                const int k = k0 + dk;
+                half val = 0;
 
-                        const float x = *(device const float *)(src + src_offs);
-                        const float w = (float) (*(device const TK *)(weights + w_offs));
+                if (a_m < M && k < K) {
+                    const int iy = a_by + ky * args.d1;
+                    const int ix = a_bx + kx * args.d0;
 
-                        acc += x * w;
+                    if (iy >= 0 && iy < args.IH && ix >= 0 && ix < args.IW) {
+                        val = (half)(*(device const float *)(src + src_base
+                            + (uint64_t)ic * args.nb12
+                            + (uint64_t)iy * args.nb11
+                            + (uint64_t)ix * args.nb10));
+                    }
+                }
+                sa[a_row * CONV2D_GEMM_K + a_k_base + dk] = val;
+
+                if (++kx >= args.KW) {
+                    kx = 0;
+                    if (++ky >= args.KH) {
+                        ky = 0;
+                        ++ic;
                     }
                 }
             }
         }
 
-        const uint64_t dst_offs =
-            (uint64_t) n  * args.nb3 +
-            (uint64_t) oc * args.nb2 +
-            (uint64_t) oh * args.nb1 +
-            (uint64_t) ow * args.nb0;
+        // --- Load B tile: weights are contiguous, no index decomposition needed ---
+        for (int i = lid; i < CONV2D_GEMM_K * CONV2D_GEMM_N; i += 256) {
+            const int kl = i / CONV2D_GEMM_N;
+            const int nl = i % CONV2D_GEMM_N;
+            const int k  = k_start + kl;
+            const int oc = n_start + nl;
 
-        *(device float *)(dst + dst_offs) = acc;
+            half val = 0;
+            if (k < K && oc < N) {
+                val = (half)(*(device const TK *)(weights
+                    + (uint64_t)oc * args.nb03
+                    + (uint64_t)k  * args.nb00));
+            }
+            sb[i] = val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- GEMM: each simdgroup loads A once, multiplies with 8 B sub-tiles ---
+        for (int kk = 0; kk < CONV2D_GEMM_K; kk += 8) {
+            simdgroup_half8x8 A;
+            simdgroup_load(A, sa + sg_m * CONV2D_GEMM_K + kk, CONV2D_GEMM_K);
+
+            for (int ni = 0; ni < 8; ni++) {
+                simdgroup_half8x8 B;
+                simdgroup_load(B, sb + kk * CONV2D_GEMM_N + ni * 8, CONV2D_GEMM_N);
+                simdgroup_multiply_accumulate(C[ni], A, B, C[ni]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Store accumulators and write to global ---
+    // Each simdgroup writes to non-overlapping rows [sg_m..sg_m+7], no barrier needed.
+    threadgroup float * so = (threadgroup float *)shared_mem;
+
+    for (int ni = 0; ni < 8; ni++) {
+        simdgroup_store(C[ni], so + sg_m * CONV2D_GEMM_N + ni * 8, CONV2D_GEMM_N);
+    }
+
+    // Each simdgroup's 32 threads write their own 8×64 block (16 elements per thread)
+    for (int i = tiisg; i < 8 * CONV2D_GEMM_N; i += 32) {
+        const int ml = sg_m + i / CONV2D_GEMM_N;
+        const int nl = i % CONV2D_GEMM_N;
+        const int m  = m_start + ml;
+        const int oc = n_start + nl;
+
+        if (m < M && oc < N) {
+            const int oh = m / args.OW;
+            const int ow = m - oh * args.OW;
+
+            *(device float *)(dst
+                + (uint64_t)batch * args.nb3
+                + (uint64_t)oc * args.nb2
+                + (uint64_t)oh * args.nb1
+                + (uint64_t)ow * args.nb0) = so[ml * CONV2D_GEMM_N + nl];
+        }
     }
 }
 
@@ -5942,10 +6091,10 @@ kernel void kernel_conv_2d<float>(
         device const char * weights,
         device const char * src,
         device       char * dst,
+        threadgroup char * shared_mem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]],
-        uint3   tpitg[[thread_position_in_threadgroup]],
-        uint3     ntg[[threads_per_threadgroup]]);
+        uint    tiisg[[thread_index_in_simdgroup]],
+        uint    sgitg[[simdgroup_index_in_threadgroup]]);
 
 template [[host_name("kernel_conv_2d_f16_f32")]]
 kernel void kernel_conv_2d<half>(
@@ -5953,10 +6102,10 @@ kernel void kernel_conv_2d<half>(
         device const char * weights,
         device const char * src,
         device       char * dst,
+        threadgroup char * shared_mem [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]],
-        uint3   tpitg[[thread_position_in_threadgroup]],
-        uint3     ntg[[threads_per_threadgroup]]);
+        uint    tiisg[[thread_index_in_simdgroup]],
+        uint    sgitg[[simdgroup_index_in_threadgroup]]);
 
 // Depthwise conv2d: each output channel reads ONLY its matching input channel
 // (no cross-channel mixing), so there is no inner IC loop and the kernel weight
@@ -7295,60 +7444,60 @@ void kernel_flash_attn_ext_impl(
             // this is compile-time check, so it does not have runtime overhead
             if (is_same<kd4x4_t, k4x4_t>::value) {
                 // we can read directly from global memory
-                device      const k_t * pk = (device const k_t *) (k + ic*args.nb11);
-                threadgroup const q_t * pq = sq;
-                threadgroup       s_t * ps = ss;
-
-                pk += sgitg*(8*NS10);
-                ps += sgitg*(8*1);
-
                 static_assert((C/8) % NSG == 0, "");
-
                 constexpr short NC = (C/8)/NSG;
 
-                FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
-                    qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
+                for (short qb = 0; qb < Q; qb += 8) {
+                    device      const k_t * pk = (device const k_t *) (k + ic*args.nb11);
+                    threadgroup const q_t * pq = sq + qb*DK;
+                    threadgroup       s_t * ps = ss + qb*SH;
 
-                    if (DK % 16 != 0) {
-                        k8x8_t mk;
-                        q8x8_t mq;
+                    pk += sgitg*(8*NS10);
+                    ps += sgitg*(8*1);
 
-                        FOR_UNROLL (short i = 0; i < DK8; ++i) {
-                            simdgroup_barrier(mem_flags::mem_none);
+                    FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+                        qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
 
-                            simdgroup_load(mk, pk + 8*i, NS10, 0, true);
-                            simdgroup_load(mq, pq + 8*i, DK);
+                        if (DK % 16 != 0) {
+                            k8x8_t mk;
+                            q8x8_t mq;
 
-                            simdgroup_barrier(mem_flags::mem_none);
+                            FOR_UNROLL (short i = 0; i < DK8; ++i) {
+                                simdgroup_barrier(mem_flags::mem_none);
 
-                            simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                                simdgroup_load(mk, pk + 8*i, NS10, 0, true);
+                                simdgroup_load(mq, pq + 8*i, DK);
+
+                                simdgroup_barrier(mem_flags::mem_none);
+
+                                simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                            }
+                        } else {
+                            k8x8_t mk[2];
+                            q8x8_t mq[2];
+
+                            #pragma unroll (MIN(DK8/2, 4*NSG))
+                            for (short i = 0; i < DK8/2; ++i) {
+                                simdgroup_barrier(mem_flags::mem_none);
+
+                                simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
+                                simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
+
+                                simdgroup_load(mk[0], pk + 0*8 + 16*i, NS10, 0, true);
+                                simdgroup_load(mk[1], pk + 1*8 + 16*i, NS10, 0, true);
+
+                                simdgroup_barrier(mem_flags::mem_none);
+
+                                simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
+                                simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
+                            }
                         }
-                    } else {
-                        k8x8_t mk[2];
-                        q8x8_t mq[2];
 
-                        // note: too much unroll can tank the performance for large heads
-                        #pragma unroll (MIN(DK8/2, 4*NSG))
-                        for (short i = 0; i < DK8/2; ++i) {
-                            simdgroup_barrier(mem_flags::mem_none);
+                        simdgroup_store(mqk, ps, SH, 0, false);
 
-                            simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
-                            simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
-
-                            simdgroup_load(mk[0], pk + 0*8 + 16*i, NS10, 0, true);
-                            simdgroup_load(mk[1], pk + 1*8 + 16*i, NS10, 0, true);
-
-                            simdgroup_barrier(mem_flags::mem_none);
-
-                            simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
-                            simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
-                        }
+                        pk += 8*(NSG*NS10);
+                        ps += 8*(NSG);
                     }
-
-                    simdgroup_store(mqk, ps, SH, 0, false);
-
-                    pk += 8*(NSG*NS10);
-                    ps += 8*(NSG);
                 }
             } else {
                 // TODO: this is the quantized K cache branch - not optimized yet
@@ -7470,77 +7619,79 @@ void kernel_flash_attn_ext_impl(
 
                     constexpr short NO = PV8/NSG;
 
-                    o8x8_t lo[NO];
+                    for (short qb = 0; qb < Q; qb += 8) {
+                        o8x8_t lo[NO];
 
-                    {
-                        auto sot = so + 8*sgitg;
+                        {
+                            auto sot = so + qb*PV + 8*sgitg;
 
-                        FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
-                            simdgroup_load(lo[ii], sot, PV, 0, false);
+                            FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+                                simdgroup_load(lo[ii], sot, PV, 0, false);
 
-                            sot += 8*NSG;
-                        }
-                    }
-
-                    {
-                        device const v_t * pv = (device const v_t *) (v + ic*args.nb21);
-
-                        pv += 8*sgitg;
-
-                        if (DV <= 64) {
-                            FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
-                                s8x8_t vs;
-                                simdgroup_load(vs, ss + 8*cc, SH, 0, false);
-
-                                FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
-                                    v8x8_t mv[2];
-
-                                    simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
-                                    simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
-
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
-                                }
-
-                                pv  += 8*NS20;
-                            }
-                        } else {
-                            constexpr short NC = (C/8)/2;
-
-                            FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
-                                s8x8_t vs[2];
-
-                                simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
-                                simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
-
-                                FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
-                                    v8x8_t mv[4];
-
-                                    simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
-                                    simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
-
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
-                                }
-
-                                pv  += 2*8*NS20;
+                                sot += 8*NSG;
                             }
                         }
-                    }
 
-                    {
-                        auto sot = so + 8*sgitg;
+                        {
+                            device const v_t * pv = (device const v_t *) (v + ic*args.nb21);
 
-                        FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
-                            simdgroup_store(lo[ii], sot, PV, 0, false);
+                            pv += 8*sgitg;
 
-                            sot += 8*NSG;
+                            if (DV <= 64) {
+                                FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+                                    s8x8_t vs;
+                                    simdgroup_load(vs, ss + qb*SH + 8*cc, SH, 0, false);
+
+                                    FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
+                                        v8x8_t mv[2];
+
+                                        simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
+                                        simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
+
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
+                                    }
+
+                                    pv  += 8*NS20;
+                                }
+                            } else {
+                                constexpr short NC = (C/8)/2;
+
+                                FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+                                    s8x8_t vs[2];
+
+                                    simdgroup_load(vs[0], ss + qb*SH + 16*cc + 0, SH, 0, false);
+                                    simdgroup_load(vs[1], ss + qb*SH + 16*cc + 8, SH, 0, false);
+
+                                    FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
+                                        v8x8_t mv[4];
+
+                                        simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+                                        simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
+                                        simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
+                                    }
+
+                                    pv  += 2*8*NS20;
+                                }
+                            }
                         }
+
+                        {
+                            auto sot = so + qb*PV + 8*sgitg;
+
+                            FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+                                simdgroup_store(lo[ii], sot, PV, 0, false);
+
+                                sot += 8*NSG;
+                            }
                     }
+                    } // qb loop
                 } else {
                     // TODO: this is the quantized V cache branch - not optimized yet
 
