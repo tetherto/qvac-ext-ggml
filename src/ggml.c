@@ -1087,7 +1087,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOFT_MAX_BACK",
     "ROPE",
     "ROPE_BACK",
-    "ROPE_FLUX",
     "CLAMP",
     "CONV_TRANSPOSE_1D",
     "IM2COL",
@@ -1142,6 +1141,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "ROPE_FLUX",
 };
 
 static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
@@ -1202,7 +1202,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "soft_max_back(x)",
     "rope(x)",
     "rope_back(x)",
-    "rope_flux(x)",
     "clamp(x)",
     "conv_transpose_1d(x)",
     "im2col(x)",
@@ -1257,6 +1256,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "rope_flux(x)",
 };
 
 static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
@@ -4446,7 +4446,14 @@ struct ggml_tensor * ggml_rope_flux(
     // a: [d_head, n_head, L, N]
     // b: [2, 2, d_head/2, L] (precomputed PE), or NULL for permute-only (no rotation)
     // result: [d_head, L, N*n_head]
+    GGML_ASSERT(a != NULL);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] > 0 && a->ne[1] > 0 && a->ne[2] > 0 && a->ne[3] > 0);
+    GGML_ASSERT(a->ne[0] % 2 == 0);
     if (b != NULL) {
+        GGML_ASSERT(b->type == GGML_TYPE_F32);
+        GGML_ASSERT(b->ne[0] == 2);
+        GGML_ASSERT(b->ne[1] == 2);
         GGML_ASSERT(a->ne[0] == 2 * b->ne[2]); // d_head == 2 * (d_head/2)
         GGML_ASSERT(a->ne[2] == b->ne[3]);     // L matches
     }
@@ -4455,6 +4462,8 @@ struct ggml_tensor * ggml_rope_flux(
     const int64_t n_head = a->ne[1];
     const int64_t L      = a->ne[2];
     const int64_t N      = a->ne[3];
+
+    GGML_ASSERT(n_head <= INT64_MAX / N);
 
     const int64_t ne[4] = { d_head, L, N * n_head, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
@@ -6925,6 +6934,10 @@ static void ggml_compute_backward(
             }
             GGML_ASSERT((!src2 || !src2_needs_grads) && "gradients for freq factors not implemented");
         } break;
+        case GGML_OP_ROPE_FLUX: {
+            GGML_ASSERT(!src0_needs_grads && "backward pass for rope_flux not implemented");
+            GGML_ASSERT((!src1 || !src1_needs_grads) && "gradients for rope_flux positional encoding not implemented");
+        } break;
         case GGML_OP_IM2COL: {
             if (src1_needs_grads) {
                 const int32_t s0    = ggml_get_op_params_i32(tensor, 0);
@@ -7215,6 +7228,7 @@ void ggml_build_backward_expand(
             case GGML_OP_GET_ROWS:      // row indices not differentiable
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
             case GGML_OP_ROPE:          // positions not differentiable
+            case GGML_OP_ROPE_FLUX:     // positional encoding not differentiable
                 ignore_src[1] = true;
                 break;
             case GGML_OP_SET_ROWS:
