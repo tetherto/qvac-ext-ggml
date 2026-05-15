@@ -4507,8 +4507,10 @@ kernel void kernel_rope_flux(
     const int L      = args.L;
     const int N      = args.N;
 
-    const int total = d_head * L * N * n_head;
-    if ((int)tid >= total) return;
+    if (d_head <= 0 || n_head <= 0 || L <= 0 || N <= 0) return;
+
+    const uint total = (uint)d_head * (uint)L * (uint)N * (uint)n_head;
+    if (tid >= total) return;
 
     const int d  = tid % d_head;
     const int l  = (tid / d_head) % L;
@@ -4542,8 +4544,10 @@ kernel void kernel_permute_cont_021(
     const int ne2 = args.L;
     const int ne3 = args.N;
 
-    const int total = ne0 * ne1 * ne2 * ne3;
-    if ((int)tid >= total) return;
+    if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0) return;
+
+    const uint total = (uint)ne0 * (uint)ne1 * (uint)ne2 * (uint)ne3;
+    if (tid >= total) return;
 
     const int i0 = tid % ne0;
     const int i2 = (tid / ne0) % ne2;
@@ -4617,16 +4621,17 @@ kernel void kernel_conv_2d(
     const int a_by     = a_oh * args.s1 - args.p1;
     const int a_bx     = a_ow * args.s0 - args.p0;
 
-    // Precompute src offset for 1×1 fast path (no padding, no kernel spatial)
+    const bool fast_1x1 = KHW == 1 && args.s0 == 1 && args.s1 == 1 && args.p0 == 0 && args.p1 == 0;
+
+    // Precompute src offset for the strict 1x1/no-padding/no-stride fast path.
     const uint64_t a_src_spatial = src_base
         + (uint64_t)a_oh * args.nb11
         + (uint64_t)a_ow * args.nb10;
 
     for (int k_start = 0; k_start < K; k_start += CONV2D_GEMM_K) {
         // --- Load A tile: implicit im2col ---
-        if (KHW == 1) {
-            // Fast path for 1×1 convolutions: k maps directly to ic,
-            // no kernel spatial dims, no padding, no bounds checks needed.
+        if (fast_1x1) {
+            // Fast path for 1x1 convolutions where output coordinates map directly to input coordinates.
             for (int dk = 0; dk < 8; ++dk) {
                 const int ic = k_start + a_k_base + dk;
                 half val = 0;

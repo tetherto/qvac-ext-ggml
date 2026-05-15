@@ -5840,6 +5840,93 @@ void ggml_compute_forward_rope_back(
     }
 }
 
+// ggml_compute_forward_rope_flux
+
+void ggml_compute_forward_rope_flux(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0 != NULL);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t d_head = src0->ne[0];
+    const int64_t n_head = src0->ne[1];
+    const int64_t L      = src0->ne[2];
+    const int64_t N      = src0->ne[3];
+
+    GGML_ASSERT(d_head > 0 && n_head > 0 && L > 0 && N > 0);
+    GGML_ASSERT(d_head % 2 == 0);
+
+    if (src1 != NULL) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->ne[0] == 2);
+        GGML_ASSERT(src1->ne[1] == 2);
+        GGML_ASSERT(src1->ne[2] == d_head / 2);
+        GGML_ASSERT(src1->ne[3] == L);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t total = ggml_nelements(dst);
+    const int64_t dr = (total + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, total);
+
+    float * dst_data = (float *) dst->data;
+    const char * src0_data = (const char *) src0->data;
+    const char * src1_data = src1 ? (const char *) src1->data : NULL;
+
+    for (int64_t tid = i0; tid < i1; ++tid) {
+        const int64_t d  = tid % d_head;
+        const int64_t l  = (tid / d_head) % L;
+        const int64_t bh = tid / (d_head * L);
+        const int64_t h  = bh % n_head;
+        const int64_t n  = bh / n_head;
+
+        if (src1_data == NULL) {
+            dst_data[tid] = *(const float *) (src0_data +
+                n * src0->nb[3] +
+                l * src0->nb[2] +
+                h * src0->nb[1] +
+                d * src0->nb[0]);
+            continue;
+        }
+
+        const int64_t pair = d / 2;
+        const int64_t comp = d % 2;
+
+        const float x_even = *(const float *) (src0_data +
+            n * src0->nb[3] +
+            l * src0->nb[2] +
+            h * src0->nb[1] +
+            (2 * pair) * src0->nb[0]);
+        const float x_odd = *(const float *) (src0_data +
+            n * src0->nb[3] +
+            l * src0->nb[2] +
+            h * src0->nb[1] +
+            (2 * pair + 1) * src0->nb[0]);
+
+        const float pe_col0 = *(const float *) (src1_data +
+            l * src1->nb[3] +
+            pair * src1->nb[2] +
+            comp * src1->nb[1] +
+            0 * src1->nb[0]);
+        const float pe_col1 = *(const float *) (src1_data +
+            l * src1->nb[3] +
+            pair * src1->nb[2] +
+            comp * src1->nb[1] +
+            1 * src1->nb[0]);
+
+        dst_data[tid] = x_even * pe_col0 + x_odd * pe_col1;
+    }
+}
+
 // ggml_compute_forward_conv_transpose_1d
 
 static void ggml_compute_forward_conv_transpose_1d_f16_f32(
