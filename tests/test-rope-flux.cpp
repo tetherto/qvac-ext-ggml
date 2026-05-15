@@ -61,11 +61,29 @@ static ggml_tensor * build_rope_old(ggml_context * ctx,
     return x_out;
 }
 
+static ggml_tensor * build_permute_old(ggml_context * ctx,
+                                        ggml_tensor * x,
+                                        ggml_tensor *) {
+    int64_t d_head = x->ne[0];
+    int64_t n_head = x->ne[1];
+    int64_t L      = x->ne[2];
+    int64_t N      = x->ne[3];
+
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+    return ggml_reshape_3d(ctx, x, d_head, L, n_head * N);
+}
+
 // Build the NEW fused graph
 static ggml_tensor * build_rope_fused(ggml_context * ctx,
                                        ggml_tensor * x,
                                        ggml_tensor * pe) {
     return ggml_rope_flux(ctx, x, pe);
+}
+
+static ggml_tensor * build_permute_fused(ggml_context * ctx,
+                                          ggml_tensor * x,
+                                          ggml_tensor *) {
+    return ggml_rope_flux(ctx, x, nullptr);
 }
 
 static float * run_graph(ggml_backend_t backend,
@@ -100,7 +118,9 @@ static float * run_graph(ggml_backend_t backend,
 
     // set input data
     ggml_backend_tensor_set(x_param, x_data, 0, ggml_nbytes(x_param));
-    ggml_backend_tensor_set(pe_param, pe_data, 0, ggml_nbytes(pe_param));
+    if (pe_param != nullptr) {
+        ggml_backend_tensor_set(pe_param, pe_data, 0, ggml_nbytes(pe_param));
+    }
 
     if (ggml_backend_is_cpu(backend)) {
         ggml_backend_cpu_set_n_threads(backend, 1);
@@ -117,6 +137,7 @@ static float * run_graph(ggml_backend_t backend,
     result = ggml_graph_get_tensor(gf, "result");
     size_t nbytes = ggml_nbytes(result);
     float * out = (float *)malloc(nbytes);
+    assert(out != nullptr);
     ggml_backend_tensor_get(result, out, 0, nbytes);
 
     printf("    time: %.2f ms, nodes: %d, output shape: [%lld, %lld, %lld]\n",
@@ -140,17 +161,21 @@ int main(void) {
     };
     int n_configs = sizeof(configs) / sizeof(configs[0]);
 
+    ggml_backend_t backend = nullptr;
 #ifdef GGML_USE_METAL
-    ggml_backend_t backend = ggml_backend_metal_init();
-    if (!backend) {
-        fprintf(stderr, "Metal init failed\n");
-        return 1;
+    backend = ggml_backend_metal_init();
+    if (backend) {
+        printf("Using Metal backend\n\n");
     }
-    printf("Using Metal backend\n\n");
-#else
-    printf("Metal not available, skipping test\n");
-    return 0;
 #endif
+    if (!backend) {
+        backend = ggml_backend_cpu_init();
+        if (!backend) {
+            fprintf(stderr, "Backend init failed\n");
+            return 1;
+        }
+        printf("Using CPU backend\n\n");
+    }
 
     int pass = 0, fail = 0;
 
@@ -262,6 +287,40 @@ int main(void) {
 
         free(old_out);
         free(new_out);
+
+        // compare permute-only path (b == NULL)
+        printf("  OLD permute-only:\n");
+        int old_perm_nodes = 0;
+        float * old_perm_out = run_graph(backend, x_param, nullptr, x_data.data(), nullptr,
+                                         build_permute_old, &old_perm_nodes);
+
+        printf("  NEW permute-only (fused):\n");
+        int new_perm_nodes = 0;
+        float * new_perm_out = run_graph(backend, x_param, nullptr, x_data.data(), nullptr,
+                                         build_permute_fused, &new_perm_nodes);
+
+        float perm_max_abs = 0.0f;
+        int perm_max_abs_idx = 0;
+        for (int i = 0; i < out_elems; i++) {
+            float diff = fabsf(old_perm_out[i] - new_perm_out[i]);
+            if (diff > perm_max_abs) {
+                perm_max_abs = diff;
+                perm_max_abs_idx = i;
+            }
+        }
+
+        bool perm_ok = perm_max_abs < 1e-6f;
+        printf("  PERMUTE COMPARE: max_abs=%.6f (at idx %d: old=%.6f new=%.6f) => %s\n",
+               perm_max_abs, perm_max_abs_idx,
+               old_perm_out[perm_max_abs_idx], new_perm_out[perm_max_abs_idx],
+               perm_ok ? "PASS" : "FAIL");
+        printf("  nodes: old=%d, new=%d (-%d)\n\n",
+               old_perm_nodes, new_perm_nodes, old_perm_nodes - new_perm_nodes);
+
+        if (perm_ok) pass++; else fail++;
+
+        free(old_perm_out);
+        free(new_perm_out);
         ggml_free(mctx);
         ggml_backend_buffer_free(buffer);
     }
