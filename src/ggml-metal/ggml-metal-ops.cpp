@@ -3614,11 +3614,31 @@ int ggml_metal_op_rope_flux(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    const int32_t d_head = op->src[0]->ne[0];
-    const int32_t n_head = op->src[0]->ne[1];
-    const int32_t L      = op->src[0]->ne[2];
-    const int32_t N      = op->src[0]->ne[3];
-    const bool    has_pe = op->src[1] != nullptr;
+    GGML_ASSERT(op->src[0] != nullptr);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+
+    const bool has_pe = op->src[1] != nullptr;
+    if (has_pe) {
+        GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+        GGML_ASSERT(op->src[1]->ne[0] == 2);
+        GGML_ASSERT(op->src[1]->ne[1] == 2);
+        GGML_ASSERT(op->src[0]->ne[0] == 2 * op->src[1]->ne[2]);
+        GGML_ASSERT(op->src[0]->ne[2] == op->src[1]->ne[3]);
+    }
+
+    auto to_i32_dim = [](int64_t dim) {
+        GGML_ASSERT(dim > 0);
+        GGML_ASSERT(dim <= std::numeric_limits<int32_t>::max());
+        return (int32_t) dim;
+    };
+
+    const int32_t d_head = to_i32_dim(op->src[0]->ne[0]);
+    const int32_t n_head = to_i32_dim(op->src[0]->ne[1]);
+    const int32_t L      = to_i32_dim(op->src[0]->ne[2]);
+    const int32_t N      = to_i32_dim(op->src[0]->ne[3]);
+    const int64_t total  = ggml_nelements(op);
+    GGML_ASSERT(total > 0);
+    GGML_ASSERT(total <= std::numeric_limits<int32_t>::max());
 
     ggml_metal_kargs_rope_flux args = {
         /*.d_head =*/ d_head,
@@ -3650,9 +3670,8 @@ int ggml_metal_op_rope_flux(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         2);
     }
 
-    const int total = d_head * L * N * n_head;
-    const int nth   = 256;
-    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1) / nth, 1, 1, nth, 1, 1);
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, ((int) total + nth - 1) / nth, 1, 1, nth, 1, 1);
 
     return 1;
 }

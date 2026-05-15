@@ -93,7 +93,12 @@ static bool run_test(const conv2d_test_case & tc) {
     size_t graph_buf_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
     std::vector<uint8_t> graph_buf(graph_buf_size);
 
-    auto build_graph = [&](bool direct) -> ggml_cgraph * {
+    struct graph_build {
+        ggml_context * ctx;
+        ggml_cgraph  * gf;
+    };
+
+    auto build_graph = [&](bool direct) -> graph_build {
         struct ggml_init_params gp = {
             /*.mem_size   =*/ graph_buf_size,
             /*.mem_buffer =*/ graph_buf.data(),
@@ -111,26 +116,26 @@ static bool run_test(const conv2d_test_case & tc) {
             ggml_set_name(result, "im2col");
         }
         ggml_build_forward_expand(gf, result);
-        ggml_free(ctx0);
-        return gf;
+        return { ctx0, gf };
     };
 
     auto run_graph = [&](bool direct) -> std::vector<float> {
-        struct ggml_cgraph * gf = build_graph(direct);
+        graph_build reserved = build_graph(direct);
         ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        ggml_gallocr_reserve(gallocr, gf);
+        ggml_gallocr_reserve(gallocr, reserved.gf);
+        ggml_free(reserved.ctx);
 
-        gf = build_graph(direct);
-        ggml_gallocr_alloc_graph(gallocr, gf);
+        graph_build compute = build_graph(direct);
+        ggml_gallocr_alloc_graph(gallocr, compute.gf);
 
         if (ggml_backend_is_cpu(backend)) {
             ggml_backend_cpu_set_n_threads(backend, 1);
         }
-        ggml_backend_graph_compute(backend, gf);
+        ggml_backend_graph_compute(backend, compute.gf);
 
         struct ggml_tensor * result = nullptr;
-        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-            struct ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int i = 0; i < ggml_graph_n_nodes(compute.gf); i++) {
+            struct ggml_tensor * node = ggml_graph_node(compute.gf, i);
             if (strcmp(ggml_get_name(node), direct ? "direct" : "im2col") == 0) {
                 result = node;
                 break;
@@ -141,6 +146,7 @@ static bool run_test(const conv2d_test_case & tc) {
         std::vector<float> data(ggml_nelements(result));
         ggml_backend_tensor_get(result, data.data(), 0, ggml_nbytes(result));
         ggml_gallocr_free(gallocr);
+        ggml_free(compute.ctx);
         return data;
     };
 
@@ -160,6 +166,12 @@ static bool run_test(const conv2d_test_case & tc) {
     float max_abs_err = 0.0f;
     float max_rel_err = 0.0f;
     int   worst_idx   = 0;
+    int   n_bad       = 0;
+
+    // Half intermediates are expected to differ from the im2col reference.
+    // Flag only elements that fail both an absolute and relative tolerance.
+    const float rel_tol = 0.005f;
+    const float abs_tol = 0.05f;
 
     for (int i = 0; i < n_out; i++) {
         float abs_err = fabsf(ref_data[i] - direct_data[i]);
@@ -173,22 +185,19 @@ static bool run_test(const conv2d_test_case & tc) {
         if (rel_err > max_rel_err) {
             max_rel_err = rel_err;
         }
+        if (abs_err > abs_tol && rel_err > rel_tol) {
+            n_bad++;
+        }
     }
 
-    // Half-precision intermediates can introduce rounding error proportional
-    // to the magnitude of the reduction (IC * KH * KW accumulations).
-    // Allow ~0.5% relative error to account for this.
-    const float rel_tol = 0.005f;
-    const float abs_tol = 0.5f;
-
-    bool pass = (max_rel_err < rel_tol) || (max_abs_err < abs_tol);
+    bool pass = n_bad == 0;
 
     if (pass) {
-        printf("\033[32mPASS\033[0m (max_abs=%.4f max_rel=%.4f%% n=%d)\n",
-               max_abs_err, max_rel_err * 100.0f, n_out);
+        printf("\033[32mPASS\033[0m (max_abs=%.4f max_rel=%.4f%% bad=%d/%d)\n",
+               max_abs_err, max_rel_err * 100.0f, n_bad, n_out);
     } else {
-        printf("\033[31mFAIL\033[0m (max_abs=%.4f max_rel=%.4f%% at [%d] ref=%.4f got=%.4f)\n",
-               max_abs_err, max_rel_err * 100.0f, worst_idx,
+        printf("\033[31mFAIL\033[0m (max_abs=%.4f max_rel=%.4f%% bad=%d/%d at [%d] ref=%.4f got=%.4f)\n",
+               max_abs_err, max_rel_err * 100.0f, n_bad, n_out, worst_idx,
                ref_data[worst_idx], direct_data[worst_idx]);
     }
 
@@ -210,6 +219,8 @@ int main(void) {
         // 1×1 convolution (channel projection in attention blocks)
         { "1x1 s1p0 IC=320 OC=320 64x64",    1,1,320,320,  64, 64, 1,  1,1, 0,0, 1,1 },
         { "1x1 s1p0 IC=640 OC=640 32x32",    1,1,640,640,  32, 32, 1,  1,1, 0,0, 1,1 },
+        { "1x1 s1p1 IC=32  OC=32  8x8",      1,1, 32, 32,   8,  8, 1,  1,1, 1,1, 1,1 },
+        { "1x1 s2p1 IC=32  OC=32  8x8",      1,1, 32, 32,   8,  8, 1,  2,2, 1,1, 1,1 },
 
         // Stride-2 downsampling
         { "3x3 s2p1 IC=128 OC=256 64x64",    3,3,128,256,  64, 64, 1,  2,2, 1,1, 1,1 },
