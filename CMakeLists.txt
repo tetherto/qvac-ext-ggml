@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 
+# ref: https://cmake.org/cmake/help/latest/policy/CMP0194.html
+# CMake 4.1+ rejects MSVC as the ASM compiler when CMP0194 is NEW, which breaks
+# the ggml build on MSVC. We set it to OLD to maintain compatibility with MSVC.
+if (POLICY CMP0194)
+    cmake_policy(SET CMP0194 OLD)
+endif()
 project("ggml" C CXX ASM)
 
 ### GGML Version
@@ -213,7 +219,7 @@ set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
-option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
+option(GGML_HIP_GRAPHS                      "ggml: use HIP graph, experimental, slow"         OFF)
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
 option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
@@ -363,7 +369,7 @@ if (GGML_STANDALONE)
         @ONLY)
 
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+        DESTINATION share/pkgconfig)
 endif()
 
 #
