@@ -4640,6 +4640,44 @@ struct test_rope : public test_case {
     }
 };
 
+// GGML_OP_ROPE_FLUX
+struct test_rope_flux : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const bool use_pe;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, use_pe);
+    }
+
+    test_rope_flux(std::array<int64_t, 4> ne_a = {16, 4, 32, 1}, bool use_pe = true)
+        : ne_a(ne_a), use_pe(use_pe) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        if (mode != MODE_GRAD) {
+            // rope_flux is inference-only today; keep support/test coverage without
+            // requesting an unsupported backward pass in grad mode.
+            ggml_set_param(a);
+        }
+        ggml_set_name(a, "a");
+
+        ggml_tensor * pe = nullptr;
+        if (use_pe) {
+            pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, ne_a[0] / 2, ne_a[2]);
+            ggml_set_name(pe, "pe");
+        }
+
+        ggml_tensor * out = ggml_rope_flux(ctx, a, pe);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+};
+
 // GGML_OP_POOL2D
 struct test_pool2d : public test_case {
     enum ggml_op_pool pool_type;
@@ -7081,6 +7119,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rope_set_rows(type, GGML_TYPE_I64, { 128, 32, ne2, 3 }, mode));
             }
         }
+    }
+
+    for (bool use_pe : {true, false}) {
+        test_cases.emplace_back(new test_rope_flux({16, 4, 32, 1}, use_pe));
+        test_cases.emplace_back(new test_rope_flux({64, 8, 128, 1}, use_pe));
+        test_cases.emplace_back(new test_rope_flux({128, 24, 256, 2}, use_pe));
     }
 
     for (ggml_type type_input : {GGML_TYPE_F32}) {
