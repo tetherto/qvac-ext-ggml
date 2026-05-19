@@ -8,6 +8,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <stdint.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -1118,7 +1119,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROPE_FLUX:
             if (op->src[0] == nil || op->src[0]->type != GGML_TYPE_F32 ||
                     op->src[0]->ne[0] <= 0 || op->src[0]->ne[1] <= 0 || op->src[0]->ne[2] <= 0 || op->src[0]->ne[3] <= 0 ||
-                    op->src[0]->ne[0] % 2 != 0) {
+                    op->src[0]->ne[0] % 2 != 0 ||
+                    ggml_nelements(op) > INT32_MAX) {
                 return false;
             }
             if (op->src[1] == nil) {
