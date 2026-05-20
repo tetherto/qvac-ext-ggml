@@ -3479,8 +3479,6 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
         /*.p1      =*/ p1,
         /*.d0      =*/ d0,
         /*.d1      =*/ d1,
-        /*.IC_TILE =*/ 0,
-        /*.OC_TILE =*/ 0,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_conv_2d(lib, op);
