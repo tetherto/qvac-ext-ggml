@@ -4710,12 +4710,13 @@ kernel void kernel_conv_2d(
     }
 
     // --- Store accumulators and write to global ---
-    // Each simdgroup writes to non-overlapping rows [sg_m..sg_m+7], no barrier needed.
+    // Each simdgroup writes to non-overlapping rows [sg_m..sg_m+7].
     threadgroup float * so = (threadgroup float *)shared_mem;
 
     for (int ni = 0; ni < 8; ni++) {
         simdgroup_store(C[ni], so + sg_m * CONV2D_GEMM_N + ni * 8, CONV2D_GEMM_N);
     }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
     // Each simdgroup's 32 threads write their own 8×64 block (16 elements per thread)
     for (int i = tiisg; i < 8 * CONV2D_GEMM_N; i += 32) {
