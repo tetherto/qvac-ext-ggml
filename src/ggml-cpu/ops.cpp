@@ -5873,57 +5873,51 @@ void ggml_compute_forward_rope_flux(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int64_t total = ggml_nelements(dst);
-    const int64_t dr = (total + nth - 1) / nth;
-    const int64_t i0 = dr * ith;
-    const int64_t i1 = MIN(i0 + dr, total);
+    const int64_t n_rows = L * n_head * N;
+    const int64_t dr = (n_rows + nth - 1) / nth;
+    const int64_t r0 = dr * ith;
+    const int64_t r1 = MIN(r0 + dr, n_rows);
 
     float * dst_data = (float *) dst->data;
     const char * src0_data = (const char *) src0->data;
     const char * src1_data = src1 ? (const char *) src1->data : NULL;
 
-    for (int64_t tid = i0; tid < i1; ++tid) {
-        const int64_t d  = tid % d_head;
-        const int64_t l  = (tid / d_head) % L;
-        const int64_t bh = tid / (d_head * L);
+    for (int64_t row = r0; row < r1; ++row) {
+        const int64_t l  = row % L;
+        const int64_t bh = row / L;
         const int64_t h  = bh % n_head;
         const int64_t n  = bh / n_head;
 
+        float * dst_row = dst_data + row * d_head;
+        const char * src0_row = src0_data +
+            n * src0->nb[3] +
+            l * src0->nb[2] +
+            h * src0->nb[1];
+
         if (src1_data == NULL) {
-            dst_data[tid] = *(const float *) (src0_data +
-                n * src0->nb[3] +
-                l * src0->nb[2] +
-                h * src0->nb[1] +
-                d * src0->nb[0]);
+            for (int64_t d = 0; d < d_head; ++d) {
+                dst_row[d] = *(const float *) (src0_row + d * src0->nb[0]);
+            }
             continue;
         }
 
-        const int64_t pair = d / 2;
-        const int64_t comp = d % 2;
+        for (int64_t pair = 0; pair < d_head / 2; ++pair) {
+            const char * src0_pair = src0_row + (2 * pair) * src0->nb[0];
+            const char * src1_pair = src1_data +
+                l * src1->nb[3] +
+                pair * src1->nb[2];
 
-        const float x_even = *(const float *) (src0_data +
-            n * src0->nb[3] +
-            l * src0->nb[2] +
-            h * src0->nb[1] +
-            (2 * pair) * src0->nb[0]);
-        const float x_odd = *(const float *) (src0_data +
-            n * src0->nb[3] +
-            l * src0->nb[2] +
-            h * src0->nb[1] +
-            (2 * pair + 1) * src0->nb[0]);
+            const float x_even = *(const float *) src0_pair;
+            const float x_odd  = *(const float *) (src0_pair + src0->nb[0]);
 
-        const float pe_col0 = *(const float *) (src1_data +
-            l * src1->nb[3] +
-            pair * src1->nb[2] +
-            comp * src1->nb[1] +
-            0 * src1->nb[0]);
-        const float pe_col1 = *(const float *) (src1_data +
-            l * src1->nb[3] +
-            pair * src1->nb[2] +
-            comp * src1->nb[1] +
-            1 * src1->nb[0]);
+            const float pe_00 = *(const float *) src1_pair;
+            const float pe_10 = *(const float *) (src1_pair + src1->nb[0]);
+            const float pe_01 = *(const float *) (src1_pair + src1->nb[1]);
+            const float pe_11 = *(const float *) (src1_pair + src1->nb[1] + src1->nb[0]);
 
-        dst_data[tid] = x_even * pe_col0 + x_odd * pe_col1;
+            dst_row[2 * pair]     = x_even * pe_00 + x_odd * pe_10;
+            dst_row[2 * pair + 1] = x_even * pe_01 + x_odd * pe_11;
+        }
     }
 }
 
