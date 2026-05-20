@@ -32,6 +32,7 @@ struct conv2d_test_case {
     int KW, KH, IC, OC;
     int IW, IH, N;
     int s0, s1, p0, p1, d0, d1;
+    ggml_type weight_type = GGML_TYPE_F16;
 };
 
 static bool run_test(const conv2d_test_case & tc) {
@@ -69,7 +70,7 @@ static bool run_test(const conv2d_test_case & tc) {
         backend = ggml_backend_cpu_init();
     }
 
-    size_t buf_size = n_weights * sizeof(ggml_fp16_t) + n_input * sizeof(float) + 4096;
+    size_t buf_size = n_weights * ggml_type_size(tc.weight_type) + n_input * sizeof(float) + 4096;
     ggml_backend_buffer_t buffer = ggml_backend_alloc_buffer(backend, buf_size);
 
     struct ggml_init_params params = {
@@ -79,14 +80,19 @@ static bool run_test(const conv2d_test_case & tc) {
     };
     struct ggml_context * ctx_data = ggml_init(params);
 
-    struct ggml_tensor * w = ggml_new_tensor_4d(ctx_data, GGML_TYPE_F16,  tc.KW, tc.KH, tc.IC, tc.OC);
+    struct ggml_tensor * w = ggml_new_tensor_4d(ctx_data, tc.weight_type, tc.KW, tc.KH, tc.IC, tc.OC);
     struct ggml_tensor * x = ggml_new_tensor_4d(ctx_data, GGML_TYPE_F32, tc.IW, tc.IH, tc.IC, tc.N);
 
     struct ggml_tallocr alloc = ggml_tallocr_new(buffer);
     ggml_tallocr_alloc(&alloc, w);
     ggml_tallocr_alloc(&alloc, x);
 
-    ggml_backend_tensor_set(w, weight_f16.data(), 0, ggml_nbytes(w));
+    if (tc.weight_type == GGML_TYPE_F16) {
+        ggml_backend_tensor_set(w, weight_f16.data(), 0, ggml_nbytes(w));
+    } else {
+        assert(tc.weight_type == GGML_TYPE_F32);
+        ggml_backend_tensor_set(w, weight_f32.data(), 0, ggml_nbytes(w));
+    }
     ggml_backend_tensor_set(x, input_f32.data(),  0, ggml_nbytes(x));
 
     // --- Build graph with BOTH paths ---
@@ -237,6 +243,9 @@ int main(void) {
         // Minimal size
         { "3x3 s1p1 IC=3   OC=16  8x8",      3,3,  3, 16,   8,  8, 1,  1,1, 1,1, 1,1 },
         { "1x1 s1p0 IC=16  OC=3   8x8",      1,1, 16,  3,   8,  8, 1,  1,1, 0,0, 1,1 },
+
+        // supports_op also advertises F32 weights with F32 input.
+        { "3x3 s1p1 F32W IC=16 OC=16 8x8",   3,3, 16, 16,   8,  8, 1,  1,1, 1,1, 1,1, GGML_TYPE_F32 },
     };
 
     int n_tests = sizeof(tests) / sizeof(tests[0]);
