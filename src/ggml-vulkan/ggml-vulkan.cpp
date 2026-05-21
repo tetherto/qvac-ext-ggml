@@ -16032,7 +16032,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
         case GGML_OP_IM2COL_3D:
             return op->src[1]->type == GGML_TYPE_F32
-                && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                && ((op->type == GGML_TYPE_F32 &&
+                     (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)) ||
+                    (op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16));
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D_DW:
