@@ -4161,8 +4161,17 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
                         (!f32acc && device->coopmat_support_16x16x16_f16acc);
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, ggml_vk_flash_attn_qjl_quant_k(k_type), params.qjl_full_proj);
+        auto is_coopmat1_fa_type = [](ggml_type t) {
+            static auto types = { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16,
+                                  GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+                                  GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL,
+                                  GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0,
+                                  GGML_TYPE_TBQ3_0_64, GGML_TYPE_TBQ4_0_64, GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64 };
+            return std::any_of(types.begin(), types.end(), [t](ggml_type s) { return s == t; });
+        };
+        bool type_ok = is_coopmat1_fa_type(k_type) && is_coopmat1_fa_type(v_type);
 
-        if (!shape_ok || !shmem_ok) {
+        if (!shape_ok || !shmem_ok || !type_ok) {
             path = FA_SCALAR;
         }
     }
