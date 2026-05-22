@@ -4331,9 +4331,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    // Adreno (Qualcomm) Vulkan miscompiles the mul_mat_vec subgroup-reduction
+    // SPIR-V (createComputePipeline null-derefs); force the shmem-reduction
+    // variant on Qualcomm (mathematically equivalent per the shader source).
+    bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) { use_subgroups = false; }
     // Ensure a subgroup size >= 16 is available
-    const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
+    bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
+    if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) { use_subgroups16 = false; }
 
     const uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
     const uint32_t subgroup_size16 = std::max(subgroup_size, 16u);
