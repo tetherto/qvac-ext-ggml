@@ -60,6 +60,11 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <future>
 #include <thread>
 
+// [qvac-rca] Android logcat sink for the instrumentation prints below.
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
@@ -2371,13 +2376,50 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         // device->pipeline_cache is VK_NULL_HANDLE when persistent caching is
         // opt-ed-out or its init failed; VK treats that as "no cache" — same
         // as before this patch.
-        pipeline->pipeline = device->device.createComputePipeline(device->pipeline_cache, compute_pipeline_create_info).value;
+        auto _qvac_rca_rv = device->device.createComputePipeline(device->pipeline_cache, compute_pipeline_create_info);
+        // [qvac-rca] instrumentation: log VkResult + returned handle for every
+        // compute pipeline created via __android_log_print (Android's logcat
+        // ignores stderr from shared libs). On Adreno, driver is documented to
+        // return VK_INCOMPLETE (=5) with VK_NULL_HANDLE when shader-link fails,
+        // which is success-class for Vulkan-Hpp's resultCheck and does NOT throw.
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "qvac-rca",
+            "createComputePipeline name=%s result=%d handle=0x%llx",
+            pipeline->name.c_str(), (int)_qvac_rca_rv.result,
+            (unsigned long long)(VkPipeline)_qvac_rca_rv.value);
+#else
+        std::cerr << "[qvac-rca] createComputePipeline name=" << pipeline->name
+                  << " result=" << (int)_qvac_rca_rv.result
+                  << " handle=0x" << std::hex
+                  << (uint64_t)(VkPipeline)_qvac_rca_rv.value
+                  << std::dec << std::endl;
+#endif
+        pipeline->pipeline = _qvac_rca_rv.value;
     } catch (const vk::SystemError& e) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_ERROR, "qvac-rca",
+            "ggml_vulkan: Compute pipeline creation failed for %s: %s",
+            pipeline->name.c_str(), e.what());
+#else
         std::cerr << "ggml_vulkan: Compute pipeline creation failed for " << pipeline->name << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
+#endif
         throw e;
     }
     pipeline->compiled = true;
+    // [qvac-rca] flag a null handle even though we still proceed (to match
+    // current behavior and not perturb the crash). The dispatcher will still
+    // crash on bindPipeline(NULL); this log line is the canary.
+    if (!pipeline->pipeline) {
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_WARN, "qvac-rca",
+            "WARNING null pipeline handle stored for %s",
+            pipeline->name.c_str());
+#else
+        std::cerr << "[qvac-rca] WARNING null pipeline handle stored for "
+                  << pipeline->name << std::endl;
+#endif
+    }
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsObjectNameInfoEXT duoni;
@@ -6897,6 +6939,24 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
 
     subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
+    // [qvac-rca] log every bindPipeline so the LAST log line before crash
+    // identifies the failing shader; also catch a null handle before the
+    // driver crashes on it.
+    {
+        const uint64_t _qvac_rca_h = (uint64_t)(VkPipeline)pipeline->pipeline;
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "qvac-rca",
+            "bindPipeline name=%s handle=0x%llx%s",
+            pipeline->name.c_str(),
+            (unsigned long long)_qvac_rca_h,
+            (_qvac_rca_h == 0 ? " (NULL - driver-side crash imminent)" : ""));
+#else
+        std::cerr << "[qvac-rca] bindPipeline name=" << pipeline->name
+                  << " handle=0x" << std::hex << _qvac_rca_h << std::dec
+                  << (_qvac_rca_h == 0 ? " (NULL - driver-side crash imminent)" : "")
+                  << std::endl;
+#endif
+    }
     subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
     subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
                                 pipeline->layout,
@@ -7487,6 +7547,12 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if ((ctx->device->mul_mat_m[src0_type] && (m <= 64 || n <= 64)) || !ctx->device->mul_mat_l[src0_type]) {
         return aligned ? mmp->a_m : mmp->m;
     }
+    // Adreno (Qualcomm) Vulkan crashes on the matmul `_l` (large, BLOCK_SIZE=128)
+    // tile; fall back to the `_m` tile (BLOCK_SIZE=64, known-good). Cost: ~4x more
+    // dispatches on Adreno; no correctness change.
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM && ctx->device->mul_mat_m[src0_type]) {
+        return aligned ? mmp->a_m : mmp->m;
+    }
     return aligned ? mmp->a_l : mmp->l;
 
     GGML_UNUSED(src1_type);
@@ -7567,6 +7633,10 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
         return aligned ? mmp->a_s : mmp->s;
     }
     if ((ctx->device->mul_mat_id_m[src0_type] && (m <= 64 || n <= 64)) || !ctx->device->mul_mat_id_l[src0_type]) {
+        return aligned ? mmp->a_m : mmp->m;
+    }
+    // Adreno (Qualcomm) Vulkan crashes on the matmul `_l` tile; fall back to `_m`.
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM && ctx->device->mul_mat_id_m[src0_type]) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
@@ -9884,11 +9954,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_topk_moe[idx][use_push];
         }
 
+        // Adreno (Qualcomm) Vulkan hangs in vk::Queue::waitIdle on the wg512 softmax
+        // variant (BLOCK_SIZE=512); fall back to the smaller-wg variant.
         if (src0->type == GGML_TYPE_F32 && (src1 == nullptr || src1->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F32) {
-            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_wg512 : ctx->device->pipeline_soft_max_f32;
+            const bool use_wg512 = src0->ne[0] > 1024 && ctx->device->vendor_id != VK_VENDOR_ID_QUALCOMM;
+            return use_wg512 ? ctx->device->pipeline_soft_max_f32_wg512 : ctx->device->pipeline_soft_max_f32;
         }
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16;
+            const bool use_wg512 = src0->ne[0] > 1024 && ctx->device->vendor_id != VK_VENDOR_ID_QUALCOMM;
+            return use_wg512 ? ctx->device->pipeline_soft_max_f32_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16;
         }
         return nullptr;
     case GGML_OP_SOFT_MAX_BACK:
@@ -14041,7 +14115,16 @@ static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type
 
 static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
-    return ctx->device->suballocation_block_size;
+    size_t alloc_block = ctx->device->suballocation_block_size;
+    // Adreno (Qualcomm) can't bind a single descriptor larger than
+    // maxStorageBufferRange (128 MiB, the Vulkan-spec minimum, which Adreno 740
+    // exposes); cap there so callers can fall back to CPU. Other vendors keep
+    // the full suballocation block size.
+    if (ctx->device->vendor_id != VK_VENDOR_ID_QUALCOMM) {
+        return alloc_block;
+    }
+    size_t desc_range = ctx->device->properties.limits.maxStorageBufferRange;
+    return std::min(alloc_block, desc_range);
 }
 
 static size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -15849,6 +15932,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // Adreno (Qualcomm) Vulkan fails to compile every flash_attn SPIR-V
+                // variant (createComputePipeline returns ErrorUnknown); route FA to CPU.
+                if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+                    return false;
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];

@@ -87,6 +87,11 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+    # [qvac-rca] link liblog so __android_log_print resolves in the
+    # instrumented ggml_vk_create_pipeline_func / ggml_vk_dispatch_pipeline.
+    if (ANDROID)
+        target_link_libraries(ggml-vulkan PRIVATE log)
+    endif()
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
