@@ -1820,6 +1820,11 @@ struct vk_op_rope_push_constants {
     uint32_t nb11;
     uint32_t nb12;
     uint32_t nb13;
+    // qvac fix: the ROPE shader (rope_head.glsl) declares a 116-byte push-constant
+    // block ending in a_offset/d_offset (read at bytes [108,116)); the qvac rebase
+    // dropped these two fields, truncating the pipeline push-constant range to 108
+    // bytes so the shader read undefined push-constant memory → deterministic
+    // garbage ("of of of...") on multi-token prefill. Restore them.
     uint32_t a_offset;
     uint32_t d_offset;
 };
@@ -1990,6 +1995,10 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+    // qvac fix: the MTP-support commit added a trailing `uint K` (the recurrent
+    // snapshot/rollback slot count = state->ne[1]) to the gated_delta_net shader
+    // but not to this struct, so the shader read K from undefined push-constant
+    // memory → NaN/garbage (test-backend-ops 0/13). Restore it.
     uint32_t K;
 };
 
@@ -14103,6 +14112,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     } else if (op == GGML_OP_OPT_STEP_SGD) {
         // OPT_STEP_SGD works on src0, it does not need dst
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf }, pc, elements);
+    } else if (op == GGML_OP_SSM_CONV) {
+        // qvac fix: the ssm_conv_f32 shader declares 4 bindings (src0, src1,
+        // bias, dst) since the upstream BIAS+SILU fusion. We don't fuse bias
+        // here (APPLY_BIAS=false), but the binding still has to exist, so bind a
+        // dummy (src0_buf) at the bias slot; dst must be the 4th buffer.
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src0_buf, dst_buf }, pc, elements);
     } else if (use_src3) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, src3_buf, dst_buf }, pc, elements);
     } else if (use_src2) {
@@ -14728,6 +14743,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
+    // K = recurrent snapshot/rollback slot count = state (src[5]) ne[1].
+    const uint32_t K = (uint32_t)dst->src[5]->ne[1];
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
