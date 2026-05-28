@@ -3038,6 +3038,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
+        if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary && device->uma) {
+            l_mmq_wg_denoms = {128, 256, 1};
+        }
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
         l_align = 128;
