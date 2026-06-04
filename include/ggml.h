@@ -530,6 +530,7 @@ extern "C" {
         GGML_OP_SOFT_MAX_BACK,
         GGML_OP_ROPE,
         GGML_OP_ROPE_BACK,
+        GGML_OP_ROPE_FLUX,
         GGML_OP_CLAMP,
         GGML_OP_CONV_TRANSPOSE_1D,
         GGML_OP_IM2COL,
@@ -1902,6 +1903,15 @@ extern "C" {
             float                 attn_factor,
             float                 beta_fast,
             float                 beta_slow);
+
+    // Fused Flux-style RoPE: applies rotation using precomputed PE matrix and permutes output layout.
+    // a: [d_head, n_head, L, N]  (Q or K tensor, may be non-contiguous)
+    // b: [2, 2, d_head/2, L]     (precomputed rotation matrix [[cos,-sin],[sin,cos]]), or NULL for permute-only
+    // result: [d_head, L, N*n_head] (contiguous, layout for flash attention)
+    GGML_API struct ggml_tensor * ggml_rope_flux(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     GGML_DEPRECATED(GGML_API struct ggml_tensor * ggml_rope_custom(
             struct ggml_context * ctx,

@@ -331,6 +331,21 @@ typedef struct {
 } ggml_metal_kargs_rope;
 
 typedef struct {
+    int32_t  d_head;
+    int32_t  n_head;
+    int32_t  L;
+    int32_t  N;
+    uint64_t nb00; // x strides (may be non-contiguous)
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t pe_nb0; // pe strides
+    uint64_t pe_nb1;
+    uint64_t pe_nb2;
+    uint64_t pe_nb3;
+} ggml_metal_kargs_rope_flux;
+
+typedef struct {
     int32_t  ne11;
     int32_t  ne_12_2; // assume K and V are same shape
     int32_t  ne_12_3;

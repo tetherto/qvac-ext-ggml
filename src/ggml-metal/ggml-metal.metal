@@ -4632,6 +4632,75 @@ template [[host_name("kernel_rope_multi_f16")]] kernel kernel_rope_multi_t kerne
 template [[host_name("kernel_rope_vision_f32")]] kernel kernel_rope_vision_t kernel_rope_vision<float>;
 template [[host_name("kernel_rope_vision_f16")]] kernel kernel_rope_vision_t kernel_rope_vision<half>;
 
+// Fused Flux RoPE: applies interleaved rotary embedding and permutes output layout in one pass.
+// Input x:   [d_head, n_head, L, N] (may be non-contiguous)
+// Input pe:  [2, 2, d_head/2, L]    (precomputed [[cos,-sin],[sin,cos]])
+// Output:    [d_head, L, N*n_head]  (contiguous, ready for flash attention)
+kernel void kernel_rope_flux(
+        constant ggml_metal_kargs_rope_flux & args,
+        device const char * src0,
+        device const char * src1,
+        device       float * dst,
+        uint tid [[thread_position_in_grid]]) {
+
+    const int d_head = args.d_head;
+    const int n_head = args.n_head;
+    const int L      = args.L;
+    const int N      = args.N;
+
+    if (d_head <= 0 || n_head <= 0 || L <= 0 || N <= 0) return;
+
+    const uint total = (uint)d_head * (uint)L * (uint)N * (uint)n_head;
+    if (tid >= total) return;
+
+    const int d  = tid % d_head;
+    const int l  = (tid / d_head) % L;
+    const int bh = tid / (d_head * L);
+    const int h  = bh % n_head;
+    const int n  = bh / n_head;
+
+    const int pair = d / 2;
+
+    const float x_even = *(device const float *)(src0 + n*args.nb03 + l*args.nb02 + h*args.nb01 + (2*pair)  *args.nb00);
+    const float x_odd  = *(device const float *)(src0 + n*args.nb03 + l*args.nb02 + h*args.nb01 + (2*pair+1)*args.nb00);
+
+    const int comp = d % 2;
+    const float pe_col0 = *(device const float *)(src1 + l*args.pe_nb3 + pair*args.pe_nb2 + comp*args.pe_nb1 + 0*args.pe_nb0);
+    const float pe_col1 = *(device const float *)(src1 + l*args.pe_nb3 + pair*args.pe_nb2 + comp*args.pe_nb1 + 1*args.pe_nb0);
+
+    dst[bh * L * d_head + l * d_head + d] = x_even * pe_col0 + x_odd * pe_col1;
+}
+
+// Fused permute(0,2,1,3)+cont: transposes dims 1 and 2 and produces contiguous output.
+// Input:  [ne0, ne1, ne2, ne3] (may be non-contiguous)
+// Output: [ne0, ne2, ne1*ne3]  (contiguous)
+kernel void kernel_permute_cont_021(
+        constant ggml_metal_kargs_rope_flux & args,
+        device const char * src0,
+        device       float * dst,
+        uint tid [[thread_position_in_grid]]) {
+
+    const int ne0 = args.d_head;
+    const int ne1 = args.n_head;
+    const int ne2 = args.L;
+    const int ne3 = args.N;
+
+    if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0) return;
+
+    const uint total = (uint)ne0 * (uint)ne1 * (uint)ne2 * (uint)ne3;
+    if (tid >= total) return;
+
+    const int i0 = tid % ne0;
+    const int i2 = (tid / ne0) % ne2;
+    const int bh = tid / (ne0 * ne2);
+    const int i1 = bh % ne1;
+    const int i3 = bh / ne1;
+
+    const float val = *(device const float *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + i0*args.nb00);
+
+    dst[bh * ne2 * ne0 + i2 * ne0 + i0] = val;
+}
+
 typedef void (im2col_t)(
         constant ggml_metal_kargs_im2col & args,
         device const float * x,
