@@ -582,6 +582,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_ROPE_FLUX,
 
         GGML_OP_COUNT,
     };
@@ -1933,6 +1934,15 @@ extern "C" {
             float                 beta_slow),
         "use ggml_rope_ext_inplace instead");
 
+    // Fused Flux-style RoPE: applies rotation using precomputed PE matrix and permutes output layout.
+    // a: [d_head, n_head, L, N]  (Q or K tensor, may be non-contiguous)
+    // b: [2, 2, d_head/2, L]     (precomputed rotation matrix [[cos,-sin],[sin,cos]]), or NULL for permute-only
+    // result: [d_head, L, N*n_head] (contiguous, layout for flash attention)
+    GGML_API struct ggml_tensor * ggml_rope_flux(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     // compute correction dims for YaRN RoPE scaling
     GGML_API void ggml_rope_yarn_corr_dims(
         int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, float dims[2]);
@@ -2721,7 +2731,12 @@ extern "C" {
     GGML_API struct ggml_tensor ** ggml_graph_nodes  (struct ggml_cgraph * cgraph);
     GGML_API int                   ggml_graph_n_nodes(struct ggml_cgraph * cgraph);
 
+    GGML_API struct ggml_tensor *  ggml_graph_leaf   (struct ggml_cgraph * cgraph, int i);
+    GGML_API struct ggml_tensor ** ggml_graph_leafs  (struct ggml_cgraph * cgraph);
+    GGML_API int                   ggml_graph_n_leafs(struct ggml_cgraph * cgraph);
+
     GGML_API void   ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
+    GGML_API void   ggml_graph_add_leaf(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
 
     GGML_API size_t ggml_graph_overhead(void);
     GGML_API size_t ggml_graph_overhead_custom(size_t size, bool grads);

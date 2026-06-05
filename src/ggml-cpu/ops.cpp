@@ -5970,6 +5970,87 @@ void ggml_compute_forward_rope_back(
     }
 }
 
+// ggml_compute_forward_rope_flux
+
+void ggml_compute_forward_rope_flux(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0 != NULL);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t d_head = src0->ne[0];
+    const int64_t n_head = src0->ne[1];
+    const int64_t L      = src0->ne[2];
+    const int64_t N      = src0->ne[3];
+
+    GGML_ASSERT(d_head > 0 && n_head > 0 && L > 0 && N > 0);
+    GGML_ASSERT(d_head % 2 == 0);
+
+    if (src1 != NULL) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->ne[0] == 2);
+        GGML_ASSERT(src1->ne[1] == 2);
+        GGML_ASSERT(src1->ne[2] == d_head / 2);
+        GGML_ASSERT(src1->ne[3] == L);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n_rows = L * n_head * N;
+    const int64_t dr = (n_rows + nth - 1) / nth;
+    const int64_t r0 = dr * ith;
+    const int64_t r1 = MIN(r0 + dr, n_rows);
+
+    float * dst_data = (float *) dst->data;
+    const char * src0_data = (const char *) src0->data;
+    const char * src1_data = src1 ? (const char *) src1->data : NULL;
+
+    for (int64_t row = r0; row < r1; ++row) {
+        const int64_t l  = row % L;
+        const int64_t bh = row / L;
+        const int64_t h  = bh % n_head;
+        const int64_t n  = bh / n_head;
+
+        float * dst_row = dst_data + row * d_head;
+        const char * src0_row = src0_data +
+            n * src0->nb[3] +
+            l * src0->nb[2] +
+            h * src0->nb[1];
+
+        if (src1_data == NULL) {
+            for (int64_t d = 0; d < d_head; ++d) {
+                dst_row[d] = *(const float *) (src0_row + d * src0->nb[0]);
+            }
+            continue;
+        }
+
+        for (int64_t pair = 0; pair < d_head / 2; ++pair) {
+            const char * src0_pair = src0_row + (2 * pair) * src0->nb[0];
+            const char * src1_pair = src1_data +
+                l * src1->nb[3] +
+                pair * src1->nb[2];
+
+            const float x_even = *(const float *) src0_pair;
+            const float x_odd  = *(const float *) (src0_pair + src0->nb[0]);
+
+            const float pe_00 = *(const float *) src1_pair;
+            const float pe_10 = *(const float *) (src1_pair + src1->nb[0]);
+            const float pe_01 = *(const float *) (src1_pair + src1->nb[1]);
+            const float pe_11 = *(const float *) (src1_pair + src1->nb[1] + src1->nb[0]);
+
+            dst_row[2 * pair]     = x_even * pe_00 + x_odd * pe_10;
+            dst_row[2 * pair + 1] = x_even * pe_01 + x_odd * pe_11;
+        }
+    }
+}
+
 // ggml_compute_forward_conv_transpose_1d
 
 static void ggml_compute_forward_conv_transpose_1d_f16_f32(

@@ -181,6 +181,7 @@ option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"      OFF)
 option(GGML_VXE              "ggml: enable vxe"               ${GGML_NATIVE})
 
 option(GGML_CPU_ALL_VARIANTS "ggml: build all variants of the CPU backend (requires GGML_BACKEND_DL)" OFF)
+option(GGML_CPU_STATIC        "ggml: build CPU backend as static library even with GGML_BACKEND_DL"   OFF)
 set(GGML_CPU_ARM_ARCH        "" CACHE STRING "ggml: CPU architecture for ARM")
 set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 
@@ -330,6 +331,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cpp.h
     include/ggml-cuda.h
     include/ggml-opt.h
+    include/ggml-opencl.h
     include/ggml-metal.h
     include/ggml-rpc.h
     include/ggml-virtgpu.h

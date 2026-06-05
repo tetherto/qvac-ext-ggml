@@ -8,6 +8,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <stdint.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -1115,10 +1116,26 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
         case GGML_OP_ROPE:
             return true;
+        case GGML_OP_ROPE_FLUX:
+            if (op->src[0] == nil || op->src[0]->type != GGML_TYPE_F32 ||
+                    op->src[0]->ne[0] <= 0 || op->src[0]->ne[1] <= 0 || op->src[0]->ne[2] <= 0 || op->src[0]->ne[3] <= 0 ||
+                    op->src[0]->ne[0] % 2 != 0 ||
+                    ggml_nelements(op) > INT32_MAX) {
+                return false;
+            }
+            if (op->src[1] == nil) {
+                return true;
+            }
+            return op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[1]->ne[0] == 2 &&
+                op->src[1]->ne[1] == 2 &&
+                op->src[0]->ne[0] == 2 * op->src[1]->ne[2] &&
+                op->src[0]->ne[2] == op->src[1]->ne[3];
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
         case GGML_OP_CONV_2D:
-            return ggml_is_contiguous(op->src[0]) &&
+            return has_simdgroup_mm &&
+                   ggml_is_contiguous(op->src[0]) &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 &&
                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
@@ -1133,9 +1150,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (ggml_get_op_params_i32(op, 8) != 0) {
                 return false;
             }
-
-            return (ggml_get_op_params_i32(op, 0) == 0) && (ggml_get_op_params_i32(op, 2) == 0) &&
-                   (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_LEAKY_RELU:
@@ -1282,6 +1297,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return has_simdgroup_reduction;
+        case GGML_OP_IM2COL_3D:
+            return op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[1]->nb[0] == sizeof(float) &&
+                   (op->type == GGML_TYPE_F32 ||
+                    (op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16));
         default:
             return false;
     }
