@@ -6906,6 +6906,18 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+    // [DO NOT MERGE] Mali RCA: abort at the FIRST dispatch that exceeds the
+    // requested count (idx >= requirements) -> names the true under-requesting
+    // pipeline (fires before the pool-slack runs out, so it pins the culprit
+    // rather than the later victim). Routed to logcat via the ggml_abort
+    // instrumentation. On devices that never over-dispatch (e.g. Xclipse) this
+    // is inert. Strip with the rest of the scaffolding.
+    if (ctx->descriptor_set_idx >= ctx->pipeline_descriptor_set_requirements) {
+        GGML_ABORT("[ds-overdispatch] pipeline=%s idx=%u requirements=%u size=%zu",
+                   pipeline->name.c_str(), (unsigned) ctx->descriptor_set_idx,
+                   (unsigned) ctx->pipeline_descriptor_set_requirements,
+                   (size_t) ctx->descriptor_sets.size());
+    }
     // [DO NOT MERGE] Mali RCA: name the pipeline that over-dispatches descriptor
     // sets (the bare assert gave no op identity). Routes through ggml_abort ->
     // Android logcat (tag ggml_abort) via the ggml.c instrumentation on this branch.
