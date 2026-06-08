@@ -6906,7 +6906,15 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
-    GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
+    // [DO NOT MERGE] Mali RCA: name the pipeline that over-dispatches descriptor
+    // sets (the bare assert gave no op identity). Routes through ggml_abort ->
+    // Android logcat (tag ggml_abort) via the ggml.c instrumentation on this branch.
+    if (ctx->descriptor_set_idx >= ctx->descriptor_sets.size()) {
+        GGML_ABORT("[descriptor-set RCA] overflow: pipeline=%s idx=%u size=%zu requirements=%u",
+                   pipeline->name.c_str(), (unsigned) ctx->descriptor_set_idx,
+                   (size_t) ctx->descriptor_sets.size(),
+                   (unsigned) ctx->pipeline_descriptor_set_requirements);
+    }
     GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
