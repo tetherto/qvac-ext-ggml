@@ -488,6 +488,8 @@ endif()
 
 if (CMAKE_SYSTEM_NAME MATCHES "Android")
     target_link_libraries(ggml-base PRIVATE dl)
+    # [DO NOT MERGE] Mali RCA: liblog for the __android_log_print in ggml_abort.
+    target_link_libraries(ggml-base PRIVATE log)
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "visionOS")

@@ -20,6 +20,10 @@
 #include <alloca.h>
 #endif
 
+#ifdef __ANDROID__
+#include <android/log.h> // [DO NOT MERGE] Mali RCA: forward ggml_abort to logcat
+#endif
+
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
@@ -259,6 +263,16 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
     va_start(args, fmt);
     vsnprintf(message + offset, sizeof(message) - offset, fmt, args);
     va_end(args);
+
+#ifdef __ANDROID__
+    // [DO NOT MERGE] Device-Farm Mali RCA (qvac PR #2476): forward the exact
+    // "file:line: GGML_ASSERT(...) failed" to logcat synchronously, before
+    // abort(), regardless of g_abort_callback / GGML_BACKEND_DL linker-namespace
+    // state (the addon-installed abort callback lives in a different namespace
+    // than the dlopen'd Vulkan backend, so it never fires for backend aborts).
+    // Strip with the rest of the device-farm test scaffolding.
+    __android_log_print(ANDROID_LOG_FATAL, "ggml_abort", "%s", message);
+#endif
 
     if (g_abort_callback) {
         g_abort_callback(message);
