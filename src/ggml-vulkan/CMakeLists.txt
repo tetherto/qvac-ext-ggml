@@ -95,6 +95,14 @@ if (Vulkan_FOUND)
         add_compile_definitions(_ITERATOR_DEBUG_LEVEL=0)
     endif()
 
+    # QVAC-20557 (DO-NOT-MERGE diagnostic): ggml-vulkan.cpp's device-identity /
+    # gate logging calls __android_log_print, which lives in Android's liblog.
+    # The .so is linked with -Wl,--no-undefined so the symbol must be resolved.
+    # (Placed clear of the spirv-headers overlay patch context near line 89.)
+    if (ANDROID)
+        target_link_libraries(ggml-vulkan PRIVATE log)
+    endif()
+
     if (GGML_VULKAN_CHECK_RESULTS)
         add_compile_definitions(GGML_VULKAN_CHECK_RESULTS)
     endif()
