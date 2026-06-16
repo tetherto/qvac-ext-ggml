@@ -7501,6 +7501,17 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
             && (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16)
             && std::string(ctx->device->properties.deviceName.data()).find("Mali") != std::string::npos) {
         aligned = false;
+        // DEBUG (QVAC-20557 H1, DO-NOT-MERGE): one-shot confirmation that the Mali
+        // gate actually FIRED (anti-dead-gate guard — parakeet wasted device rounds
+        // on gates whose discriminator never matched). If this line is absent from
+        // the device logcat but the bug persists, the gate (not the unaligned path)
+        // is the problem. Routed via GGML_LOG -> the addon's shared ggml sink.
+        static bool s_h1_logged = false;
+        if (!s_h1_logged) {
+            s_h1_logged = true;
+            GGML_LOG_WARN("[gpu-diag] QVAC-20557 H1: Mali F32 mul_mat -> UNALIGNED pipeline (gate FIRED, dev=%s)\n",
+                          ctx->device->properties.deviceName.data());
+        }
     }
 
     if (ctx->device->coopmat2) {
