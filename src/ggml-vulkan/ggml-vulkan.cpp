@@ -114,7 +114,6 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_VENDOR_ID_INTEL 0x8086
 #define VK_VENDOR_ID_NVIDIA 0x10de
 #define VK_VENDOR_ID_QUALCOMM 0x5143
-#define VK_VENDOR_ID_ARM 0x13B5
 
 #define VK_DEVICE_DESCRIPTOR_POOL_SIZE 256
 
@@ -16232,10 +16231,23 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D_DW:
-            // ARM Mali/Valhall Vulkan miscomputes depthwise conv2d (non-deterministic inf);
-            // route to CPU. im2col+mul_mat are fine on Mali, so the rest of the encoder stays on GPU.
-            if (device->vendor_id == VK_VENDOR_ID_ARM) {
-                return false;
+            {
+                // DEBUG: log the real device identity once (the vendor_id==0x13B5 ARM check did
+                // not match Pixel Mali-G715; device->name is just "Vulkan<idx>").
+                static bool vk_dev_logged = false;
+                if (!vk_dev_logged) {
+                    vk_dev_logged = true;
+                    GGML_LOG_WARN("[gpu-diag] vk device: name=\"%s\" vendor_id=0x%x driver_id=%d\n",
+                        device->properties.deviceName.data(),
+                        (unsigned) device->vendor_id, (int) device->driver_id);
+                }
+                // ARM Mali/Valhall Vulkan miscomputes depthwise conv2d (non-deterministic inf);
+                // route it to CPU. im2col+mul_mat are fine on Mali, so the rest of the encoder
+                // stays on the GPU. Match the GPU model name (device->name is "Vulkan<idx>";
+                // the model is in properties.deviceName, e.g. "Mali-G715").
+                if (std::string(device->properties.deviceName.data()).find("Mali") != std::string::npos) {
+                    return false;
+                }
             }
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)
                 && op->src[1]->type == GGML_TYPE_F32;
