@@ -7333,7 +7333,12 @@ int ggml_graph_n_nodes(struct ggml_cgraph * cgraph) {
 }
 
 struct ggml_tensor * ggml_graph_leaf(struct ggml_cgraph * cgraph, int i) {
-    GGML_ASSERT(i >= 0 && i < cgraph->n_leafs);
+    if (i < 0) {
+        GGML_ASSERT(cgraph->n_leafs + i >= 0);
+        return cgraph->leafs[cgraph->n_leafs + i];
+    }
+
+    GGML_ASSERT(i < cgraph->n_leafs);
     return cgraph->leafs[i];
 }
 
