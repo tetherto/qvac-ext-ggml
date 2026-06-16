@@ -7488,6 +7488,21 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
+    // QVAC-20557 (Mali-Vulkan, DO-NOT-MERGE probe H1): ARM Mali/Valhall miscomputes
+    // the ALIGNED (no-bounds-check LOAD_VEC_A=4) F32 mul_mm path — a few ~4x output
+    // outliers on K-spanning->=2-tile shapes (e.g. the Supertonic duration predictor's
+    // K=64 pointwise conv), confirmed on-device: Pixel-9 pw1_mulmat max 10.4 vs an
+    // Adreno control of 2.5 for a BIT-IDENTICAL input. Force the bounds-checked
+    // UNALIGNED variant on Mali to test whether the aligned vec4 load is the culprit.
+    // deviceName-gated, NOT path-gated: Android builds disable coopmat for ALL Vulkan
+    // devices (GGML_VULKAN_DISABLE_COOPMAT=ON), so Samsung Xclipse shares this
+    // non-coopmat path and must stay on the fast aligned path (it computes correctly).
+    if (aligned && src1_type == GGML_TYPE_F32
+            && (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16)
+            && std::string(ctx->device->properties.deviceName.data()).find("Mali") != std::string::npos) {
+        aligned = false;
+    }
+
     if (ctx->device->coopmat2) {
         const uint32_t shader_core_count = ctx->device->shader_core_count;
         const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
