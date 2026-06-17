@@ -7498,11 +7498,14 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
     // QVAC-20557 (Mali/Valhall, DO-NOT-MERGE diagnostic): one-shot dump of the Vulkan
-    // device identity the gate below evaluates. The device-farm Pixel 9 went red while
-    // the friend's Pixel 9 Pro went green on the SAME binary -> the old deviceName.find
-    // ("Mali") gate missed because ARM brands the premium Valhall tier "Immortalis-G715".
-    // Print everything that could feed a discriminator so a red round is still decisive
-    // (R5: never gate on a runtime id you haven't captured from the actual target).
+    // device identity (name / vendorID / deviceID / driverVersion / driverId / arch /
+    // subgroup). On the CI device-farm Mali-G715 this captured deviceName='Mali-G715',
+    // vendorID=0x13b5, driverId=9, subgroup=16. Kept as ground truth (R5).
+    // NOTE: the former H1 force-unaligned gate was REMOVED here — on the CI ARM driver
+    // forcing the unaligned F32 mul_mm pipeline was CATASTROPHIC (pw1_mulmat 10.4 -> 184417
+    // + NaN, non-deterministic) while the stock ALIGNED path is deterministic-finite (10.4).
+    // So we no longer dodge the aligned path; we characterize/fix it directly via the
+    // in-APK tts-cpp mul_mat selftest. (#2605 Mali->CPU stays the shipping fallback.)
 #if defined(__ANDROID__)
     {
         static bool s_vkdev_logged = false;
@@ -7525,47 +7528,6 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         }
     }
 #endif
-
-    // QVAC-20557 (Mali/Valhall, DO-NOT-MERGE probe H1): ARM Mali/Valhall miscomputes
-    // the ALIGNED (no-bounds-check LOAD_VEC_A=4) F32 mul_mm path — a few ~4x output
-    // outliers on K-spanning->=2-tile shapes (e.g. the Supertonic duration predictor's
-    // K=64 pointwise conv), confirmed on-device: Pixel-9 pw1_mulmat max 10.4 vs an
-    // Adreno control of 2.5 for a BIT-IDENTICAL input. Force the bounds-checked
-    // UNALIGNED variant to route around the aligned vec4 load.
-    // VENDOR-gated (ARM 0x13B5), NOT path-gated: Android builds disable coopmat for ALL
-    // Vulkan devices (GGML_VULKAN_DISABLE_COOPMAT=ON), so Samsung Xclipse shares this
-    // non-coopmat path and must stay on the fast aligned path (it computes correctly).
-    // vendorID covers BOTH "Mali-*" and the premium "Immortalis-*" Valhall branding;
-    // the device-name substrings stay as a belt-and-suspenders fallback.
-    {
-        const std::string vk_dev_name(ctx->device->properties.deviceName.data());
-        const bool is_arm_valhall =
-            ctx->device->vendor_id == 0x13B5 /* ARM Ltd */
-            || vk_dev_name.find("Mali") != std::string::npos
-            || vk_dev_name.find("Immortalis") != std::string::npos;
-        if (aligned && src1_type == GGML_TYPE_F32
-                && (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16)
-                && is_arm_valhall) {
-            aligned = false;
-            // DEBUG (QVAC-20557 H1, DO-NOT-MERGE): one-shot confirmation the gate FIRED.
-            // GGML_LOG_* from this dlopened backend .so does NOT reach Android logcat, so
-            // the NDK log is the one that actually lands there; keep GGML_LOG for desktop.
-            static bool s_h1_logged = false;
-            if (!s_h1_logged) {
-                s_h1_logged = true;
-#if defined(__ANDROID__)
-                __android_log_print(ANDROID_LOG_WARN, "qvac-supertonic",
-                    "[gpu-diag] QVAC-20557 H1: ARM Valhall F32 mul_mat -> UNALIGNED pipeline "
-                    "(gate FIRED, vendorID=0x%x dev=%s)",
-                    (unsigned) ctx->device->vendor_id,
-                    ctx->device->properties.deviceName.data());
-#endif
-                GGML_LOG_WARN("[gpu-diag] QVAC-20557 H1: ARM Valhall F32 mul_mat -> UNALIGNED pipeline (gate FIRED, vendorID=0x%x dev=%s)\n",
-                              (unsigned) ctx->device->vendor_id,
-                              ctx->device->properties.deviceName.data());
-            }
-        }
-    }
 
     if (ctx->device->coopmat2) {
         const uint32_t shader_core_count = ctx->device->shader_core_count;
