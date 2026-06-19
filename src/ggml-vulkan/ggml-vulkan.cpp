@@ -10402,7 +10402,10 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t ksh = ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
 
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = MatBc * osh_stride * f16vec4;
+    // pvsh is ACC_TYPEV4 in flash_attn_cm1.comp (4 * acctype bytes): vec4 (16B) for
+    // f32acc, f16vec4 (8B) otherwise. Must track the shader or the pipeline silently
+    // falls back to scalar on shmem-constrained devices.
+    const uint32_t pvsh = MatBc * osh_stride * 4 * acctype;
 
     const uint32_t slope = Br * acctype;
 
