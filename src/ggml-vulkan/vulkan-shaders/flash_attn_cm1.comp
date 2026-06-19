@@ -53,7 +53,9 @@ const uint vsh_stride = v_cols;
 shared f16vec4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
 
 const uint32_t osh_stride = row_split * MatBr / 4;
-shared f16vec4 pvsh[MatBc * osh_stride];
+// PV accumulator staging: ACC_TYPEV4 so the f32acc variant (GGML_PREC_F32)
+// accumulates P*V and the running output in f32. f16acc variant is unchanged.
+shared ACC_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
@@ -141,10 +143,10 @@ void main() {
     }
 #endif
 
-    f16vec4 Of[rows_per_thread][d_per_thread];
+    ACC_TYPEV4 Of[rows_per_thread][d_per_thread];
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
         [[unroll]] for (uint32_t d = 0; d < d_per_thread; ++d) {
-            Of[r][d] = f16vec4(0.0);
+            Of[r][d] = ACC_TYPEV4(0.0);
         }
     }
 
@@ -493,7 +495,7 @@ void main() {
         [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
             const uint d_local = d0 / threads_per_rowgroup;
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Of[r][d_local] = float16_t(eMf[r]) * Of[r][d_local];
+                Of[r][d_local] = ACC_TYPE(eMf[r]) * Of[r][d_local];
             }
         }
 
@@ -586,7 +588,7 @@ void main() {
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
             const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
 
-            coopmat<float16_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat = coopmat<float16_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+            coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
 
             // Preload V tiles for [Bc, 16 * num subgroups]
             const uint v_rows = Bc;
@@ -707,7 +709,7 @@ void main() {
                         const uint d = d0 + col_tid;
                         if (d >= HSV/4) break;
                         const uint d_local = d0 / threads_per_rowgroup;
-                        gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N);
+                        gqaStore(tile_row(r), d, FLOAT_TYPEV4(Of[r][d_local]), o_offset, iq2, N);
                     }
                 }
             }
@@ -757,7 +759,7 @@ void main() {
 
                 [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
                     const uint d_local = d0 / threads_per_rowgroup;
-                    Of[r][d_local] *= float16_t(ms);
+                    Of[r][d_local] *= ACC_TYPE(ms);
                 }
             } else {
                 vs = exp(sink - Mf[r]);
@@ -775,9 +777,9 @@ void main() {
     [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
         const uint d_local = d0 / threads_per_rowgroup;
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            Of[r][d_local] *= float16_t(Lfrcp[r]);
+            Of[r][d_local] *= ACC_TYPE(Lfrcp[r]);
 #if defined(FLOAT_TYPE_MAX)
-            Of[r][d_local] = clamp(Of[r][d_local], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
+            Of[r][d_local] = clamp(Of[r][d_local], ACC_TYPE(-FLOAT_TYPE_MAX), ACC_TYPE(FLOAT_TYPE_MAX));
 #endif
         }
     }
@@ -791,7 +793,7 @@ void main() {
                     const uint d = d0 + col_tid;
                     if (d >= HSV / 4) break;
                     const uint d_local = d0 / threads_per_rowgroup;
-                    gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N);
+                    gqaStore(tile_row(r), d, FLOAT_TYPEV4(Of[r][d_local]), o_offset, iq2, N);
                 }
             }
         }
