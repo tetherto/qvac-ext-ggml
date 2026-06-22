@@ -671,6 +671,13 @@ struct vk_device_struct {
     uint32_t coopmat_n;
     uint32_t coopmat_k;
 
+    bool coopmat_f32_support {};
+    bool coopmat_f32_acc_f32_support {};
+    bool coopmat_f32_support_16x16x16_f32acc {};
+    uint32_t coopmat_f32_m {};
+    uint32_t coopmat_f32_n {};
+    uint32_t coopmat_f32_k {};
+
     bool coopmat_int_support;
     uint32_t coopmat_int_m;
     uint32_t coopmat_int_n;
@@ -692,6 +699,7 @@ struct vk_device_struct {
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
+    vk_matmul_pipeline pipeline_matmul_f32_cm1 {};
     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
     vk_matmul_pipeline pipeline_matmul_bf16 {};
     vk_matmul_pipeline2 pipeline_matmul_f16;
@@ -3285,7 +3293,8 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 
     // Needs to be kept up to date on shader changes
     const uint32_t bank_conflict_offset = device->coopmat_support ? 8 : 1;
-    const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
+    const bool     f32_only             = (src0_type == GGML_TYPE_F32 && device->coopmat_f32_support_16x16x16_f32acc);
+    const uint32_t type_size = device->fp16 && !f32_only ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t warps = warptile[0] / warptile[10];
 
     const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
@@ -3388,6 +3397,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     // mulmat
     std::vector<uint32_t> l_warptile, m_warptile, s_warptile,
+                          l_warptile_f32, m_warptile_f32, s_warptile_f32,
                           l_warptile_id, m_warptile_id, s_warptile_id,
                           l_warptile_mmq, m_warptile_mmq, s_warptile_mmq,
                           l_warptile_mmq_int, m_warptile_mmq_int, s_warptile_mmq_int,
@@ -3450,15 +3460,42 @@ static void ggml_vk_load_shaders(vk_device& device) {
         const uint32_t tk_m = device->coopmat_support ? device->coopmat_k : 1;
         const uint32_t tk_s = device->coopmat_support ? device->coopmat_k : 1;
 
-        const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
+        const bool coopmat_support_f32 = device->coopmat_f32_support_16x16x16_f32acc;
+        const uint32_t tm_l_f32 = coopmat_support_f32 ? device->coopmat_f32_m : 4;
+        const uint32_t tm_m_f32 = coopmat_support_f32 ? device->coopmat_f32_m : 4;
+        const uint32_t tm_s_f32 = coopmat_support_f32 ? device->coopmat_f32_m : 2;
+        const uint32_t tn_l_f32 = coopmat_support_f32 ? device->coopmat_f32_n : 4;
+        const uint32_t tn_m_f32 = coopmat_support_f32 ? device->coopmat_f32_n : 2;
+        const uint32_t tn_s_f32 = coopmat_support_f32 ? device->coopmat_f32_n : 2;
+        const uint32_t tk_l_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
+        const uint32_t tk_m_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
+        const uint32_t tk_s_f32 = coopmat_support_f32 ? device->coopmat_f32_k : 1;
 
-        l_warptile = { 128,             128, 128, 16, subgroup_size_8 * 2, 64, 2, tm_l, tn_l, tk_l, subgroup_size_8 };
-        m_warptile = { 128,              64,  64, 16, subgroup_size_8,     32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-        s_warptile = { subgroup_size_32, 32,  32, 16, s_warptile_wm,       32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+        const auto calc_tile = [&](uint32_t base_bm, uint32_t base_bn, uint32_t block_tk, uint32_t base_wm,
+                             uint32_t base_wn, uint32_t tm, uint32_t tn, uint32_t tk) -> std::vector<uint32_t>{
+            const uint32_t wm = std::max(base_wm, tm);
+            const uint32_t wn = std::max(base_wn, tn);
+            const uint32_t bm = base_bm * wm / base_wm;
+            const uint32_t bn = base_bn * wn / base_wn;
+            const uint32_t num_warps = (bm / wm) * (bn / wn);
+            const uint32_t block_size = num_warps * subgroup_size_8;
+            return { block_size, bm, bn, block_tk, wm, wn, 2, tm, tn, tk, subgroup_size_8 };
+        };
 
-        l_warptile_mmq = { 128,             128, 128, 32, subgroup_size_8 * 2, 64, 2, tm_l, tn_l, tk_l, subgroup_size_8 };
-        m_warptile_mmq = { 128,              64,  64, 32, subgroup_size_8,     32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-        s_warptile_mmq = { subgroup_size_32, 32,  32, 32, s_warptile_wm,       32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+        const uint32_t s_warptile_wm = std::clamp(device->subgroup_size, 8u, 32u);
+        const uint32_t s_warptile_wm_f32 = std::clamp(device->subgroup_size, 16u, 32u);
+
+        l_warptile = calc_tile(128, 128, 16, subgroup_size_8 * 2, 64, tm_l, tn_l, tk_l);
+        m_warptile = calc_tile( 64,  64, 16, subgroup_size_8,     32, tm_m, tn_m, tk_m);
+        s_warptile = calc_tile( 32,  32, 16, s_warptile_wm,       32, tm_s, tn_s, tk_s);
+
+        l_warptile_f32 = calc_tile(128, 128, 32, subgroup_size_8 * 2, 64, tm_l_f32, tn_l_f32, tk_l_f32);
+        m_warptile_f32 = calc_tile( 64,  64, 32, subgroup_size_8,     32, tm_m_f32, tn_m_f32, tk_m_f32);
+        s_warptile_f32 = calc_tile( 32,  32, 32, s_warptile_wm_f32,   32, tm_s_f32, tn_s_f32, tk_s_f32);
+
+        l_warptile_mmq = calc_tile(128, 128, 32, subgroup_size_8 * 2, 64, tm_l, tn_l, tk_l);
+        m_warptile_mmq = calc_tile( 64,  64, 32, subgroup_size_8,     32, tm_m, tn_m, tk_m);
+        s_warptile_mmq = calc_tile( 32,  32, 32, s_warptile_wm,       32, tm_s, tn_s, tk_s);
 
         // Integer MMQ has a smaller shared memory profile, but heavier register use
         l_warptile_mmq_int = { 128,             128, 128, 32, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8 };
@@ -3501,9 +3538,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
         }
 
-        l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
-        m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
-        s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+        l_wg_denoms     = { l_warptile[1],     l_warptile[2],     1 };
+        m_wg_denoms     = { m_warptile[1],     m_warptile[2],     1 };
+        s_wg_denoms     = { s_warptile[1],     s_warptile[2],     1 };
+        l_mmq_wg_denoms = { l_warptile_mmq[1], l_warptile_mmq[2], 1 };
+        m_mmq_wg_denoms = { m_warptile_mmq[1], m_warptile_mmq[2], 1 };
+        s_mmq_wg_denoms = { s_warptile_mmq[1], s_warptile_mmq[2], 1 };
         l_align = 128;
         m_align =  64;
         s_align =  32;
@@ -3534,11 +3574,27 @@ static void ggml_vk_load_shaders(vk_device& device) {
             } else if (!ggml_vk_matmul_shmem_support(device, l_warptile_mmqid, true, t)) {
                 device->mul_mat_id_l[i] = false;
             }
+
+            if (t == GGML_TYPE_F32 && device->coopmat_f32_support_16x16x16_f32acc) {
+                if (!ggml_vk_matmul_shmem_support(device, s_warptile_f32, false, t)) {
+                    device->mul_mat_s[i] = false;
+                    device->mul_mat_m[i] = false;
+                    device->mul_mat_l[i] = false;
+                } else if (!ggml_vk_matmul_shmem_support(device, m_warptile_f32, false, t)) {
+                    device->mul_mat_m[i] = false;
+                    device->mul_mat_l[i] = false;
+                } else if (!ggml_vk_matmul_shmem_support(device, l_warptile_f32, false, t)) {
+                    device->mul_mat_l[i] = false;
+                }
+            }
         }
     }
 
     if (!device->pipeline_matmul_f32) {
         device->pipeline_matmul_f32 = std::make_shared<vk_matmul_pipeline_struct>();
+    }
+    if (!device->pipeline_matmul_f32_cm1) {
+        device->pipeline_matmul_f32_cm1 = std::make_shared<vk_matmul_pipeline_struct>();
     }
     if (!device->pipeline_matmul_f32_f16) {
         device->pipeline_matmul_f32_f16 = std::make_shared<vk_matmul_pipeline_struct>();
@@ -3839,8 +3895,26 @@ static void ggml_vk_load_shaders(vk_device& device) {
             CREATE_MM(TYPE, PIPELINE_NAME . f32acc, NAMELC, , WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         } \
 
+        // 6 variants {s,m,l}x{unaligned,aligned} for the f32-input/f32-output cm1 path (Mali native f32 coopmat)
+#define CREATE_MM_FP32(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
+        if (device->mul_mat ## ID ## _l[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC "_l", NAMELC ## _cm1_fp32_len, NAMELC ## _cm1_fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1, false, true); \
+        if (device->mul_mat ## ID ## _m[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC "_m", NAMELC ## _cm1_fp32_len, NAMELC ## _cm1_fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, 1, false, true); \
+        if (device->mul_mat ## ID ## _s[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC "_s", NAMELC ## _cm1_fp32_len, NAMELC ## _cm1_fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, 1, false, true); \
+        if (device->mul_mat ## ID ## _l[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC "_aligned_l", NAMELC ## _aligned_cm1_fp32_len, NAMELC ## _aligned_cm1_fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, l_align, false, true); \
+        if (device->mul_mat ## ID ## _m[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC "_aligned_m", NAMELC ## _aligned_cm1_fp32_len, NAMELC ## _aligned_cm1_fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, m_ ## WARPTILE, m_align, false, true); \
+        if (device->mul_mat ## ID ## _s[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC "_aligned_s", NAMELC ## _aligned_cm1_fp32_len, NAMELC ## _aligned_cm1_fp32_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, s_ ## WARPTILE, s_align, false, true); \
+
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
+        if (device->coopmat_f32_support_16x16x16_f32acc) {
+            CREATE_MM_FP32(GGML_TYPE_F32, pipeline_matmul_f32_cm1, matmul_f32_f32, wg_denoms, warptile_f32, vk_mat_mat_push_constants, 3, );
+        }
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
@@ -3932,6 +4006,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MM2(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL],  matmul_id_subgroup_iq4_nl_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4],   matmul_id_subgroup_mxfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_NVFP4,   pipeline_dequant_mul_mat_mat_id[GGML_TYPE_NVFP4],   matmul_id_subgroup_nvfp4_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+#undef CREATE_MM_FP32
 #undef CREATE_MM2
 #undef CREATE_MM
     } else
@@ -4248,7 +4323,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         && !device->coopmat_bf16_support
 #endif
         ) {
-        const uint32_t s_warptile_wm = device->subgroup_size == 8 ? 8 : 32;
+        const uint32_t s_warptile_wm = std::clamp(device->subgroup_size, 8u, 32u);
 
         // use scalar tile sizes
         l_warptile = { 128, 128, 128, 16, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8 };
@@ -5637,11 +5712,45 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
             pfn_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(device->physical_device, &cm_props_num, cm_props.data());
 
+            // On some GPUs (e.g. Mali) vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR returns
+            // entries unordered, so the naive "pick the first match" can select a suboptimal shape
+            // (e.g. f16xf16xf32 4x8x8). Sort by largest volume/shape/type so the best shape wins.
+            constexpr const auto make_coop_mat_key = [](const auto& p) {
+                return std::make_tuple(uint64_t(p.MSize) * p.NSize * p.KSize,
+                                       p.KSize, p.NSize, p.MSize,
+                                       uint32_t(p.AType), uint32_t(p.BType), uint32_t(p.CType), uint32_t(p.ResultType));
+            };
+            std::sort(cm_props.begin(), cm_props.end(), [&](const auto& lhs, const auto& rhs) {
+                return make_coop_mat_key(lhs) > make_coop_mat_key(rhs);
+            });
+
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix Shapes: " << cm_props.size());
 
             for (auto& prop : cm_props) {
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
 
+                if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat32 &&
+                    (vk::ComponentTypeKHR)prop.BType == vk::ComponentTypeKHR::eFloat32 &&
+                    (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup
+                ) {
+                    if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat32 &&
+                        (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat32) {
+                        // coopmat sizes not set yet
+                        if (device->coopmat_f32_m == 0) {
+                            device->coopmat_f32_support = true;
+                            device->coopmat_f32_acc_f32_support = true;
+                            device->coopmat_f32_m = prop.MSize;
+                            device->coopmat_f32_n = prop.NSize;
+                            device->coopmat_f32_k = prop.KSize;
+                        } else if (device->coopmat_f32_m == prop.MSize && device->coopmat_f32_n == prop.NSize && device->coopmat_f32_k == prop.KSize) {
+                            // Only enable if shape is identical
+                            device->coopmat_f32_acc_f32_support = true;
+                        }
+                        if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_f32_support_16x16x16_f32acc = true;
+                        }
+                    }
+                }
                 if ((vk::ComponentTypeKHR)prop.AType == vk::ComponentTypeKHR::eFloat16 &&
                     (vk::ComponentTypeKHR)prop.BType == vk::ComponentTypeKHR::eFloat16 &&
                     (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup
@@ -5714,6 +5823,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 // No suitable matmul mode found
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
                 device->coopmat_support = false;
+            }
+            if (!device->coopmat_support || device->coopmat_f32_m == 0 || !device->coopmat_f32_support_16x16x16_f32acc) {
+                device->coopmat_f32_support_16x16x16_f32acc = false;
+                device->coopmat_f32_acc_f32_support = false;
+                device->coopmat_f32_support = false;
             }
             if (getenv("GGML_VK_DISABLE_BFLOAT16")) {
                 device->coopmat_bf16_support = false;
@@ -6432,6 +6546,12 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
 static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+        // Mali (and other coopmat1 GPUs that advertise native f32 16x16x16 coopmat): use the
+        // dedicated f32-input cm1 matmul path instead of the f32->f16-converting shader.
+        if (ctx->device->coopmat_f32_support_16x16x16_f32acc) {
+            assert(ctx->device->coopmat_support);
+            return ctx->device->pipeline_matmul_f32_cm1;
+        }
         return ctx->device->pipeline_matmul_f32;
     }
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) {
