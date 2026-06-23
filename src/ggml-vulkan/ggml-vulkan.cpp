@@ -111,6 +111,7 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 #define VK_VENDOR_ID_AMD 0x1002
 #define VK_VENDOR_ID_APPLE 0x106b
+#define VK_VENDOR_ID_ARM 0x13b5
 #define VK_VENDOR_ID_INTEL 0x8086
 #define VK_VENDOR_ID_NVIDIA 0x10de
 #define VK_VENDOR_ID_QUALCOMM 0x5143
@@ -16415,6 +16416,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
+            // QVAC-20557: the ARM Mali Vulkan driver miscomputes conv_transpose_1d
+            // (device-confirmed on Mali-G715: Chatterbox HiFT ISTFT output ~5x too
+            // quiet, round O). Decline it on Mali so ggml_backend_sched routes the op
+            // to CPU, exactly as ggml-opencl/Adreno already do (OpenCL has no kernel
+            // for it). Mirrors the FLASH_ATTN_EXT->Qualcomm decline above. Mali-only
+            // (vendorID 0x13b5, device-captured); every other vendor keeps it on GPU.
+            if (device->vendor_id == VK_VENDOR_ID_ARM) {
+                return false;
+            }
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:
         case GGML_OP_CONV_TRANSPOSE_2D:
