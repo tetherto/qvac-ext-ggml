@@ -525,7 +525,7 @@ void main() {
                         const uint d = d0 + col_tid;
                         if (d >= HSV/4) break;
                         const uint d_local = d0 / threads_per_rowgroup;
-                        gqaStore(tile_row(r), d, FLOAT_TYPEV4(Of[r][d_local]), o_offset, iq2, N);
+                        gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N);
                     }
                 }
             }
@@ -609,7 +609,7 @@ void main() {
                     const uint d = d0 + col_tid;
                     if (d >= HSV / 4) break;
                     const uint d_local = d0 / threads_per_rowgroup;
-                    gqaStore(tile_row(r), d, FLOAT_TYPEV4(Of[r][d_local]), o_offset, iq2, N);
+                    gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N);
                 }
             }
         }
