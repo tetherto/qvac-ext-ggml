@@ -4525,7 +4525,7 @@ struct ggml_tensor * ggml_conv_1d(
         int                   s0,
         int                   p0,
         int                   d0) {
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16); // [N, OL, IC * K]
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, a->type); // [N, OL, IC * K]
 
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
@@ -4559,7 +4559,7 @@ struct ggml_tensor * ggml_conv_1d_dw(
         int                   d0) {
     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, b->ne[1], b->ne[2]);
 
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16);
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, a->type);
 
     struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a);
 
@@ -7332,10 +7332,34 @@ int ggml_graph_n_nodes(struct ggml_cgraph * cgraph) {
     return cgraph->n_nodes;
 }
 
+struct ggml_tensor * ggml_graph_leaf(struct ggml_cgraph * cgraph, int i) {
+    if (i < 0) {
+        GGML_ASSERT(cgraph->n_leafs + i >= 0);
+        return cgraph->leafs[cgraph->n_leafs + i];
+    }
+
+    GGML_ASSERT(i < cgraph->n_leafs);
+    return cgraph->leafs[i];
+}
+
+struct ggml_tensor ** ggml_graph_leafs(struct ggml_cgraph * cgraph) {
+    return cgraph->leafs;
+}
+
+int ggml_graph_n_leafs(struct ggml_cgraph * cgraph) {
+    return cgraph->n_leafs;
+}
+
 void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
     GGML_ASSERT(cgraph->size > cgraph->n_nodes);
     cgraph->nodes[cgraph->n_nodes] = tensor;
     cgraph->n_nodes++;
+}
+
+void ggml_graph_add_leaf(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
+    GGML_ASSERT(cgraph->size > cgraph->n_leafs);
+    cgraph->leafs[cgraph->n_leafs] = tensor;
+    cgraph->n_leafs++;
 }
 
 struct ggml_tensor * ggml_graph_get_tensor(const struct ggml_cgraph * cgraph, const char * name) {
