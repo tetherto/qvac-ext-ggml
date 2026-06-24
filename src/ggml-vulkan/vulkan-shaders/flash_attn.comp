@@ -764,7 +764,7 @@ void main() {
                 const uint row = tile_row(r);
                 if (row < N) {
                     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                        gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
+                        gqaStore(row, d * D_split + d_tid, ACC_TYPEV4(Of[r][d]), o_offset, iq2, N);
                     }
                 }
             }
@@ -842,7 +842,7 @@ void main() {
             const uint row = tile_row(r);
             if (row < N) {
                 [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                    gqaStore(row, d * D_split + d_tid, Of[r][d], o_offset, iq2, N);
+                    gqaStore(row, d * D_split + d_tid, ACC_TYPEV4(Of[r][d]), o_offset, iq2, N);
                 }
             }
         }
