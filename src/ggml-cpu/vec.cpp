@@ -1,6 +1,8 @@
 #include "vec.h"
 
 #include <cassert>
+#include <cstdio>    // [VERIFY-ONLY] [sve-diag] fprintf(stderr) — NOT in the fix PR
+#include <cstdlib>   // [VERIFY-ONLY] getenv() A/B toggle — NOT in the fix PR
 
 // precomputed gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_f16[1 << 16];
@@ -19,6 +21,16 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
     float sumf = 0.0f;
 
     #if defined(__ARM_FEATURE_SVE)
+        {   // [VERIFY-ONLY] prove the SVE dot path actually ran on-device + which tail, once per process. NOT in the fix PR.
+            static bool sve_diag_printed = false;
+            if (!sve_diag_printed) {
+                sve_diag_printed = true;
+                const int diag_svcntb = ggml_cpu_get_sve_cnt();
+                fprintf(stderr, "[sve-diag] ggml_vec_dot_f32 SVE active: svcntb=%d epr=%d tail=%s\n",
+                        diag_svcntb, diag_svcntb * 8 / 32,
+                        (getenv("TTS_SVE_DOT_UNFIXED") ? "svmad(UNFIXED)" : "svmla(FIXED)"));
+            }
+        }
         const int sve_register_length = ggml_cpu_get_sve_cnt() * 8;
         const int ggml_f32_epr = sve_register_length / 32;//8;//svcntw(); // SVE128:4, SVE256:8, SVE512:16
         const int ggml_f32_step = 8 * ggml_f32_epr; // choose 8 SVE registers
@@ -83,7 +95,13 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
             // svmla (merge into the accumulator) preserves sum1 on inactive lanes; svmad's _m merge would
             // overwrite them with ax1 (=0 from the predicated load), discarding the main-loop partial sums
             // and biasing the reduction for any n not a multiple of ggml_f32_epr.
-            sum1 = svmla_f32_m(pg, sum1, ax1, ay1);
+            // [VERIFY-ONLY] env toggle to A/B the fix on a single binary; default = svmla (the fix). NOT in the fix PR.
+            static const bool sve_dot_unfixed = (getenv("TTS_SVE_DOT_UNFIXED") != nullptr);
+            if (sve_dot_unfixed) {
+                sum1 = svmad_f32_m(pg, ax1, ay1, sum1);   // old buggy tail (reproduces the Nyquist tone)
+            } else {
+                sum1 = svmla_f32_m(pg, sum1, ax1, ay1);
+            }
         }
         // reduce sum1,sum2 to sum1
         GGML_F32_VEC_REDUCE(sumf, sum1, sum2, sum3, sum4, sum5, sum6, sum7, sum8);
