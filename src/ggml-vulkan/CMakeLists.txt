@@ -7,6 +7,7 @@ if (POLICY CMP0147)
 endif()
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
+find_package(SPIRV-Headers QUIET)
 
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
@@ -112,11 +113,15 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+
+    if (TARGET SPIRV-Headers::SPIRV-Headers)
+        target_link_libraries(ggml-vulkan PRIVATE SPIRV-Headers::SPIRV-Headers)
+    endif()
+
     target_include_directories(ggml-vulkan
         PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR}
             ../../../vendor
-
     )
     if (ANDROID)
         target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
