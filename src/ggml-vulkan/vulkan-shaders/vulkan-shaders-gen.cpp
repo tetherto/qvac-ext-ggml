@@ -515,6 +515,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
     };
 
+    // The coopmat-f32 (cm1 f32-input) pass only needs the f32 shaders; skip the f16/bf16 B_TYPE variants.
+    const bool coopmat_f32_only = coopmat && !fp16;
+
+    if (!coopmat_f32_only) {
     const std::map<std::string, std::string> float_type_dict_f16 = {
         {"FLOAT_TYPE",   FLOAT_TYPE(1, "f16")},
         {"FLOAT_TYPEV2", FLOAT_TYPE(2, "f16")},
@@ -552,6 +556,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             string_to_spv(shader_name + "_bf16_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict_bf16), {{"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", "4"}, {"B_TYPE", coopmat2 ? "bfloat16_t" : "u16vec4"},  {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
         }
     }
+    }
 
     for (const auto& tname : type_names) {
         std::string load_vec_quant = "2";
@@ -560,7 +565,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         else if ((tname == "q5_0") || (tname == "q8_0") || (tname == "q2_k") || (tname == "q4_k") || (tname == "q5_k") || (tname == "iq3_xxs") || (tname == "iq3_s") || (tname == "iq4_xs") || (tname == "iq4_nl") || (tname == "mxfp4") || (tname == "nvfp4"))
             load_vec_quant = "4";
 
-        if (tname == "bf16") {
+        if (tname == "bf16" ||
+            (coopmat_f32_only && tname != "f32")) {
             continue;
         }
 
@@ -610,7 +616,8 @@ void process_shaders() {
 
         if (matmul_id_type != MatMulIdType::DEFAULT) {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-            // Coopmat, fp32acc and fp16acc
+            // Coopmat, fp32, fp32acc and fp16acc
+            matmul_shaders(false, matmul_id_type, true, false, false);
             matmul_shaders(true, matmul_id_type, true, false, false);
             matmul_shaders(true, matmul_id_type, true, false, true);
 #endif
