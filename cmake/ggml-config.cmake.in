@@ -89,6 +89,7 @@ if (NOT GGML_SHARED_LIB)
     # a Vulkan SDK. Keep the dependency for non-DL builds, which link it directly.
     if (GGML_VULKAN AND NOT GGML_BACKEND_DL)
         find_dependency(Vulkan)
+        find_dependency(SPIRV-Headers CONFIG)
         set(GGML_VULKAN_INTERFACE_LINK_LIBRARIES $<LINK_ONLY:Vulkan::Vulkan>)
     endif()
 
