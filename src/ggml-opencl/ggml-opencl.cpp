@@ -8403,6 +8403,15 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     cl_command_queue queue = backend_ctx->queue;
 
 #ifdef GGML_OPENCL_SOA_Q
+    static std::mutex set_tensor_soa_mutex;
+    std::unique_lock<std::mutex> set_tensor_soa_lock;
+    if (ggml_is_quantized(tensor->type)) {
+        // Quantized SOA uploads use backend-level scratch buffers during
+        // conversion/transposition, so concurrent model-loader threads must not
+        // enter this path at the same time.
+        set_tensor_soa_lock = std::unique_lock<std::mutex>(set_tensor_soa_mutex);
+    }
+
     if (tensor->type == GGML_TYPE_Q1_0) {
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
         GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
