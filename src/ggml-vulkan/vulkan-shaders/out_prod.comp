@@ -53,4 +53,3 @@ void main() {
         idx += num_threads;
     }
 }
-
