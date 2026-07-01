@@ -656,7 +656,11 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     // Use Vulkan backend to obtain GPU information
     ggml_backend_reg_t vulkanBackend           = ggml_backend_reg_by_name("vulkan");
     int                devicesMinAdrenoVersion = minAdrenoVersion(vulkanBackend);
-    if (devicesMinAdrenoVersion <= 0) {
+    if (devicesMinAdrenoVersion == -2) {
+        GGML_LOG_INFO(
+            "%s: Vulkan backend unavailable for Adreno detection; keeping OpenCL backend available\n",
+            __func__);
+    } else if (devicesMinAdrenoVersion <= 0) {
         GGML_LOG_INFO(
             "%s: no adreno GPU version found (%d) removing OpenCL backend (if any) to rely on Vulkan/cpu only\n",
             __func__, devicesMinAdrenoVersion);
