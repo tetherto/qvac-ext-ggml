@@ -4641,14 +4641,23 @@ struct ggml_backend_opencl_buffer_context {
     }
 
     ~ggml_backend_opencl_buffer_context() {
-        for (cl_mem buf : buffer) {
-            CL_CHECK(clReleaseMemObject(buf));
-        }
+        // Release in leaf-to-root order. `img` entries are images that wrap the
+        // quant/scale sub-buffers, those sub-buffers (extra->q / extra->d) are
+        // created via clCreateSubBuffer aliasing into the parent `buffer`
+        // object(s). The OpenCL spec defers parent-buffer deletion until every
+        // associated sub-buffer is released, but the Adreno/QCOM driver does not
+        // reliably honor that ref-counting: releasing the parent first can tear
+        // down host-side bookkeeping that a subsequent sub-buffer release then
+        // touches, corrupting the allocator heap. Always release children before
+        // parents so we never depend on that driver behavior.
+
+        // 1. Images wrapping the quant/scale sub-buffers.
         for (cl_mem im : img) {
             CL_CHECK(clReleaseMemObject(im));
         }
 
-        // Delete all extras to trigger their destructors
+        // 2. Delete all extras to trigger their destructors, which release the
+        //    quant/scale sub-buffers created via clCreateSubBuffer.
         for (ggml_tensor_extra_cl * e : temp_tensor_extras) {
             delete e;
         }
@@ -4659,6 +4668,12 @@ struct ggml_backend_opencl_buffer_context {
             delete e;
         }
         for (ggml_tensor_extra_cl_q4_0 * e : temp_tensor_extras_q4_0_in_use) {
+            delete e;
+        }
+        for (ggml_tensor_extra_cl_q4_1 * e : temp_tensor_extras_q4_1) {
+            delete e;
+        }
+        for (ggml_tensor_extra_cl_q4_1 * e : temp_tensor_extras_q4_1_in_use) {
             delete e;
         }
         for (ggml_tensor_extra_cl_mxfp4 * e : temp_tensor_extras_mxfp4) {
@@ -4690,6 +4705,12 @@ struct ggml_backend_opencl_buffer_context {
         }
         for (ggml_tensor_extra_cl_q5_K * e : temp_tensor_extras_q5_K_in_use) {
             delete e;
+        }
+
+        // 3. Finally release the parent buffer object(s), now that every
+        //    sub-buffer aliasing into them has been released.
+        for (cl_mem buf : buffer) {
+            CL_CHECK(clReleaseMemObject(buf));
         }
     }
 
