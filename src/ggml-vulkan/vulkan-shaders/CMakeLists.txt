@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.19)
 project("vulkan-shaders-gen" C CXX)
 
-option(GGML_VULKAN_BUILD_ADRENO_SHADERS "Build Adreno-specific shader variants" ON)
+if (ANDROID)
+    set(GGML_VULKAN_BUILD_ADRENO_SHADERS_DEFAULT ON)
+else()
+    set(GGML_VULKAN_BUILD_ADRENO_SHADERS_DEFAULT OFF)
+endif()
+option(GGML_VULKAN_BUILD_ADRENO_SHADERS "Build Adreno-specific shader variants" ${GGML_VULKAN_BUILD_ADRENO_SHADERS_DEFAULT})
 
 find_package (Threads REQUIRED)
 
