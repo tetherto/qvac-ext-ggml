@@ -111,6 +111,7 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 #define VK_VENDOR_ID_AMD 0x1002
 #define VK_VENDOR_ID_APPLE 0x106b
+#define VK_VENDOR_ID_ARM 0x13b5
 #define VK_VENDOR_ID_INTEL 0x8086
 #define VK_VENDOR_ID_NVIDIA 0x10de
 #define VK_VENDOR_ID_QUALCOMM 0x5143
@@ -7525,6 +7526,15 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // tile; fall back to the `_m` tile (BLOCK_SIZE=64, known-good). Cost: ~4x more
     // dispatches on Adreno; no correctness change.
     if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM && ctx->device->mul_mat_m[src0_type]) {
+        return aligned ? mmp->a_m : mmp->m;
+    }
+    // QVAC-21617: ARM Mali has few shader cores; the large (128x128) tile leaves
+    // tall-K / small-N GEMMs (e.g. the parakeet FFN m=1024 n=76 k=4096) with only
+    // ~8 workgroups -> severe underutilization + wasted N padding. The medium
+    // (64x64) tile roughly quadruples the workgroup count and cuts the parakeet
+    // Vulkan encoder ~18% (1.86x -> 2.26x vs CPU on Mali-G715 / Pixel 9); the
+    // whisper encoder drops ~18% too. Mirrors the Qualcomm fallback above.
+    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->mul_mat_m[src0_type]) {
         return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
@@ -16622,6 +16632,14 @@ static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
 
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch) {
     switch (props.vendorID) {
+    case VK_VENDOR_ID_ARM:
+        // QVAC-21617: ARM Mali (e.g. Mali-G715 on Tensor G4) advertises
+        // GL_KHR_cooperative_matrix, but its coopmat matmul path is ~5x slower
+        // than the scalar/vec path for the shapes used by the parakeet Conformer
+        // encoder (measured 12-19 GFLOPS with coopmat vs 90-130 GFLOPS without,
+        // on Mali-G715 / Pixel 9). Disabling coopmat here selects the fast path
+        // and flips the Vulkan encoder from ~2x slower than CPU to ~1.8x faster.
+        return false;
     case VK_VENDOR_ID_INTEL:
         // Only allowing Xe2 GPU at the moment since Xe2 GPU can gain significant performance boost,
         // while some older hardware (ex. Arc A770) has performance regressions
