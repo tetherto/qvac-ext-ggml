@@ -332,7 +332,12 @@ compile_count_guard acquire_compile_slot() {
 }
 
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
-    if (name.find("tbq") != std::string::npos || name.find("pq") != std::string::npos) {
+    if (name.find("tbq") != std::string::npos ||
+        name.find("pq") != std::string::npos ||
+        name.find("tq1_0") != std::string::npos ||
+        name.find("tq2_0") != std::string::npos ||
+        name.find("mxfp4") != std::string::npos ||
+        name.find("nvfp4") != std::string::npos) {
         const std::string noop_path = out_path + ".noop.comp";
         write_binary_file(noop_path, "#version 450\nlayout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;\nvoid main() {}\n");
         in_path = noop_path;
