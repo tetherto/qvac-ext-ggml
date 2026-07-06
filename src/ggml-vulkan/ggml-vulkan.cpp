@@ -899,7 +899,7 @@ struct vk_device_struct {
     // (createComputePipeline takes VK_NULL_HANDLE, which is legal).
     vk::PipelineCache pipeline_cache = VK_NULL_HANDLE;
     std::string       pipeline_cache_path;
-    // QVAC-17872 round-2: bytes already on disk for this cache.  Used by
+    // round-2: bytes already on disk for this cache. Used by
     // the eager flush in ggml_vk_load_shaders to skip the disk write on
     // pure cache-hit paths (warm runs where every pipeline came from the
     // seed blob): if getPipelineCacheData().size() == this value, the
@@ -958,7 +958,7 @@ static void ggml_vk_save_pipeline_cache(vk_device & device) {
         if (blob.empty()) {
             return;
         }
-        // QVAC-17872 round-2: skip the disk write if the cache content
+        // round-2: skip the disk write if the cache content
         // is byte-equivalent in size to what we already have on disk.
         // Avoids re-writing 1 MB on every cleanup of a process that
         // didn't compile any new pipelines (warm runs).  The eager-flush
@@ -5024,7 +5024,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         c.wait();
     }
 
-    // QVAC-17872 round-2: persist the pipeline cache eagerly when this
+    // round-2: persist the pipeline cache eagerly when this
     // load_shaders call actually GREW the cache (i.e. compiled at least
     // one pipeline whose SPIR-V was not already in the seed blob).
     // Without this, lazy-compile work done by
@@ -5827,7 +5827,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // to pay seconds of shader compile drops to tens of ms on drivers
         // without an aggressive per-app system cache (Mesa/RADV,
         // Android Adreno/Mali, fresh NVIDIA installs, containers).
-        // See: QVAC-17872 for measured cold->warm deltas.
+        // Measured meaningful cold->warm deltas in practice.
         // -------------------------------------------------------------------
         {
             const char * env_dir = getenv("GGML_VK_PIPELINE_CACHE_DIR");
@@ -5870,7 +5870,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
                     seed.empty() ? nullptr : seed.data());
                 try {
                     device->pipeline_cache = device->device.createPipelineCache(pci);
-                    // QVAC-17872 round-2: seed size matches the disk blob;
+                    // round-2: seed size matches the disk blob;
                     // if the eager-flush path observes the same size after
                     // a load_shaders call, it's a pure cache-hit run and
                     // the disk write is skipped.  The driver may rewrite
@@ -7528,7 +7528,7 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM && ctx->device->mul_mat_m[src0_type]) {
         return aligned ? mmp->a_m : mmp->m;
     }
-    // QVAC-21617: ARM Mali has few shader cores; the large (128x128) tile leaves
+    // ARM Mali has few shader cores; the large (128x128) tile leaves
     // tall-K / small-N GEMMs (e.g. the parakeet FFN m=1024 n=76 k=4096) with only
     // ~8 workgroups -> severe underutilization + wasted N padding. The medium
     // (64x64) tile roughly quadruples the workgroup count and cuts the parakeet
@@ -16633,7 +16633,7 @@ static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch) {
     switch (props.vendorID) {
     case VK_VENDOR_ID_ARM:
-        // QVAC-21617: ARM Mali (e.g. Mali-G715 on Tensor G4) advertises
+        // ARM Mali (e.g. Mali-G715 on Tensor G4) advertises
         // GL_KHR_cooperative_matrix, but its coopmat matmul path is ~5x slower
         // than the scalar/vec path for the shapes used by the parakeet Conformer
         // encoder (measured 12-19 GFLOPS with coopmat vs 90-130 GFLOPS without,
