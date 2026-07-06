@@ -331,13 +331,25 @@ compile_count_guard acquire_compile_slot() {
     return compile_count_guard(&compile_count, &decrement_compile_count);
 }
 
-void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
-    if (name.find("tbq") != std::string::npos ||
+bool should_strip_shader_payload(const std::string & name) {
+    return name.find("tbq") != std::string::npos ||
         name.find("pq") != std::string::npos ||
         name.find("tq1_0") != std::string::npos ||
         name.find("tq2_0") != std::string::npos ||
         name.find("mxfp4") != std::string::npos ||
-        name.find("nvfp4") != std::string::npos) {
+        name.find("nvfp4") != std::string::npos ||
+        name.find("repeat_back") != std::string::npos ||
+        name.find("rms_norm_back") != std::string::npos ||
+        name.find("silu_back") != std::string::npos ||
+        name.find("geglu_back") != std::string::npos ||
+        name.find("soft_max_back") != std::string::npos ||
+        name.find("cross_entropy_loss") != std::string::npos ||
+        name.find("opt_step") != std::string::npos ||
+        name.find("out_prod") != std::string::npos;
+}
+
+void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
+    if (should_strip_shader_payload(name)) {
         const std::string noop_path = out_path + ".noop.comp";
         write_binary_file(noop_path, "#version 450\nlayout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;\nvoid main() {}\n");
         in_path = noop_path;
