@@ -156,6 +156,7 @@ set(GGML_OPENCL_KERNELS
     conv2d_dw
     zero_upsample
     channel_shuffle
+    affine_prelu
     tsembd
     upscale
     tanh
