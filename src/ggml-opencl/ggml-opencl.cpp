@@ -10195,6 +10195,24 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     const cl_int dim = ((const int32_t *) dst->op_params)[0];
     GGML_ASSERT(dim >= 0 && dim <= 3);
 
+    // Fast path: a contiguous "linear split" concat (all axes outer to `dim` are 1, so dst is just
+    // src0 followed by src1 in memory) is two plain DMA copies -- no kernel, no per-thread integer
+    // division, full memory bandwidth. Common case for the unrolled-GRU stitch (concat [H,B,k] +
+    // [H,B,1] along dim 2, ne3==1) where the generic kernel wastes warps on the tiny ne0=hidden.
+    bool linear_split = ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+    for (int d = dim + 1; d < 4 && linear_split; ++d) {
+        if (dst->ne[d] != 1) linear_split = false;
+    }
+    if (linear_split) {
+        const size_t sz0 = ggml_nbytes(src0);
+        const size_t sz1 = ggml_nbytes(src1);
+        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, extra0->data_device, extrad->data_device,
+                                     offset0, offsetd,       sz0, 0, NULL, NULL));
+        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue, extra1->data_device, extrad->data_device,
+                                     offset1, offsetd + sz0, sz1, 0, NULL, NULL));
+        return;
+    }
+
     int nth = MIN(64, ne0);
 
     cl_kernel kernel = backend_ctx->kernel_concat_f32;
