@@ -153,6 +153,7 @@ set(GGML_OPENCL_KERNELS
     transpose
     concat
     gru
+    conv2d_dw
     tsembd
     upscale
     tanh
