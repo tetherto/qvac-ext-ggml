@@ -154,6 +154,7 @@ set(GGML_OPENCL_KERNELS
     concat
     gru
     conv2d_dw
+    zero_upsample
     tsembd
     upscale
     tanh
