@@ -598,6 +598,11 @@ extern "C" {
         // instead of a transpose/pad/transpose/cont chain.
         GGML_OP_ZERO_UPSAMPLE,
 
+        // Channel shuffle over ne2 (QVAC overlay, LavaSR denoiser): one
+        // plane copy per output channel instead of a permute/reshape/
+        // transpose/cont dance.
+        GGML_OP_CHANNEL_SHUFFLE,
+
         GGML_OP_COUNT,
     };
 
@@ -2482,6 +2487,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   s);
+
+    // Channel shuffle of ne2 into `groups` groups (PyTorch channel_shuffle):
+    // result channel c' = a channel (c'%groups)*(ne2/groups) + c'/groups.
+    // a must be contiguous and ne2 % groups == 0.
+    GGML_API struct ggml_tensor * ggml_channel_shuffle(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   groups);
 
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
