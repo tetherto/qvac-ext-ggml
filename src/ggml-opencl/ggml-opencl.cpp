@@ -623,6 +623,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_upscale;
     cl_kernel kernel_upscale_bilinear;
     cl_kernel kernel_concat_f32;
+    cl_kernel kernel_gru_f32;
     cl_kernel kernel_conv_2d_f16;
     cl_kernel kernel_conv_2d_f32;
     cl_kernel kernel_conv_2d_f16_f32;
@@ -2724,6 +2725,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
+    // gru
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gru.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gru.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_gru_f32 = clCreateKernel(prog, "kernel_gru_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
     // timestep_embedding
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -4672,6 +4689,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
         case GGML_OP_CONCAT:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_GRU:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] <= 128;   // hidden size H <= GRU_MAX_H (local-mem cap)
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_GROUP_NORM:
@@ -10248,6 +10269,50 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+static void ggml_cl_gru(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0 && src0->extra);      // whh   [H, 3H]
+    GGML_ASSERT(src1 && src1->extra);      // gi    [3H, B, L]
+    const ggml_tensor * src2 = dst->src[2];// bhh   [3H]
+    GGML_ASSERT(src2 && src2->extra);
+    GGML_ASSERT(dst && dst->extra);
+
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *)src0->extra;
+    ggml_tensor_extra_cl * e1 = (ggml_tensor_extra_cl *)src1->extra;
+    ggml_tensor_extra_cl * e2 = (ggml_tensor_extra_cl *)src2->extra;
+    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
+
+    cl_ulong off0 = e0->offset + src0->view_offs;
+    cl_ulong off1 = e1->offset + src1->view_offs;
+    cl_ulong off2 = e2->offset + src2->view_offs;
+    cl_ulong offd = ed->offset + dst->view_offs;
+
+    const int H       = src0->ne[0];
+    const int B       = src1->ne[1];
+    const int L       = src1->ne[2];
+    const int reverse = ggml_get_op_params_i32(dst, 0);
+
+    cl_kernel kernel = backend_ctx->kernel_gru_f32;
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &e0->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &off0));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &e1->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &off1));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &e2->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &off2));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &ed->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offd));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &H));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &B));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &L));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &reverse));
+
+    // one workgroup (H threads) per batch element b.
+    size_t global_work_size[] = { (size_t) H, (size_t) B, 1 };
+    size_t local_work_size[]  = { (size_t) H, 1, 1 };
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -15353,6 +15418,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_concat;
+            break;
+        case GGML_OP_GRU:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_gru;
             break;
         case GGML_OP_TIMESTEP_EMBEDDING:
             if (!any_on_device) {
