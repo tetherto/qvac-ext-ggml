@@ -26,7 +26,8 @@ void main() {
 
     FLOAT_TYPE sum = FLOAT_TYPE(0.0);
     for (uint i = 0; i < p.n_cols; ++i) {
-        sum += FLOAT_TYPE(data_a[src_idx + i]);
+        const FLOAT_TYPE v = FLOAT_TYPE(data_a[src_idx + i]);
+        sum += (p.square != 0) ? v * v : v;
     }
     data_d[dst_idx] = D_TYPE(sum * p.weight);
 }

@@ -5886,19 +5886,21 @@ struct test_mean : public test_case {
     const std::array<int64_t, 4> ne;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, sqr);
     }
 
+    const bool sqr; // mean(sqr(x)): exercises backends that fuse the pair
+
     test_mean(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool sqr = false)
+        : type(type), ne(ne), sqr(sqr) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_param(a);
         ggml_set_name(a, "a");
 
-        ggml_tensor * out = ggml_mean(ctx, a);
+        ggml_tensor * out = ggml_mean(ctx, sqr ? ggml_sqr(ctx, a) : a);
         ggml_set_name(out, "out");
 
         return out;
@@ -8721,6 +8723,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 33, 256, 1, 1 }));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32769, 1, 1, 1 }));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 12, 63, 129, 31 }));  // tiny rows in bulk (lane-per-row path)
+    // mean(sqr(x)) — fused into one reduction on Vulkan
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 10, 5, 4, 3 }, true));
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 12, 63, 129, 31 }, true));
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 65, 63, 12, 31 }, true));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32, 4099, 1, 1 }));   // path-boundary shape
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 7, 63, 129, 31 }, false, false));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32, 1, 1, 1 }));

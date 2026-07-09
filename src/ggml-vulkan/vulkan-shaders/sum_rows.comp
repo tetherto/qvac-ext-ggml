@@ -30,7 +30,8 @@ void main() {
     tmp[col] = FLOAT_TYPE(0.0);
 
     for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
-        tmp[col] += FLOAT_TYPE(data_a[src_idx + i]);
+        const FLOAT_TYPE v = FLOAT_TYPE(data_a[src_idx + i]);
+        tmp[col] += (p.square != 0) ? v * v : v;
     }
 
     barrier();

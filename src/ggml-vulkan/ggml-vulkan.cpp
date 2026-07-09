@@ -1699,6 +1699,7 @@ struct vk_op_sum_rows_push_constants
     uint32_t ne0_12mp, ne0_12L;
     uint32_t ne0_1mp, ne0_1L;
     uint32_t nrows;
+    uint32_t square;
 };
 
 static vk_op_sum_rows_push_constants vk_op_sum_rows_push_constants_init(const ggml_tensor * src, const ggml_tensor * dst, int64_t n_cols) {
@@ -12202,6 +12203,17 @@ static void ggml_vk_mean(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_MEAN, p);
 }
 
+// fused sqr+mean: one reduction pass over sqr's src, writing mean's dst — the
+// squared intermediate is never materialized (halves the memory traffic).
+static void ggml_vk_sqr_mean(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * src0 = cgraph->nodes[node_idx]->src[0];
+    ggml_tensor * dst = cgraph->nodes[node_idx + 1];
+    vk_op_sum_rows_push_constants p = vk_op_sum_rows_push_constants_init(src0, dst, src0->ne[0]);
+    p.weight = 1.0f / (float)src0->ne[0];
+    p.square = 1;
+    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_MEAN, p);
+}
+
 static void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     vk_op_sum_rows_push_constants pc = vk_op_sum_rows_push_constants_init(src0, dst, src0->ne[0]);
     // Use the single pass shader when the rows are small or there are enough rows to fill the GPU.
@@ -13663,7 +13675,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_SQR:
-        ggml_vk_sqr(ctx, compute_ctx, src0, node);
+        if (ctx->num_additional_fused_ops > 0) {
+            ggml_vk_sqr_mean(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_sqr(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SQRT:
@@ -14697,6 +14713,18 @@ static bool ggml_vk_is_empty(ggml_tensor * node) {
     return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
 }
 
+// sqr+mean is a shape-changing pair (mean reduces ne0), so the generic
+// same-shape ggml_can_fuse cannot express it; validate as a subgraph instead.
+static bool ggml_vk_can_fuse_sqr_mean(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_SQR, GGML_OP_MEAN }, { node_idx + 1 })) {
+        return false;
+    }
+    const ggml_tensor *sqr  = cgraph->nodes[node_idx];
+    const ggml_tensor *mean = cgraph->nodes[node_idx + 1];
+    return mean->src[0] == sqr && sqr->src[0]->type == GGML_TYPE_F32 &&
+           mean->type == GGML_TYPE_F32 && ggml_is_contiguous(sqr->src[0]);
+}
+
 static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
@@ -15259,6 +15287,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_sqr_mean(cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "SQR_MEAN";
+                // mean reduces rows to one element; keep the conservative overlap test
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "RMS_NORM_MUL";
@@ -15594,6 +15628,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SQR && graph->nodes[j]->op == GGML_OP_MEAN) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
