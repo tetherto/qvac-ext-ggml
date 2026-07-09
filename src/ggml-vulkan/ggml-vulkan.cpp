@@ -7585,21 +7585,25 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->mul_mat_m[src0_type]) {
         return aligned ? mmp->a_m : mmp->m;
     }
-    // Samsung Xclipse (RDNA2 mobile): the `_l` tile's 128 fp32 accumulators/thread
-    // throttle occupancy and leave wide-K GEMMs with too few workgroups; `_m` cuts
-    // the LavaSR enhancer GEMM block ~10% e2e (measured on Xclipse 920).
-    if (ctx->device->vendor_id == VK_VENDOR_ID_SAMSUNG && ctx->device->mul_mat_m[src0_type]) {
-        return aligned ? mmp->a_m : mmp->m;
-    }
     // DIAG-REVERT: A/B tile force for Xclipse tuning (GGML_VK_FORCE_MM_TILE=m|s|l).
+    // Must precede the vendor overrides below or it is dead code on those devices.
     {
         static const char * force = getenv("GGML_VK_FORCE_MM_TILE");
+        if (force && force[0] == 'l' && ctx->device->mul_mat_l[src0_type]) {
+            return aligned ? mmp->a_l : mmp->l;
+        }
         if (force && force[0] == 'm' && ctx->device->mul_mat_m[src0_type]) {
             return aligned ? mmp->a_m : mmp->m;
         }
         if (force && force[0] == 's' && ctx->device->mul_mat_s[src0_type]) {
             return aligned ? mmp->a_s : mmp->s;
         }
+    }
+    // Samsung Xclipse (RDNA2 mobile): the `_l` tile's 128 fp32 accumulators/thread
+    // throttle occupancy and leave wide-K GEMMs with too few workgroups; `_m` cuts
+    // the LavaSR enhancer GEMM block ~10% e2e (measured on Xclipse 920).
+    if (ctx->device->vendor_id == VK_VENDOR_ID_SAMSUNG && ctx->device->mul_mat_m[src0_type]) {
+        return aligned ? mmp->a_m : mmp->m;
     }
     return aligned ? mmp->a_l : mmp->l;
 
