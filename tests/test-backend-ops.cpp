@@ -3585,13 +3585,14 @@ struct test_gru : public test_case {
     const int64_t b;   // batch
     const int64_t l;   // sequence length
     const bool reverse;
+    const float gi_range;  // input-transform magnitude (large values exercise gate saturation)
 
     std::string vars() override {
-        return VARS_TO_STR4(h, b, l, reverse);
+        return VARS_TO_STR5(h, b, l, reverse, gi_range);
     }
 
-    test_gru(int64_t h = 64, int64_t b = 2, int64_t l = 9, bool reverse = false)
-        : h(h), b(b), l(l), reverse(reverse) {}
+    test_gru(int64_t h = 64, int64_t b = 2, int64_t l = 9, bool reverse = false, float gi_range = 1.0f)
+        : h(h), b(b), l(l), reverse(reverse), gi_range(gi_range) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * whh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h, 3 * h);
@@ -3609,6 +3610,8 @@ struct test_gru : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->ne[0] == h && t->ne[1] == 3 * h) {
                 init_tensor_uniform(t, -ws, ws);   // whh
+            } else if (t->ne[2] == l && t->ne[0] == 3 * h) {
+                init_tensor_uniform(t, -gi_range, gi_range);   // gi
             } else {
                 init_tensor_uniform(t, -1.0f, 1.0f);
             }
@@ -8123,6 +8126,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gru(128, 2, 33, false));    // H at the GPU shared-mem cap
     test_cases.emplace_back(new test_gru(96, 2, 9, true));       // H not a multiple of the warp size
     test_cases.emplace_back(new test_gru(96, 2, 33, true));      // long L with H > typical warp size
+    test_cases.emplace_back(new test_gru(4, 1953, 33, true));    // LavaSR denoiser DPGRNN shape (tiny H, huge B)
+    test_cases.emplace_back(new test_gru(2, 31, 63, false));     // LavaSR cTFA shape
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 60.0f));  // saturated gates (large gi: tanh/exp range)
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 90.0f));  // past fp32 exp-overflow threshold (~88.7)
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 150.0f)); // LavaSR-observed activation range
+    test_cases.emplace_back(new test_gru(64, 1, 17, false, 300.0f)); // extreme saturation
 
     test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 1));
     test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2));

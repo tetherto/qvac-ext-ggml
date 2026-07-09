@@ -56,10 +56,12 @@ void main() {
         barrier();
 
         // pass 2: gates + state update (each lane touches only h_l[j]).
+        // exp/tanh args are saturated: some mobile drivers return NaN on exp overflow
+        // (arg > ~88.7) instead of +inf; the clamps are bit-equivalent in fp32.
         if (j < p.H) {
-            const float r  = 1.0f / (1.0f + exp(-(data_gi[gi_base + j] + gh_l[j])));
-            const float z  = 1.0f / (1.0f + exp(-(data_gi[gi_base + p.H + j] + gh_l[p.H + j])));
-            const float nc = tanh(data_gi[gi_base + 2u * p.H + j] + r * gh_l[2u * p.H + j]);
+            const float r  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + j] + gh_l[j]), 88.0f)));
+            const float z  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + p.H + j] + gh_l[p.H + j]), 88.0f)));
+            const float nc = tanh(clamp(data_gi[gi_base + 2u * p.H + j] + r * gh_l[2u * p.H + j], -15.0f, 15.0f));
             const float hn = nc + z * (h_l[j] - nc);
             data_d[p.H * b + p.H * p.B * t + j] = hn;
             h_l[j] = hn;
