@@ -1,6 +1,5 @@
-// Channel shuffle (G groups) along ne2: output plane c' copies input plane
-// in_c = (c'%G)*(C/G) + c'/G (PyTorch channel_shuffle).  One workgroup per output
-// plane (c'+C*b on dim2 -> one div/mod per workgroup, not per-thread); coalesced FT copy.
+// Channel shuffle (G groups) along ne2 (PyTorch): output plane c' copies input plane
+// (c'%G)*(C/G) + c'/G. One workgroup per output plane; coalesced FT copy.
 kernel void kernel_channel_shuffle_f32(
     global const char * src, ulong off_src,
     global       char * dst, ulong off_dst,

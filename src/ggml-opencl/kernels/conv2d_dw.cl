@@ -1,6 +1,5 @@
-// Fused depthwise conv2d (WHCN, F32): one workgroup row per (dst_y, channel*batch plane),
-// threads over dst_x (coalesced writes). Matches the CPU whcn accumulation order bit-for-bit
-// (ky-outer/kx-inner, OOB-skip). knl [KW,KH,1,C], data [W,H,C,N] -> dst [Wout,Hout,C,N].
+// Fused depthwise conv2d (WHCN, F32), bit-exact with the CPU whcn order (ky-outer/kx-inner,
+// OOB-skip). knl [KW,KH,1,C], data [W,H,C,N] -> dst [Wout,Hout,C,N]; threads over dst_x.
 kernel void kernel_conv_2d_dw_whcn_f32(
     global const char * src, ulong off_src,
     global const char * knl, ulong off_knl,

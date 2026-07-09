@@ -588,24 +588,20 @@ extern "C" {
         GGML_OP_SUPERTONIC_BIAS_GELU,
         GGML_OP_SUPERTONIC_EDGE_PAD_1D,
 
-        // Fused batched GRU (QVAC overlay, LavaSR denoiser).  Loops the L
-        // time-steps internally (parallel over the batch) so the whole
-        // recurrent sweep is one op instead of L*(matmul + ~10 gate ops).
+        // Fused batched GRU (LavaSR denoiser): the whole recurrent sweep over
+        // the L time-steps as one op, parallel over the batch.
         GGML_OP_GRU,
 
-        // Zero-insertion upsample along ne0 (QVAC overlay, LavaSR denoiser
-        // transpose-conv): out[i0*s] = in[i0], zeros between, in one pass
-        // instead of a transpose/pad/transpose/cont chain.
+        // Zero-insertion upsample along ne0 (LavaSR denoiser transpose-conv):
+        // out[i0*s] = in[i0], zeros between, in one pass.
         GGML_OP_ZERO_UPSAMPLE,
 
-        // Channel shuffle over ne2 (QVAC overlay, LavaSR denoiser): one
-        // plane copy per output channel instead of a permute/reshape/
-        // transpose/cont dance.
+        // Channel shuffle over ne2 (LavaSR denoiser): one plane copy per
+        // output channel instead of a permute/reshape/transpose/cont chain.
         GGML_OP_CHANNEL_SHUFFLE,
 
-        // Fused affine + per-channel PReLU (QVAC overlay, LavaSR denoiser):
-        // out = x*aw + ab + max(x,0) + slope*min(x,0), collapsing a 7-op
-        // elementwise chain into one.
+        // Fused affine + per-channel PReLU (LavaSR denoiser):
+        // out = x*aw + ab + max(x,0) + slope*min(x,0).
         GGML_OP_AFFINE_PRELU,
 
         GGML_OP_COUNT,
@@ -2469,16 +2465,8 @@ extern "C" {
             int                   pad_left,
             int                   pad_right);
 
-    // Fused batched GRU (LavaSR denoiser).  Runs the whole recurrent sweep as one
-    // op, parallel over the batch B, looping the L time-steps internally.
-    //   whh:    [H, 3*H]        recurrent weight
-    //   gi_all: [3*H, B, L]     precomputed input transform (Wih*x + bih), gate rows r,z,n
-    //   bhh:    [3*H]           recurrent bias
-    //   result: [H, B, L]
-    // PyTorch GRU semantics (gate order r,z,n; reset applied to the hh new-gate; h0 = 0):
-    //   per step t (reverse: L-1..0):  gh = whh*h + bhh
-    //     r = sigmoid(gi_r + gh_r);  z = sigmoid(gi_z + gh_z)
-    //     n = tanh(gi_n + r*gh_n);   h = n + z*(h - n);  result[:,:,t] = h
+    // Fused batched GRU, PyTorch semantics (gate order r,z,n; reset on hh new-gate; h0=0).
+    // whh [H,3H]; gi_all [3H,B,L] = precomputed Wih*x+bih; bhh [3H] -> [H,B,L]; reverse flips t.
     GGML_API struct ggml_tensor * ggml_gru(
             struct ggml_context * ctx,
             struct ggml_tensor  * whh,
@@ -2493,9 +2481,8 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   s);
 
-    // Channel shuffle of ne2 into `groups` groups (PyTorch channel_shuffle):
-    // result channel c' = a channel (c'%groups)*(ne2/groups) + c'/groups.
-    // a must be contiguous and ne2 % groups == 0.
+    // Channel shuffle of ne2 into `groups` groups (PyTorch): result channel c' =
+    // a channel (c'%groups)*(ne2/groups) + c'/groups. a contiguous, ne2 % groups == 0.
     GGML_API struct ggml_tensor * ggml_channel_shuffle(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

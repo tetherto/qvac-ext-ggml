@@ -10299,10 +10299,8 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     const cl_int dim = ((const int32_t *) dst->op_params)[0];
     GGML_ASSERT(dim >= 0 && dim <= 3);
 
-    // Fast path: a contiguous "linear split" concat (all axes outer to `dim` are 1, so dst is just
-    // src0 followed by src1 in memory) is two plain DMA copies -- no kernel, no per-thread integer
-    // division, full memory bandwidth. Common case for the unrolled-GRU stitch (concat [H,B,k] +
-    // [H,B,1] along dim 2, ne3==1) where the generic kernel wastes warps on the tiny ne0=hidden.
+    // Fast path: a contiguous "linear split" concat (all axes outer to `dim` are 1) is two plain
+    // DMA copies -- no kernel, no per-thread integer division. Common for the GRU-stitch concat.
     bool linear_split = ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
     for (int d = dim + 1; d < 4 && linear_split; ++d) {
         if (dst->ne[d] != 1) linear_split = false;

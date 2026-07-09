@@ -1,7 +1,5 @@
-// Fused affine + per-channel PReLU (LavaSR denoiser): out = x*aw[f,c] + ab[f,c]
-// + max(x,0) + slope[c]*min(x,0), computed in the scalar op order for bit-exactness.
-// x/out [F,T,C,Bc]; aw,ab [F,C] (f fastest); slope [C].  Plane c+C*b on dim2 (one
-// mod per workgroup); f on dim0 (no mod, for aw/ab indexing); t on dim1.
+// Fused affine + per-channel PReLU (LavaSR denoiser), scalar op order for bit-exactness:
+// out = x*aw[f,c] + ab[f,c] + max(x,0) + slope[c]*min(x,0). x/out [F,T,C,Bc], aw,ab [F,C], slope [C].
 kernel void kernel_affine_prelu_f32(
     global const char * x,  ulong ox,
     global const char * aw, ulong oaw,

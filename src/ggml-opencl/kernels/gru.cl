@@ -1,7 +1,5 @@
-// Fused batched GRU: one workgroup per batch element b (H threads, thread j owns hidden unit j),
-// looping the L time-steps internally. h and gh live in local memory (fast, addressable). Matches
-// PyTorch GRU (gate order r,z,n; reset applied to the hh new-gate; zero initial state).
-//   whh [H,3H], gi [3H,B,L] (precomputed Wih*x+bih), bhh [3H] -> dst [H,B,L].
+// Fused batched GRU (PyTorch: gate order r,z,n, reset on hh new-gate, h0=0): one workgroup per
+// batch b, H threads, L steps looped in local mem. whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L].
 #define GRU_MAX_H 128
 
 kernel void kernel_gru_f32(
