@@ -8709,6 +8709,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 33, 1, 1, 1 }));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 33, 256, 1, 1 }));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32769, 1, 1, 1 }));
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 12, 63, 129, 31 }));  // tiny rows in bulk (lane-per-row path)
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32, 4099, 1, 1 }));   // path-boundary shape
+    test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 7, 63, 129, 31 }, false, false));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32, 1, 1, 1 }));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32, 256, 1, 1 }));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32768, 1, 1, 1 }));
@@ -9151,6 +9154,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, {256, 256, 3, 1}));
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, {12, 63, 129, 31}));   // lavasr ec (lane-per-row)
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, {65, 63, 12, 31}));    // lavasr zt (WG-per-row)
 
 
     for (int n_token : {1, 512}) {
