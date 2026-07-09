@@ -8134,6 +8134,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gru(3, 100, 7, false));         // ragged lanes (128 % 3 = 2 idle) + tail
     test_cases.emplace_back(new test_gru(48, 5, 9, true));           // PB=2, slot spans the wave64 boundary
     test_cases.emplace_back(new test_gru(2, 300, 11, true));         // small-H variant, multi-WG + tail
+
+    // conv_2d_dw whcn_v4 (wide 1-D rows) + its selection boundaries
+    test_cases.emplace_back(new test_conv_2d_dw({1031, 1, 512, 1}, {7, 1, 1, 512}, 1, 0, 1, false)); // enhancer-class row
+    test_cases.emplace_back(new test_conv_2d_dw({1037, 1, 512, 1}, {7, 1, 1, 512}, 1, 3, 1, false)); // pad_x edges + OOR pad_y rows
+    test_cases.emplace_back(new test_conv_2d_dw({300, 1, 8, 3},    {3, 1, 1, 8},   1, 1, 1, false)); // knl_w=3, batched
+    test_cases.emplace_back(new test_conv_2d_dw({257, 1, 4, 1},    {5, 1, 1, 4},   1, 2, 1, false)); // one-output tail chunk
+    test_cases.emplace_back(new test_conv_2d_dw({200, 1, 8, 1},    {7, 1, 1, 8},   1, 3, 1, false)); // below threshold -> scalar
+    test_cases.emplace_back(new test_conv_2d_dw({600, 1, 8, 1},    {7, 1, 1, 8},   2, 3, 1, false)); // stride 2 -> scalar
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 90.0f));  // past fp32 exp-overflow threshold (~88.7)
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 150.0f)); // LavaSR-observed activation range
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 300.0f)); // extreme saturation

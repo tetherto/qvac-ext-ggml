@@ -869,6 +869,7 @@ struct vk_device_struct {
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f16_f32[CONV_SHAPE_COUNT];
     vk_pipeline pipeline_conv2d_dw_whcn_f32, pipeline_conv2d_dw_whcn_f16_f32;
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
+    vk_pipeline pipeline_conv2d_dw_whcn_v4_f32, pipeline_conv2d_dw_whcn_v4_f16_f32;
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16[GGML_TYPE_COUNT];
 
@@ -5043,6 +5044,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_cwhn_f32, "conv2d_dw_cwhn_f32", conv2d_dw_cwhn_f32_len, conv2d_dw_cwhn_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_f16_f32, "conv2d_dw_whcn_f16_f32", conv2d_dw_whcn_f16_f32_len, conv2d_dw_whcn_f16_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_cwhn_f16_f32, "conv2d_dw_cwhn_f16_f32", conv2d_dw_cwhn_f16_f32_len, conv2d_dw_cwhn_f16_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
+    // v4 variants dispatch workgroup counts directly (elements override) -> wg_denoms {1,1,1}
+    ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_v4_f32, "conv2d_dw_whcn_v4_f32", conv2d_dw_whcn_v4_f32_len, conv2d_dw_whcn_v4_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_v4_f16_f32, "conv2d_dw_whcn_v4_f16_f32", conv2d_dw_whcn_v4_f16_f32_len, conv2d_dw_whcn_v4_f16_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {1, 1, 1}, {}, 1);
 
     for (uint32_t use_push = 0; use_push < 2; ++use_push) {
         for (uint32_t i = 0; i < num_topk_moe_pipelines; ++i) {
@@ -10263,17 +10267,26 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_CONV_2D_DW:
-        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32) {
             if (ggml_is_contiguous(src1)) {
-                return ctx->device->pipeline_conv2d_dw_whcn_f32;
+                // Vectorized 1-D row variant: 4 outputs/thread + per-WG weight staging.
+                // Restricted to the wide-row shapes it was built for; scalar whcn is the fallback.
+                const bool v4 = src0->ne[1] == 1                        // knl_h == 1
+                    && ggml_get_op_params_i32(dst, 0) == 1              // stride_x
+                    && ggml_get_op_params_i32(dst, 4) == 1              // dilation_x
+                    && src0->ne[0] <= 8                                 // knl_w <= MAX_K
+                    && dst->ne[0] >= 256                                // at least one full x-chunk
+                    && (uint64_t)(dst->ne[1] * dst->ne[2] * dst->ne[3]) <=
+                           ctx->device->properties.limits.maxComputeWorkGroupCount[1];
+                if (v4) {
+                    return src0->type == GGML_TYPE_F32 ? ctx->device->pipeline_conv2d_dw_whcn_v4_f32
+                                                       : ctx->device->pipeline_conv2d_dw_whcn_v4_f16_f32;
+                }
+                return src0->type == GGML_TYPE_F32 ? ctx->device->pipeline_conv2d_dw_whcn_f32
+                                                   : ctx->device->pipeline_conv2d_dw_whcn_f16_f32;
             } else if (ggml_is_contiguous_channels(src1)) {
-                return ctx->device->pipeline_conv2d_dw_cwhn_f32;
-            }
-        } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-            if (ggml_is_contiguous(src1)) {
-                return ctx->device->pipeline_conv2d_dw_whcn_f16_f32;
-            } else if (ggml_is_contiguous_channels(src1)) {
-                return ctx->device->pipeline_conv2d_dw_cwhn_f16_f32;
+                return src0->type == GGML_TYPE_F32 ? ctx->device->pipeline_conv2d_dw_cwhn_f32
+                                                   : ctx->device->pipeline_conv2d_dw_cwhn_f16_f32;
             }
         }
         return nullptr;
@@ -10647,6 +10660,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements[0] = std::min(elements[0], ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
                 elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
                 elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+            }
+
+            if (pipeline == ctx->device->pipeline_conv2d_dw_whcn_v4_f32 ||
+                pipeline == ctx->device->pipeline_conv2d_dw_whcn_v4_f16_f32) {
+                // one WG per (row, 256-output x-chunk); all lanes share one channel
+                elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 64 * 4 /*WG_SIZE*NT*/);
+                elements[1] = (uint32_t)(dst->ne[1] * dst->ne[2] * dst->ne[3]);
+                elements[2] = 1;
             }
         } break;
     case GGML_OP_ADD_ID:
