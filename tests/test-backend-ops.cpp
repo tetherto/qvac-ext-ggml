@@ -3579,6 +3579,102 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// GGML_OP_GRU
+struct test_gru : public test_case {
+    const int64_t h;   // hidden size (GPU backends cap at 128)
+    const int64_t b;   // batch
+    const int64_t l;   // sequence length
+    const bool reverse;
+
+    std::string vars() override {
+        return VARS_TO_STR4(h, b, l, reverse);
+    }
+
+    test_gru(int64_t h = 64, int64_t b = 2, int64_t l = 9, bool reverse = false)
+        : h(h), b(b), l(l), reverse(reverse) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * whh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h, 3 * h);
+        ggml_tensor * gi  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3 * h, b, l);
+        ggml_tensor * bhh = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3 * h);
+        ggml_tensor * out = ggml_gru(ctx, whh, gi, bhh, reverse);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // Scale the recurrent weights like trained weights (spectral radius < 1).
+        // With plain U(-1,1) whh the recurrence is chaotic and per-backend fp ULP
+        // differences amplify exponentially in l, failing any strict bound.
+        const float ws = 1.0f / sqrtf((float) h);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->ne[0] == h && t->ne[1] == 3 * h) {
+                init_tensor_uniform(t, -ws, ws);   // whh
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_ZERO_UPSAMPLE
+struct test_zero_upsample : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int s;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, s);
+    }
+
+    test_zero_upsample(std::array<int64_t, 4> ne = {10, 7, 3, 2}, int s = 2)
+        : ne(ne), s(s) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        return ggml_zero_upsample(ctx, a, s);
+    }
+};
+
+// GGML_OP_CHANNEL_SHUFFLE
+struct test_channel_shuffle : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int groups;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, groups);
+    }
+
+    test_channel_shuffle(std::array<int64_t, 4> ne = {8, 4, 12, 2}, int groups = 2)
+        : ne(ne), groups(groups) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        return ggml_channel_shuffle(ctx, a, groups);
+    }
+};
+
+// GGML_OP_AFFINE_PRELU
+struct test_affine_prelu : public test_case {
+    const int64_t f;   // features (ne0)
+    const int64_t t;   // time (ne1)
+    const int64_t c;   // channels (ne2)
+    const int64_t bc;  // batch (ne3)
+
+    std::string vars() override {
+        return VARS_TO_STR4(f, t, c, bc);
+    }
+
+    test_affine_prelu(int64_t f = 16, int64_t t = 10, int64_t c = 6, int64_t bc = 2)
+        : f(f), t(t), c(c), bc(bc) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, f, t, c, bc);
+        ggml_tensor * aw    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, f, c);
+        ggml_tensor * ab    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, f, c);
+        ggml_tensor * slope = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c);
+        return ggml_affine_prelu(ctx, x, aw, ab, slope);
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -8021,6 +8117,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
     }
+
+    test_cases.emplace_back(new test_gru(64, 1, 17, false));
+    test_cases.emplace_back(new test_gru(64, 1, 17, true));
+    test_cases.emplace_back(new test_gru(128, 2, 33, false));    // H at the GPU shared-mem cap
+    test_cases.emplace_back(new test_gru(96, 2, 9, true));       // H not a multiple of the warp size
+    test_cases.emplace_back(new test_gru(96, 2, 33, true));      // long L with H > typical warp size
+
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 1));
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2));
+    test_cases.emplace_back(new test_zero_upsample({33, 5, 2, 2}, 5));
+
+    for (int groups : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_channel_shuffle({8, 4, 12, 2}, groups));
+    }
+
+    test_cases.emplace_back(new test_affine_prelu(16, 10, 6, 2));
+    test_cases.emplace_back(new test_affine_prelu(129, 63, 16, 3));
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.

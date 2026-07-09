@@ -1,0 +1,69 @@
+#version 450
+
+#include "types.glsl"
+
+// Fused batched GRU (PyTorch: gate order r,z,n, reset on hh new-gate, h0=0): one
+// workgroup per batch b, GRU_MAX_H threads (lanes j >= H idle), L steps looped in
+// shared memory.  whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L].
+#define GRU_MAX_H 128
+
+layout (push_constant) uniform parameter
+{
+    uint H;
+    uint B;
+    uint L;
+    uint reverse;
+} p;
+
+layout (binding = 0) readonly buffer W {float data_whh[];};
+layout (binding = 1) readonly buffer G {float data_gi[];};
+layout (binding = 2) readonly buffer BH {float data_bhh[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+layout(local_size_x = GRU_MAX_H, local_size_y = 1, local_size_z = 1) in;
+
+shared float h_l[GRU_MAX_H];
+shared float gh_l[3 * GRU_MAX_H];
+
+void main() {
+    const uint j  = gl_LocalInvocationID.x;   // hidden unit (0..H-1); lanes >= H idle
+    const uint b  = gl_WorkGroupID.y;         // batch element
+    const uint H3 = 3u * p.H;
+
+    if (j < p.H) {
+        h_l[j] = 0.0f;                        // zero initial state
+    }
+    barrier();
+
+    // barrier()s stay in uniform control flow: every lane runs all L steps.
+    for (uint s = 0u; s < p.L; ++s) {
+        const uint t       = (p.reverse != 0u) ? (p.L - 1u - s) : s;
+        const uint gi_base = H3 * b + H3 * p.B * t;
+
+        // pass 1: gh[g] = sum_k whh[k,g]*h[k] + bhh[g] for this lane's 3 gate rows
+        // (CPU reference order: bias added after the accumulation).
+        if (j < p.H) {
+            for (uint gg = 0u; gg < 3u; ++gg) {
+                const uint g     = gg * p.H + j;
+                const uint wbase = p.H * g;
+                float acc = 0.0f;
+                for (uint k = 0u; k < p.H; ++k) {
+                    acc += data_whh[wbase + k] * h_l[k];
+                }
+                gh_l[g] = acc + data_bhh[g];
+            }
+        }
+        barrier();
+
+        // pass 2: gates + state update (each lane touches only h_l[j]).
+        if (j < p.H) {
+            const float r  = 1.0f / (1.0f + exp(-(data_gi[gi_base + j] + gh_l[j])));
+            const float z  = 1.0f / (1.0f + exp(-(data_gi[gi_base + p.H + j] + gh_l[p.H + j])));
+            const float nc = tanh(data_gi[gi_base + 2u * p.H + j] + r * gh_l[2u * p.H + j]);
+            const float hn = nc + z * (h_l[j] - nc);
+            data_d[p.H * b + p.H * p.B * t + j] = hn;
+            h_l[j] = hn;
+        }
+        barrier();
+    }
+}
