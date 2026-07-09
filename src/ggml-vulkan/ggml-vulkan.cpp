@@ -115,6 +115,7 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_VENDOR_ID_INTEL 0x8086
 #define VK_VENDOR_ID_NVIDIA 0x10de
 #define VK_VENDOR_ID_QUALCOMM 0x5143
+#define VK_VENDOR_ID_SAMSUNG 0x144d
 
 #define VK_DEVICE_DESCRIPTOR_POOL_SIZE 256
 
@@ -856,6 +857,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_gru_f32;
+    vk_pipeline pipeline_gru_small_f32[3];  // H == 2, 4, 8 register-resident variants
     vk_pipeline pipeline_zero_upsample_f32;
     vk_pipeline pipeline_channel_shuffle_f32;
     vk_pipeline pipeline_affine_prelu_f32;
@@ -4937,6 +4939,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_gru_f32, "gru_f32", gru_f32_len, gru_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[0], "gru_small_h2_f32", gru_small_h2_f32_len, gru_small_h2_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[1], "gru_small_h4_f32", gru_small_h4_f32_len, gru_small_h4_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[2], "gru_small_h8_f32", gru_small_h8_f32_len, gru_small_h8_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_zero_upsample_f32, "zero_upsample_f32", zero_upsample_f32_len, zero_upsample_f32_data, "main", 2, sizeof(vk_op_zero_upsample_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_channel_shuffle_f32, "channel_shuffle_f32", channel_shuffle_f32_len, channel_shuffle_f32_data, "main", 2, sizeof(vk_op_channel_shuffle_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
@@ -7562,6 +7567,22 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->mul_mat_m[src0_type]) {
         return aligned ? mmp->a_m : mmp->m;
     }
+    // Samsung Xclipse (RDNA2 mobile): the `_l` tile's 128 fp32 accumulators/thread
+    // throttle occupancy and leave wide-K GEMMs with too few workgroups; `_m` cuts
+    // the LavaSR enhancer GEMM block ~10% e2e (measured on Xclipse 920).
+    if (ctx->device->vendor_id == VK_VENDOR_ID_SAMSUNG && ctx->device->mul_mat_m[src0_type]) {
+        return aligned ? mmp->a_m : mmp->m;
+    }
+    // DIAG-REVERT: A/B tile force for Xclipse tuning (GGML_VK_FORCE_MM_TILE=m|s|l).
+    {
+        static const char * force = getenv("GGML_VK_FORCE_MM_TILE");
+        if (force && force[0] == 'm' && ctx->device->mul_mat_m[src0_type]) {
+            return aligned ? mmp->a_m : mmp->m;
+        }
+        if (force && force[0] == 's' && ctx->device->mul_mat_s[src0_type]) {
+            return aligned ? mmp->a_s : mmp->s;
+        }
+    }
     return aligned ? mmp->a_l : mmp->l;
 
     GGML_UNUSED(src1_type);
@@ -10152,6 +10173,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_GRU:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            // tiny hidden sizes: one-lane-per-batch register-resident variant
+            // (no barriers in the L loop); the packed kernel covers the rest.
+            switch (src0->ne[0]) {
+                case 2: return ctx->device->pipeline_gru_small_f32[0];
+                case 4: return ctx->device->pipeline_gru_small_f32[1];
+                case 8: return ctx->device->pipeline_gru_small_f32[2];
+                default: break;
+            }
             return ctx->device->pipeline_gru_f32;
         }
         return nullptr;
@@ -10653,8 +10682,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_GRU:
         {
-            // one workgroup (GRU_MAX_H lanes) per batch element on axis y
-            elements = { 1, (uint32_t)src1->ne[1], 1 };
+            // small-H variant: one lane per batch element (128/WG); packed kernel:
+            // 128-lane workgroups each covering PB = floor(128/H) batch elements
+            // (supports_op guarantees 1 <= H <= 128; must match the shaders)
+            const uint32_t H  = (uint32_t)src0->ne[0];
+            const uint32_t B  = (uint32_t)src1->ne[1];
+            const uint32_t PB = (H == 2 || H == 4 || H == 8) ? 128 : 128 / H;
+            elements = { 1, CEIL_DIV(B, PB), 1 };
         }
         break;
     default:

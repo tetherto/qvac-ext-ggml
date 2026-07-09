@@ -8129,6 +8129,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gru(4, 1953, 33, true));    // LavaSR denoiser DPGRNN shape (tiny H, huge B)
     test_cases.emplace_back(new test_gru(2, 31, 63, false));     // LavaSR cTFA shape
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 60.0f));  // saturated gates (large gi: tanh/exp range)
+    test_cases.emplace_back(new test_gru(4, 33, 9, false));          // batch tail: B % PB(32) = 1
+    test_cases.emplace_back(new test_gru(8, 17, 5, true));           // PB=16, tail 1, reverse
+    test_cases.emplace_back(new test_gru(3, 100, 7, false));         // ragged lanes (128 % 3 = 2 idle) + tail
+    test_cases.emplace_back(new test_gru(48, 5, 9, true));           // PB=2, slot spans the wave64 boundary
+    test_cases.emplace_back(new test_gru(2, 300, 11, true));         // small-H variant, multi-WG + tail
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 90.0f));  // past fp32 exp-overflow threshold (~88.7)
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 150.0f)); // LavaSR-observed activation range
     test_cases.emplace_back(new test_gru(64, 1, 17, false, 300.0f)); // extreme saturation
