@@ -1084,9 +1084,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SUPERTONIC_PW2_RESIDUAL",
     "SUPERTONIC_BIAS_GELU",
     "SUPERTONIC_EDGE_PAD_1D",
+
+    "GRU",
+    "ZERO_UPSAMPLE",
+    "CHANNEL_SHUFFLE",
+    "AFFINE_PRELU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1200,9 +1205,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "supertonic_pw2_residual(x,b,gamma,res)",
     "supertonic_bias_gelu(x,b)",
     "supertonic_edge_pad_1d(x,pad_l,pad_r)",
+
+    "gru(whh,gi,bhh)",
+    "zero_upsample(x)",
+    "channel_shuffle(x)",
+    "affine_prelu(x,aw,ab,slope)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5437,6 +5447,100 @@ struct ggml_tensor * ggml_supertonic_edge_pad_1d_ct(
         int                   pad_left,
         int                   pad_right) {
     return ggml_supertonic_edge_pad_1d_impl(ctx, x, pad_left, pad_right, /*layout=*/1);
+}
+
+// ggml_gru
+
+struct ggml_tensor * ggml_gru(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * whh,     // [H, 3H]
+        struct ggml_tensor  * gi_all,  // [3H, B, L]
+        struct ggml_tensor  * bhh,     // [3H]
+        bool                  reverse) {
+    GGML_ASSERT(whh->type == GGML_TYPE_F32 && gi_all->type == GGML_TYPE_F32 && bhh->type == GGML_TYPE_F32);
+    GGML_ASSERT(whh->ne[0] * 3 == gi_all->ne[0]);   // whh ne0 = H, gi_all ne0 = 3H
+    GGML_ASSERT(whh->ne[1] == gi_all->ne[0]);        // whh ne1 = 3H
+    GGML_ASSERT(bhh->ne[0] == gi_all->ne[0]);        // bhh = 3H
+    GGML_ASSERT(ggml_is_contiguous(whh) && ggml_is_contiguous(gi_all) && ggml_is_contiguous(bhh));
+
+    const int64_t H = whh->ne[0];
+    const int64_t B = gi_all->ne[1];
+    const int64_t L = gi_all->ne[2];
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, B, L);
+
+    ggml_set_op_params_i32(result, 0, reverse ? 1 : 0);
+
+    result->op     = GGML_OP_GRU;
+    result->src[0] = whh;
+    result->src[1] = gi_all;
+    result->src[2] = bhh;
+
+    return result;
+}
+
+// ggml_zero_upsample
+
+struct ggml_tensor * ggml_zero_upsample(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   s) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(s >= 1);
+
+    const int64_t ne0 = (a->ne[0] - 1) * s + 1;
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, a->ne[1], a->ne[2], a->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, s);
+
+    result->op     = GGML_OP_ZERO_UPSAMPLE;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_channel_shuffle
+
+struct ggml_tensor * ggml_channel_shuffle(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   groups) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(groups >= 1 && a->ne[2] % groups == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, groups);
+
+    result->op     = GGML_OP_CHANNEL_SHUFFLE;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_affine_prelu
+
+struct ggml_tensor * ggml_affine_prelu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * aw,
+        struct ggml_tensor  * ab,
+        struct ggml_tensor  * slope) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && aw->type == GGML_TYPE_F32 &&
+                ab->type == GGML_TYPE_F32 && slope->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+
+    result->op     = GGML_OP_AFFINE_PRELU;
+    result->src[0] = x;
+    result->src[1] = aw;
+    result->src[2] = ab;
+    result->src[3] = slope;
+
+    return result;
 }
 
 // ggml_roll

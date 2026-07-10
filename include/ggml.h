@@ -588,6 +588,22 @@ extern "C" {
         GGML_OP_SUPERTONIC_BIAS_GELU,
         GGML_OP_SUPERTONIC_EDGE_PAD_1D,
 
+        // Fused batched GRU (LavaSR denoiser): the whole recurrent sweep over
+        // the L time-steps as one op, parallel over the batch.
+        GGML_OP_GRU,
+
+        // Zero-insertion upsample along ne0 (LavaSR denoiser transpose-conv):
+        // out[i0*s] = in[i0], zeros between, in one pass.
+        GGML_OP_ZERO_UPSAMPLE,
+
+        // Channel shuffle over ne2 (LavaSR denoiser): one plane copy per
+        // output channel instead of a permute/reshape/transpose/cont chain.
+        GGML_OP_CHANNEL_SHUFFLE,
+
+        // Fused affine + per-channel PReLU (LavaSR denoiser):
+        // out = x*aw + ab + max(x,0) + slope*min(x,0).
+        GGML_OP_AFFINE_PRELU,
+
         GGML_OP_COUNT,
     };
 
@@ -2448,6 +2464,38 @@ extern "C" {
             struct ggml_tensor  * x,
             int                   pad_left,
             int                   pad_right);
+
+    // Fused batched GRU, PyTorch semantics (gate order r,z,n; reset on hh new-gate; h0=0).
+    // whh [H,3H]; gi_all [3H,B,L] = precomputed Wih*x+bih; bhh [3H] -> [H,B,L]; reverse flips t.
+    GGML_API struct ggml_tensor * ggml_gru(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * whh,
+            struct ggml_tensor  * gi_all,
+            struct ggml_tensor  * bhh,
+            bool                  reverse);
+
+    // Zero-insertion upsample of ne0 by factor s: result ne0 = (a->ne0 - 1)*s + 1,
+    // result[i0*s, ...] = a[i0, ...], zeros elsewhere.  a must be contiguous.
+    GGML_API struct ggml_tensor * ggml_zero_upsample(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   s);
+
+    // Channel shuffle of ne2 into `groups` groups (PyTorch): result channel c' =
+    // a channel (c'%groups)*(ne2/groups) + c'/groups. a contiguous, ne2 % groups == 0.
+    GGML_API struct ggml_tensor * ggml_channel_shuffle(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   groups);
+
+    // Fused affine + per-channel PReLU: out = x*aw + ab + max(x,0) + slope*min(x,0).
+    // x [F,T,C,Bc] contiguous; aw,ab [F,C] (per freq,channel); slope [C].
+    GGML_API struct ggml_tensor * ggml_affine_prelu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * aw,
+            struct ggml_tensor  * ab,
+            struct ggml_tensor  * slope);
 
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.

@@ -8147,6 +8147,168 @@ static int64_t ggml_wrap_index(int64_t i, int64_t ne) {
     return i;
 }
 
+// Fused batched GRU reference (CPU).  Parallel over batch b; serial over the L time-steps.
+//   whh [H,3H], gi_all [3H,B,L] (precomputed Wih*x+bih), bhh [3H] -> dst [H,B,L].
+void ggml_compute_forward_gru(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * whh    = dst->src[0];  // [H, 3H]
+    const ggml_tensor * gi_all = dst->src[1];  // [3H, B, L]
+    const ggml_tensor * bhh    = dst->src[2];  // [3H]
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && whh->type == GGML_TYPE_F32 &&
+                gi_all->type == GGML_TYPE_F32 && bhh->type == GGML_TYPE_F32);
+
+    const int64_t H  = whh->ne[0];
+    const int64_t H3 = gi_all->ne[0];   // 3H
+    const int64_t B  = gi_all->ne[1];
+    const int64_t L  = gi_all->ne[2];
+    const bool reverse = ggml_get_op_params_i32(dst, 0) != 0;
+
+    const float * whh_d = (const float *) whh->data;    // whh[k + H*g]  (column g = whh_d + H*g)
+    const float * gi_d  = (const float *) gi_all->data; // gi[g + H3*b + H3*B*t]
+    const float * bhh_d = (const float *) bhh->data;    // bhh[g]
+    float *       dst_d = (float *)       dst->data;    // dst[j + H*b + H*B*t]
+
+    std::vector<float> h((size_t) H), gh((size_t) H3);
+
+    const int64_t per = (B + params->nth - 1) / params->nth;
+    const int64_t b0  = (int64_t) params->ith * per;
+    const int64_t b1  = std::min(b0 + per, B);
+
+    for (int64_t b = b0; b < b1; ++b) {
+        for (int64_t j = 0; j < H; ++j) h[j] = 0.0f;   // zero initial state
+        for (int64_t s = 0; s < L; ++s) {
+            const int64_t t  = reverse ? (L - 1 - s) : s;
+            const float * gi = gi_d + (H3 * b + H3 * B * t);
+            for (int64_t g = 0; g < H3; ++g) {          // gh = whh*h + bhh
+                const float * wcol = whh_d + H * g;
+                float acc = 0.0f;
+                for (int64_t k = 0; k < H; ++k) acc += wcol[k] * h[k];
+                gh[g] = acc + bhh_d[g];
+            }
+            float * out = dst_d + (H * b + H * B * t);
+            for (int64_t j = 0; j < H; ++j) {
+                const float r  = 1.0f / (1.0f + expf(-(gi[j]          + gh[j])));
+                const float z  = 1.0f / (1.0f + expf(-(gi[H + j]      + gh[H + j])));
+                const float nc = tanhf(gi[2 * H + j] + r * gh[2 * H + j]);
+                const float hn = nc + z * (h[j] - nc);   // h_new = nc + z*(h - nc)
+                h[j]   = hn;
+                out[j] = hn;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_zero_upsample(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+
+    const int64_t s  = ggml_get_op_params_i32(dst, 0);
+    const int64_t F  = src->ne[0];
+    const int64_t Fu = dst->ne[0];
+    const int64_t R  = src->ne[1] * src->ne[2] * src->ne[3];   // rows (ne1*ne2*ne3)
+
+    const float * src_data = (const float *) src->data;
+    float       * dst_data = (float *) dst->data;
+
+    // parallel over rows: zero each output row, then scatter the input at stride s.
+    const int64_t per_thread = (R + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, R);
+
+    for (int64_t r = start; r < end; ++r) {
+        const float * sp = src_data + r * F;
+        float       * dp = dst_data + r * Fu;
+        for (int64_t i = 0; i < Fu; ++i) dp[i] = 0.0f;
+        for (int64_t f = 0; f < F; ++f) dp[f * s] = sp[f];
+    }
+}
+
+void ggml_compute_forward_channel_shuffle(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+
+    const int64_t G  = ggml_get_op_params_i32(dst, 0);
+    const int64_t FT = src->ne[0] * src->ne[1];
+    const int64_t C  = src->ne[2];
+    const int64_t Bc = src->ne[3];
+    const int64_t cg = C / G;
+
+    const float * src_data = (const float *) src->data;
+    float       * dst_data = (float *) dst->data;
+
+    // parallel over output planes (c' + C*b): copy the FT plane from the shuffled input channel.
+    const int64_t nplanes = C * Bc;
+    const int64_t per_thread = (nplanes + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, nplanes);
+
+    for (int64_t p = start; p < end; ++p) {
+        const int64_t cprime = p % C;
+        const int64_t b      = p / C;
+        const int64_t in_c   = (cprime % G) * cg + cprime / G;
+        const float * sp = src_data + (in_c + C * b) * FT;
+        float       * dp = dst_data + p * FT;
+        for (int64_t i = 0; i < FT; ++i) dp[i] = sp[i];
+    }
+}
+
+void ggml_compute_forward_affine_prelu(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * aw    = dst->src[1];
+    const ggml_tensor * ab    = dst->src[2];
+    const ggml_tensor * slope = dst->src[3];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
+
+    const int64_t F  = x->ne[0];
+    const int64_t T  = x->ne[1];
+    const int64_t C  = x->ne[2];
+    const int64_t Bc = x->ne[3];
+
+    const float * xd  = (const float *) x->data;
+    const float * awd = (const float *) aw->data;
+    const float * abd = (const float *) ab->data;
+    const float * sld = (const float *) slope->data;
+    float       * dd  = (float *) dst->data;
+
+    // parallel over planes (c + C*b); per element: affine + per-channel prelu in scalar op order.
+    const int64_t nplanes = C * Bc;
+    const int64_t per_thread = (nplanes + params->nth - 1) / params->nth;
+    const int64_t start = params->ith * per_thread;
+    const int64_t end   = MIN(start + per_thread, nplanes);
+
+    for (int64_t p = start; p < end; ++p) {
+        const int64_t c   = p % C;
+        const float * awc = awd + c * F;
+        const float * abc = abd + c * F;
+        const float   sl  = sld[c];
+        const float * xp  = xd + p * F * T;
+        float       * dp  = dd + p * F * T;
+        for (int64_t i = 0; i < F * T; ++i) {
+            const float xv = xp[i];
+            const float r  = xv > 0.0f ? xv : 0.0f;
+            const float n  = xv - r;
+            const float pr = r + sl * n;
+            const float a  = xv * awc[i % F] + abc[i % F];
+            dp[i] = a + pr;
+        }
+    }
+}
+
 static void ggml_compute_forward_roll_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
