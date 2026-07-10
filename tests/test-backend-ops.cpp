@@ -3067,6 +3067,53 @@ struct test_bin_bcast : public test_case {
     }
 };
 
+// fused elementwise pair: op2(mul(a, b), c) or op2(c, mul(a, b)), op2 in {mul, add}
+struct test_mul_chain : public test_case {
+    const bool op2_is_add;    // second op: false = mul, true = add
+    const bool chain_as_src1; // pass the mul result as src1 of the second op
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_b;
+    const std::array<int64_t, 4> ne_c;
+
+    std::string vars() override {
+        return VARS_TO_STR5(op2_is_add, chain_as_src1, ne_a, ne_b, ne_c);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_mul_chain(bool op2_is_add, bool chain_as_src1,
+            std::array<int64_t, 4> ne_a = {16, 10, 3, 2},
+            std::array<int64_t, 4> ne_b = {16, 10, 3, 2},
+            std::array<int64_t, 4> ne_c = {16, 10, 3, 2})
+        : op2_is_add(op2_is_add), chain_as_src1(chain_as_src1), ne_a(ne_a), ne_b(ne_b), ne_c(ne_c) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
+        ggml_set_name(b, "b");
+        ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_c.data());
+        ggml_set_name(c, "c");
+
+        ggml_tensor * m = ggml_mul(ctx, a, b);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = op2_is_add
+            ? (chain_as_src1 ? ggml_add(ctx, c, m) : ggml_add(ctx, m, c))
+            : (chain_as_src1 ? ggml_mul(ctx, c, m) : ggml_mul(ctx, m, c));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // MUL has numerical issues around zero
+            init_tensor_uniform(t, 0.9f, 1.1f);
+        }
+    }
+};
+
 // GGML_OP_ADD_ID
 struct test_add_id : public test_case {
     const ggml_type type_a;
@@ -8065,6 +8112,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {2, 2, 2, 2}, 8));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
 
+    // fused elementwise pairs mul+mul / mul+add
+    for (bool op2_is_add : {false, true}) {
+        // no broadcast
+        test_cases.emplace_back(new test_mul_chain(op2_is_add, false, {16, 10, 3, 2}, {16, 10, 3, 2}, {16, 10, 3, 2}));
+        // b broadcast over ne0 ([1,T,C,B] mask-style), c broadcast over ne1/ne2 ([F,1,1,B]-class)
+        test_cases.emplace_back(new test_mul_chain(op2_is_add, false, {16, 10, 3, 2}, {1, 10, 3, 2}, {16, 1, 1, 2}));
+        // b weight-vector [F,1,C,1], c bias [1,1,C,1]
+        test_cases.emplace_back(new test_mul_chain(op2_is_add, false, {16, 10, 3, 2}, {16, 1, 3, 1}, {1, 1, 3, 1}));
+        // second node consumes the fused node as src[1]
+        test_cases.emplace_back(new test_mul_chain(op2_is_add, true, {16, 10, 3, 2}, {1, 10, 3, 2}, {16, 10, 3, 2}));
+        // spans multiple workgroup rows (ne > 512 per slice)
+        test_cases.emplace_back(new test_mul_chain(op2_is_add, false, {1030, 7, 2, 1}, {1, 7, 2, 1}, {1030, 1, 1, 1}));
+    }
+
     test_cases.emplace_back(new test_scale());
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
@@ -8652,6 +8713,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    // concat along the outermost varying dim (all dims outer to the concat dim == 1):
+    // contiguous cases qualify for the Vulkan buffer-copy fast path, dim0 full-shape
+    // and non-contiguous cases must stay on the shader path
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_I32 }) {
+        test_cases.emplace_back(new test_concat(type, {11, 12, 13, 1}, 7, 2, 0)); // dim2, ne3==1
+        test_cases.emplace_back(new test_concat(type, {11, 12, 1, 1}, 7, 1, 0));  // dim1, ne2==ne3==1
+        test_cases.emplace_back(new test_concat(type, {11, 1, 1, 1}, 7, 0, 0));   // dim0, ne1..3==1
+        test_cases.emplace_back(new test_concat(type, {11, 12, 13, 1}, 7, 0, 0)); // dim0 full shape: not eligible
+        test_cases.emplace_back(new test_concat(type, {11, 12, 13, 1}, 7, 2, 3)); // eligible dims but non-contiguous srcs
+    }
+    // 2-byte type through the fast path (even ne0: Metal's concat copies in float units)
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {12, 12, 13, 1}, 7, 2, 0));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {12, 1, 1, 1}, 8, 0, 0));
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
