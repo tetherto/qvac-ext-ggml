@@ -3,9 +3,7 @@
 #include "types.glsl"
 
 // Fused batched GRU (PyTorch: gate order r,z,n, reset on hh new-gate, h0=0).
-// One 128-lane workgroup packs PB = 128/H batch elements: lane -> (b_local =
-// lane/H, j = lane%H); slot b_local owns h_l[b_local*H .. +H) == h_l[lane] and
-// gh_l[b_local*3H .. +3H).  whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L].
+// whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L]; 128-lane WG packs 128/H batch elems.
 #define GRU_MAX_H 128
 
 layout (push_constant) uniform parameter
@@ -65,8 +63,7 @@ void main() {
         barrier();
 
         // pass 2: gates + state update (each lane touches only h_l[lane]).
-        // exp/tanh args are saturated: some mobile drivers return NaN on exp overflow
-        // (arg > ~88.7) instead of +inf; the clamps are bit-equivalent in fp32.
+        // exp/tanh args saturated: some mobile drivers NaN on exp overflow (>~88.7) not +inf; clamps bit-equal in fp32.
         if (lane_live) {
             const float r  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + j] + gh_l[gbase + j]), 88.0f)));
             const float z  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + p.H + j] + gh_l[gbase + p.H + j]), 88.0f)));

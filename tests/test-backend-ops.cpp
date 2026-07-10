@@ -3650,9 +3650,8 @@ struct test_gru : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        // Scale the recurrent weights like trained weights (spectral radius < 1).
-        // With plain U(-1,1) whh the recurrence is chaotic and per-backend fp ULP
-        // differences amplify exponentially in l, failing any strict bound.
+        // Scale recurrent weights like trained weights (spectral radius < 1): plain U(-1,1) whh
+        // makes the recurrence chaotic, so per-backend fp ULP diffs amplify over l and fail any bound.
         const float ws = 1.0f / sqrtf((float) h);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->ne[0] == h && t->ne[1] == 3 * h) {
@@ -8713,9 +8712,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
         }
     }
-    // concat along the outermost varying dim (all dims outer to the concat dim == 1):
-    // contiguous cases qualify for the Vulkan buffer-copy fast path, dim0 full-shape
-    // and non-contiguous cases must stay on the shader path
+    // concat along the outermost varying dim (all outer dims == 1): contiguous cases hit the
+    // Vulkan buffer-copy fast path; dim0 full-shape and non-contiguous cases stay on the shader path.
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_I32 }) {
         test_cases.emplace_back(new test_concat(type, {11, 12, 13, 1}, 7, 2, 0)); // dim2, ne3==1
         test_cases.emplace_back(new test_concat(type, {11, 12, 1, 1}, 7, 1, 0));  // dim1, ne2==ne3==1

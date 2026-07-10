@@ -3,8 +3,7 @@
 #include "types.glsl"
 
 // Fused affine + per-channel PReLU (LavaSR denoiser), scalar op order:
-// out = x*aw[f,c] + ab[f,c] + (max(x,0) + slope[c]*min(x,0)).
-// x/out [F,T,C,Bc] contiguous, aw/ab [F,C], slope [C].  One thread per element.
+// out = x*aw[f,c] + ab[f,c] + (max(x,0) + slope[c]*min(x,0)).  One thread per element.
 layout (push_constant) uniform parameter
 {
     uint ne;   // total dst elements

@@ -3,8 +3,7 @@
 #include "types.glsl"
 
 // Zero-insertion upsample of ne0 by s: dst[f] = (f%s==0) ? src[f/s] : 0.
-// src [F,R] contiguous -> dst [Fu,R], Fu=(F-1)*s+1, R=ne1*ne2*ne3.
-// One thread per dst element (gather form; no scatter/zeroing pass needed).
+// One thread per dst element (gather form).
 layout (push_constant) uniform parameter
 {
     uint ne;   // total dst elements

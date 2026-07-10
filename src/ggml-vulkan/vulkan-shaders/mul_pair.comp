@@ -7,8 +7,7 @@
 #include "utils.glsl"
 
 // Fused elementwise pair: d = op2(a * b, c), op2 selected by OP2_ADD.
-// Indices decompose over src0's shape (== both nodes' dst shape); b and c
-// broadcast onto it via fastmod, like src1 in generic_binary_head.glsl.
+// b and c broadcast onto src0's shape via fastmod (like src1 in generic_binary_head.glsl).
 layout (push_constant) uniform parameter
 {
     uint ne;

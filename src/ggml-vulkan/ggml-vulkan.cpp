@@ -7603,23 +7603,8 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->mul_mat_m[src0_type]) {
         return aligned ? mmp->a_m : mmp->m;
     }
-    // DIAG-REVERT: A/B tile force for Xclipse tuning (GGML_VK_FORCE_MM_TILE=m|s|l).
-    // Must precede the vendor overrides below or it is dead code on those devices.
-    {
-        static const char * force = getenv("GGML_VK_FORCE_MM_TILE");
-        if (force && force[0] == 'l' && ctx->device->mul_mat_l[src0_type]) {
-            return aligned ? mmp->a_l : mmp->l;
-        }
-        if (force && force[0] == 'm' && ctx->device->mul_mat_m[src0_type]) {
-            return aligned ? mmp->a_m : mmp->m;
-        }
-        if (force && force[0] == 's' && ctx->device->mul_mat_s[src0_type]) {
-            return aligned ? mmp->a_s : mmp->s;
-        }
-    }
     // Samsung Xclipse (RDNA2 mobile): the `_l` tile's 128 fp32 accumulators/thread
-    // throttle occupancy and leave wide-K GEMMs with too few workgroups; `_m` cuts
-    // the LavaSR enhancer GEMM block ~10% e2e (measured on Xclipse 920).
+    // throttle occupancy on wide-K GEMMs; `_m` cuts the LavaSR enhancer GEMM ~10% e2e.
     if (ctx->device->vendor_id == VK_VENDOR_ID_SAMSUNG && ctx->device->mul_mat_m[src0_type]) {
         return aligned ? mmp->a_m : mmp->m;
     }
@@ -10743,9 +10728,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_GRU:
         {
-            // small-H variant: one lane per batch element (128/WG); packed kernel:
-            // 128-lane workgroups each covering PB = floor(128/H) batch elements
-            // (supports_op guarantees 1 <= H <= 128; must match the shaders)
+            // small-H: one lane per batch element; packed kernel: 128-lane WGs each covering
+            // PB = floor(128/H) batch elements (supports_op guarantees 1 <= H <= 128; must match the shaders).
             const uint32_t H  = (uint32_t)src0->ne[0];
             const uint32_t B  = (uint32_t)src1->ne[1];
             const uint32_t PB = (H == 2 || H == 4 || H == 8) ? 128 : 128 / H;
@@ -11400,10 +11384,8 @@ static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, co
             }
             GGML_ASSERT(bufs[i] != nullptr);
         }
-        // The copies are recorded in the same command buffer as compute dispatches;
-        // the graph-level barriers from ggml_vk_sync_buffers already include
-        // eTransfer in the stage mask and TransferRead/TransferWrite in the access
-        // masks, so ordering against neighboring shader reads/writes is preserved.
+        // Copies share the command buffer with compute; ggml_vk_sync_buffers' barriers already
+        // cover eTransfer + Transfer read/write, so ordering vs neighboring shaders is preserved.
         const size_t src0_bytes = ggml_nbytes(src0);
         const size_t src1_bytes = ggml_nbytes(src1);
         if (src0_bytes > 0) {

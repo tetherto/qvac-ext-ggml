@@ -30,8 +30,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE dst_data[];};
 #ifdef WHCN_V4
 
 // Vectorized 1-D row kernel (host guarantees knl_h==1, stride_x==1, dilation_x==1,
-// knl_w <= MAX_K): one WG per (batch,channel,row) x 256-output chunk; NT=4 outputs
-// per thread from a register window; the channel's weights staged in shared once.
+// knl_w <= MAX_K): one WG per (batch,channel,row), NT outputs/thread from a register window.
 #define WG_SIZE 64
 #define NT 4
 #define MAX_K 8

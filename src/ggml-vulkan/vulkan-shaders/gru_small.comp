@@ -4,11 +4,8 @@
 
 #include "types.glsl"
 
-// Small-H fused GRU, compiled per exact H (H_C define; host selects on p.H == H_C):
-// ONE lane per batch element, the whole recurrence register-resident (compile-time
-// loop bounds -> full unroll), whh/bhh staged in shared once — no barriers in the
-// L loop.  Per-(b,j) fp op order matches the CPU reference (and gru.comp) exactly.
-// whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L].
+// Small-H fused GRU compiled per exact H (H_C; host selects p.H == H_C); fp op order matches
+// CPU reference / gru.comp exactly. whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L].
 #define WG_SIZE 128
 
 layout (push_constant) uniform parameter
