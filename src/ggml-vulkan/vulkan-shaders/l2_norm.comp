@@ -14,6 +14,12 @@ void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationID.x;
 
+    // Workgroup count is padded up to a multiple of 512; phantom rows must
+    // not write out of bounds.
+    if (row >= p.ne11 * p.ne12 * p.ne13) {
+        return;
+    }
+
     const uint i3 = row / (p.ne11 * p.ne12);
     const uint i3_offset = i3 * p.ne12 * p.ne11;
     const uint i2 = (row - i3_offset) / p.ne11;
