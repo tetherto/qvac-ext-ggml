@@ -10809,7 +10809,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16;
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
 
-    if (n_q == 1) {
+    // The q1 kernels parallelize one workgroup per (query row, head): at small n_q the
+    // block-tiled main kernel starves the GPU (one BLOCK_M block row), so route small
+    // batches (beam-search decode, n_q <= 8) through the q1 path with n_q as dim 2.
+    const bool use_qn = n_q <= 8;
+
+    if (use_qn) {
         if (is_mixed) {
             kernel = backend_ctx->kernels_flash_attn_f32_f16_q1.at(dk_dv);
         } else if (is_f16) {
@@ -10910,11 +10915,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     CL_CHECK(clSetKernelArg(kernel, 38, sizeof(cl_mem),   &sinks_buffer));
     CL_CHECK(clSetKernelArg(kernel, 39, sizeof(cl_ulong), &offset_sinks));
 
-    if (n_q == 1) {
+    if (use_qn) {
         const size_t wg_size = 64;
-        size_t local_work_size[] = { wg_size, 1 };
-        size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch) };
-        backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+        size_t local_work_size[] = { wg_size, 1, 1 };
+        size_t global_work_size[] = { wg_size, (size_t)(n_head * n_batch), (size_t)n_q };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
     } else {
         const int block_m = backend_ctx->kernels_flash_attn_bm.at(dk_dv);
         const size_t wg_size = block_m;
