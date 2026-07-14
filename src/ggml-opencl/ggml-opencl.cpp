@@ -4658,6 +4658,8 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     return GGML_STATUS_SUCCESS;
 }
 
+inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor);
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -4679,8 +4681,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 #endif // GGML_OPENCL_SOA_Q
                 case GGML_TYPE_Q8_0:
 #ifdef GGML_OPENCL_SOA_Q
-                    // dedicated SOA q8_0 get_rows kernel keeps the token-embedding gather on the
-                    // GPU (avoids a per-token CPU-fallback split).
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+                    // the SOA get_rows kernel reads the plain block layout, so skip it when the Adreno
+                    // repack transposed this weight (ne1%4==0, e.g. an .en n_vocab) — CPU gathers it.
+                    if (enable_adreno_trans_weight(backend_ctx, op->src[0])) {
+                        return false;
+                    }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
                     return true;
 #else // GGML_OPENCL_SOA_Q
                     return false;
@@ -7828,9 +7835,8 @@ static void ggml_cl_add(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     cl_kernel kernel;
 
-    // src0 must be contiguous for the vectorized bcast_row fast path; a strided src0 (e.g. a view
-    // slicing one projection out of a fused matmul output) falls through to the general kernel_add,
-    // which honors nb strides and produces the identical result.
+    // a strided src0 (e.g. a view slicing one projection out of a fused matmul output) falls
+    // through to the general kernel_add (which honors nb strides) instead of the bcast_row fast path.
     const bool bcast_row = ggml_nelements(src1) == ne10 && ggml_is_contiguous(src1) && ggml_is_contiguous(src0) && ne00 % 4 == 0 && ne10 % 4 == 0;
 
     if (bcast_row) {
@@ -10778,9 +10784,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const bool is_mixed = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16;
     const std::pair<int, int> dk_dv = {d_head_q, d_head_v};
 
-    // The q1 kernels parallelize one workgroup per (query row, head): at small n_q the
-    // block-tiled main kernel starves the GPU (one BLOCK_M block row), so route small
-    // batches (beam-search decode, n_q <= 8) through the q1 path with n_q as dim 2.
+    // at small n_q the block-tiled main kernel starves the GPU (one BLOCK_M row), so route
+    // small batches (beam-search decode, n_q <= 8) through the q1 path with n_q as dim 2.
     const bool use_qn = n_q <= 8;
 
     if (use_qn) {
