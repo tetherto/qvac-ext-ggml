@@ -92,7 +92,7 @@ __kernel void flash_attn_f16(
     for (int i = 0; i < DV_VEC; ++i) {
         o_acc[i] = (ACC_TYPE4)(0.0f);
     }
-    ACC_TYPE m_i = -INFINITY;
+    ACC_TYPE m_i = -1e30f; // [qvac-21623] Adreno: exp(-inf) returns NaN; finite sentinel
     ACC_TYPE l_i = 0.0f;
 
     float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
@@ -108,6 +108,8 @@ __kernel void flash_attn_f16(
             if (k_row_idx < n_kv) {
                 const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
                 l_k[row][col] = ((__global DATA_TYPE4*)(k_base + k_row_offset))[col];
+            } else {
+                l_k[row][col] = (DATA_TYPE4)(0.0f); // [qvac-21623] zero-init padding: p*uninit=0*NaN=NaN
             }
         }
         for (int i = tid; i < BLOCK_N * DV_VEC; i += WG_SIZE) {
@@ -117,6 +119,8 @@ __kernel void flash_attn_f16(
             if (v_row_idx < n_kv) {
                 const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
                 l_v[row][col] = ((__global DATA_TYPE4*)(v_base + v_row_offset))[col];
+            } else {
+                l_v[row][col] = (DATA_TYPE4)(0.0f); // [qvac-21623] zero-init padding (avoid 0*NaN)
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -140,18 +144,22 @@ __kernel void flash_attn_f16(
             ACC_TYPE score1 = (dot_acc1.s0 + dot_acc1.s1 + dot_acc1.s2 + dot_acc1.s3) * scale;
 
             if (is_causal) {
-                if (k_row0 > (n_kv - n_q + my_query_row)) score0 = -INFINITY;
-                if (k_row1 > (n_kv - n_q + my_query_row)) score1 = -INFINITY;
+                if (k_row0 > (n_kv - n_q + my_query_row)) score0 = -1e30f;
+                if (k_row1 > (n_kv - n_q + my_query_row)) score1 = -1e30f;
             }
 
-            if (k_row0 >= n_kv) score0 = -INFINITY;
-            if (k_row1 >= n_kv) score1 = -INFINITY;
+            if (k_row0 >= n_kv) score0 = -1e30f;
+            if (k_row1 >= n_kv) score1 = -1e30f;
 
             if (mask_base != NULL) {
                 const global DATA_TYPE* mask_ptr = (const global DATA_TYPE*)(mask_base + my_query_row * mask_nb1);
                 if (k_row0 < n_kv) score0 += slope * (ACC_TYPE)mask_ptr[k_row0];
                 if (k_row1 < n_kv) score1 += slope * (ACC_TYPE)mask_ptr[k_row1];
             }
+
+            // [qvac-21623] mask may be -inf; keep exp() args finite (Adreno NaN-safe).
+            score0 = max(score0, -1e30f);
+            score1 = max(score1, -1e30f);
 
             if (logit_softcap > 0.0f) {
                 score0 = logit_softcap * tanh(score0 / logit_softcap);
