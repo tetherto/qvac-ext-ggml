@@ -407,18 +407,6 @@ struct ggml_backend_opencl_device_context {
     std::string device_description;
 };
 
-// [qvac-21623] host enqueue/sync instrumentation (env WHISPER_CL_ENQ_PROFILE, not shipped)
-static const bool g_clp = (getenv("WHISPER_CL_ENQ_PROFILE") != nullptr);
-static int64_t g_clp_enq_us = 0; static long g_clp_enq_n = 0;
-static int64_t g_clp_sync_us = 0; static long g_clp_sync_n = 0;
-// [qvac-21623] expose counters so whisper can decompose decode-phase enqueue/sync (instrumentation)
-extern "C" void ggml_cl_prof_snapshot(int64_t * enq_us, int64_t * sync_us, int64_t * enq_n, int64_t * sync_n) {
-    if (enq_us)  *enq_us  = g_clp_enq_us;
-    if (sync_us) *sync_us = g_clp_sync_us;
-    if (enq_n)   *enq_n   = g_clp_enq_n;
-    if (sync_n)  *sync_n  = g_clp_sync_n;
-}
-
 // backend context
 struct ggml_backend_opencl_context {
     int ref_count;
@@ -785,13 +773,7 @@ struct ggml_backend_opencl_context {
         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
 #else
         GGML_UNUSED(tensor);
-        if (g_clp) {
-            const int64_t _t = ggml_time_us();
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
-            g_clp_enq_us += ggml_time_us() - _t; g_clp_enq_n++;
-        } else {
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
-        }
+        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
 #endif
     }
 
@@ -841,11 +823,6 @@ struct ggml_backend_opencl_context {
             write_profiling_info();
             profiling_info.clear();
 #endif
-            if (g_clp) {
-                GGML_LOG_INFO("[cl-enq-prof] enqueue: n=%ld total=%.1f ms per=%.2f us | sync(barrier+wait): n=%ld total=%.1f ms per=%.2f us\n",
-                    g_clp_enq_n, g_clp_enq_us/1e3, g_clp_enq_n ? (double) g_clp_enq_us/g_clp_enq_n : 0.0,
-                    g_clp_sync_n, g_clp_sync_us/1e3, g_clp_sync_n ? (double) g_clp_sync_us/g_clp_sync_n : 0.0);
-            }
         }
     }
 };
@@ -4528,12 +4505,10 @@ static bool ggml_backend_opencl_cpy_tensor_async(ggml_backend_t backend, const g
 static void ggml_backend_opencl_synchronize(ggml_backend_t backend) {
     auto * backend_ctx = static_cast<ggml_backend_opencl_context *>(backend->context);
 
-    const int64_t _t = g_clp ? ggml_time_us() : 0;
     cl_event evt;
     CL_CHECK(clEnqueueBarrierWithWaitList(backend_ctx->queue, 0, nullptr, &evt));
     CL_CHECK(clWaitForEvents(1, &evt));
     CL_CHECK(clReleaseEvent(evt));
-    if (g_clp) { g_clp_sync_us += ggml_time_us() - _t; g_clp_sync_n++; }
 }
 
 // Synchronizes the 'backend_ctx's device with others so that commands
@@ -4704,8 +4679,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 #endif // GGML_OPENCL_SOA_Q
                 case GGML_TYPE_Q8_0:
 #ifdef GGML_OPENCL_SOA_Q
-                    // [qvac-21623] dedicated SOA q8_0 get_rows kernel keeps the quantized
-                    // token-embedding gather on the GPU (avoids a per-token CPU-fallback split).
+                    // dedicated SOA q8_0 get_rows kernel keeps the token-embedding gather on the
+                    // GPU (avoids a per-token CPU-fallback split).
                     return true;
 #else // GGML_OPENCL_SOA_Q
                     return false;
@@ -4986,19 +4961,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 if (backend_ctx->generic_subgroup_64) {
                     return false;
                 }
-                // [qvac-21623] env bypass to test whether the current Adreno FA kernels decode
-                // correctly on real transcripts (the gate exists for a suspected miscompute).
-                // GGML_OPENCL_FA_ADRENO=1 -> all FA on GPU; =2 -> only the decoder's FA (small n_q),
-                // keeping the large-n_q encoder FA on CPU (isolates encoder-vs-decoder miscompute).
+                // Adreno FA is opt-in via GGML_OPENCL_FA_ADRENO=1; default routes it to CPU.
                 {
                     static const int fa_adreno = getenv("GGML_OPENCL_FA_ADRENO") ? atoi(getenv("GGML_OPENCL_FA_ADRENO")) : 0;
-                    if (backend_ctx->gpu_family == ADRENO) {
-                        if (fa_adreno == 0) {
-                            return false;
-                        }
-                        if (fa_adreno == 2 && op->src[0]->ne[1] > 64) {
-                            return false; // encoder FA (large n_q) stays on CPU
-                        }
+                    if (backend_ctx->gpu_family == ADRENO && fa_adreno == 0) {
+                        return false;
                     }
                 }
                 const ggml_tensor * q = op->src[0];
@@ -7606,9 +7573,8 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     cl_ulong offset1 = extra1->offset + src1->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
-    // [qvac-21623] q8_0 uses the struct-of-arrays (SOA) layout (extra_cl_q8_0->q/->d),
-    // so it needs a dedicated dispatch reading the two subbuffers. This keeps the token
-    // embedding get_rows on the GPU (was a CPU fallback → per-token 2-split + 26MB copy).
+    // q8_0 uses the struct-of-arrays (SOA) layout (extra_cl_q8_0->q/->d), so it needs a
+    // dedicated dispatch reading the two subbuffers to keep this get_rows on the GPU.
     if (src0->type == GGML_TYPE_Q8_0) {
         ggml_tensor_extra_cl_q8_0 * extra0_q8 = (ggml_tensor_extra_cl_q8_0 *)src0->extra;
         cl_kernel kernel = backend_ctx->kernel_get_rows_q8_0;
@@ -10870,16 +10836,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     const int is_causal = (mask == NULL && n_q > 1 && n_q == n_kv);
 
-    // [qvac-21623] diagnostic: is the is_causal heuristic misfiring on the (non-causal) whisper encoder?
-    if (getenv("WHISPER_FA_DUMP")) {
-        static int fa_n = 0;
-        if (fa_n < 16) {
-            fprintf(stderr, "[fa] call=%d n_q=%d n_kv=%d n_head=%d mask=%s is_causal=%d\n",
-                    fa_n, n_q, n_kv, n_head, mask ? "yes" : "NULL", is_causal);
-        }
-        fa_n++;
-    }
-
     const int n_head_log2_val = n_head > 0 ? 1u << (int)floorf(log2f((float)n_head)) : 0;
     const float n_head_log2_f = n_head_log2_val > 0 ? (float)n_head_log2_val : 1.0f;
     const float m0 = powf(2.0f, -(max_bias) / n_head_log2_f);
@@ -10929,32 +10885,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t local_work_size[] = { wg_size, 1 };
         size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
-    }
-
-    // [qvac-21623] diagnostic: read back the FA output and scan for NaN/inf (bit-pattern, R14:
-    // fast-math nullifies isnan) + min/max, to localize the Adreno FA miscompute.
-    if (getenv("WHISPER_FA_DUMP2")) {
-        static int fo_n = 0;
-        if (fo_n < 12) {
-            clFinish(backend_ctx->queue);
-            size_t nb = ggml_nbytes(dst);
-            size_t rd = nb < (4u<<20) ? nb : (4u<<20);
-            std::vector<unsigned char> buf(rd);
-            clEnqueueReadBuffer(backend_ctx->queue, extra_o->data_device, CL_TRUE, offset_o, rd, buf.data(), 0, NULL, NULL);
-            int n_nan = 0, n_inf = 0; float mn = 1e30f, mx = -1e30f;
-            if (dst->type == GGML_TYPE_F32) {
-                size_t n = rd / 4; const unsigned int * u = (const unsigned int *)buf.data();
-                for (size_t i = 0; i < n; i++) { unsigned int e = u[i] & 0x7f800000u, m = u[i] & 0x7fffffu;
-                    if (e == 0x7f800000u) { if (m) n_nan++; else n_inf++; } else { float v; memcpy(&v,&u[i],4); mn = v<mn?v:mn; mx = v>mx?v:mx; } }
-                fprintf(stderr, "[fa-out] call=%d f32 n=%zu nan=%d inf=%d min=%g max=%g\n", fo_n, n, n_nan, n_inf, mn, mx);
-            } else {
-                size_t n = rd / 2; const unsigned short * h = (const unsigned short *)buf.data();
-                for (size_t i = 0; i < n; i++) { unsigned int e = h[i] & 0x7c00u, m = h[i] & 0x3ffu;
-                    if (e == 0x7c00u) { if (m) n_nan++; else n_inf++; } }
-                fprintf(stderr, "[fa-out] call=%d f16 n=%zu nan=%d inf=%d\n", fo_n, n, n_nan, n_inf);
-            }
-        }
-        fo_n++;
     }
 }
 

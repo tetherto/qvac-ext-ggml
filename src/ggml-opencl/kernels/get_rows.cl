@@ -188,7 +188,7 @@ kernel void kernel_get_rows_q4_0(
 
 #define QK8_0 32
 
-// [qvac-21623] get_rows for the struct-of-arrays (GGML_OPENCL_SOA_Q) q8_0 layout:
+// get_rows for the struct-of-arrays (GGML_OPENCL_SOA_Q) q8_0 layout:
 // quants in src_q (block-contiguous int8, 32/block), scales in src_d (one half/block).
 // Mirrors kernel_convert_block_q8_0 storage: q[QK8_0*blk + i], d[blk].
 // nblk0{1,2,3} are src0 strides expressed in BLOCKS (computed host-side from src0 ne).
