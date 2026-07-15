@@ -93,7 +93,7 @@ __kernel void flash_attn_f32(
     for (int i = 0; i < DV_VEC; ++i) {
         o_acc[i] = (ACC_TYPE4)(0.0f);
     }
-    ACC_TYPE m_i = -INFINITY;
+    ACC_TYPE m_i = -1e30f; // Adreno: exp(-inf) returns NaN; finite sentinel
     ACC_TYPE l_i = 0.0f;
 
     float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
@@ -109,6 +109,8 @@ __kernel void flash_attn_f32(
             if (k_row_idx < n_kv) {
                 const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
                 l_k[row][col] = ((__global DATA_TYPE4*)(k_base + k_row_offset))[col];
+            } else {
+                l_k[row][col] = (DATA_TYPE4)(0.0f); // zero-init padding: p*uninit=0*NaN=NaN
             }
         }
         for (int i = tid; i < BLOCK_N * DV_VEC; i += WG_SIZE) {
@@ -118,6 +120,8 @@ __kernel void flash_attn_f32(
             if (v_row_idx < n_kv) {
                 const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
                 l_v[row][col] = ((__global DATA_TYPE4*)(v_base + v_row_offset))[col];
+            } else {
+                l_v[row][col] = (DATA_TYPE4)(0.0f); // zero-init padding (avoid 0*NaN)
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -141,18 +145,22 @@ __kernel void flash_attn_f32(
             ACC_TYPE score1 = (dot_acc1.s0 + dot_acc1.s1 + dot_acc1.s2 + dot_acc1.s3) * scale;
 
             if (is_causal) {
-                if (k_row0 > (n_kv - n_q + my_query_row)) score0 = -INFINITY;
-                if (k_row1 > (n_kv - n_q + my_query_row)) score1 = -INFINITY;
+                if (k_row0 > (n_kv - n_q + my_query_row)) score0 = -1e30f;
+                if (k_row1 > (n_kv - n_q + my_query_row)) score1 = -1e30f;
             }
 
-            if (k_row0 >= n_kv) score0 = -INFINITY;
-            if (k_row1 >= n_kv) score1 = -INFINITY;
+            if (k_row0 >= n_kv) score0 = -1e30f;
+            if (k_row1 >= n_kv) score1 = -1e30f;
 
             if (mask_base != NULL) {
                 const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base + my_query_row * mask_nb1);
                 if (k_row0 < n_kv) score0 += slope * (ACC_TYPE)mask_ptr[k_row0];
                 if (k_row1 < n_kv) score1 += slope * (ACC_TYPE)mask_ptr[k_row1];
             }
+
+            // mask may be -inf; keep exp() args finite (Adreno NaN-safe).
+            score0 = max(score0, -1e30f);
+            score1 = max(score1, -1e30f);
 
             if (logit_softcap > 0.0f) {
                 score0 = logit_softcap * tanh(score0 / logit_softcap);
@@ -237,6 +245,7 @@ __kernel void flash_attn_f32_q1(
 ) {
     const int tid = get_local_id(0);
     const int head_batch_idx = get_global_id(1);
+    const int q_row = get_global_id(2); // small-batch: one workgroup per (query row, head)
 
     const int batch_idx = head_batch_idx / n_head;
     const int head_idx = head_batch_idx % n_head;
@@ -253,11 +262,12 @@ __kernel void flash_attn_f32_q1(
     if (mask_void != NULL) {
         const int mask_head_idx = head_idx % mask_ne2;
         const int mask_batch_idx = batch_idx % mask_ne3;
-        mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
+        mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2
+                  + q_row * mask_nb1;
     }
 
     ACC_TYPE4 q_priv[DK_VEC];
-    const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+    const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2 + q_row * q_nb1;
     const global DATA_TYPE4* q_ptr = (const global DATA_TYPE4*)(q_base + q_row_offset);
     #pragma unroll
     for (int i = 0; i < DK_VEC; ++i) {
@@ -271,7 +281,7 @@ __kernel void flash_attn_f32_q1(
         sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
     }
 
-    ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
+    ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -1e30f;
     for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
         const global DATA_TYPE4* k_ptr = (const global DATA_TYPE4*)(k_base + k_row_offset);
@@ -281,10 +291,14 @@ __kernel void flash_attn_f32_q1(
             dot_acc = mad(q_priv[k], CONVERT_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (is_causal && k_idx > (n_kv - n_q + q_row)) {
+            score = -1e30f;
+        }
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
             score += slope * (ACC_TYPE)mask_ptr[k_idx];
         }
+        score = max(score, -1e30f); // mask holds -inf; keep exp() args finite (Adreno NaN-safe)
         if (logit_softcap > 0.0f) {
             score = logit_softcap * tanh(score / logit_softcap);
         }
@@ -317,10 +331,14 @@ __kernel void flash_attn_f32_q1(
             dot_acc = mad(q_priv[k], CONVERT_ACC4(k_ptr[k]), dot_acc);
         }
         ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+        if (is_causal && k_idx > (n_kv - n_q + q_row)) {
+            score = -1e30f;
+        }
         if (mask_base != NULL) {
             const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
             score += slope * (ACC_TYPE)mask_ptr[k_idx];
         }
+        score = max(score, -1e30f); // mask holds -inf; keep exp() args finite (Adreno NaN-safe)
         if (logit_softcap > 0.0f) {
             score = logit_softcap * tanh(score / logit_softcap);
         }
@@ -342,7 +360,7 @@ __kernel void flash_attn_f32_q1(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
+    const ulong o_row_offset = batch_idx * o_nb3 + q_row * o_nb2 + head_idx * o_nb1;
     global DATA_TYPE4 *o_row = (global DATA_TYPE4 *)(o_base + o_row_offset);
     ACC_TYPE l_final = local_l[0];
 
