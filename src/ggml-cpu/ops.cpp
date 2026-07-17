@@ -8136,6 +8136,113 @@ void ggml_compute_forward_supertonic_edge_pad_1d(
     }
 }
 
+// ggml_compute_forward_col2im_1d
+//
+// Scatter-add columns [K*OC, T_in] -> signal [T_out, OC], where
+// T_out = (T_in - 1)*s0 + K - 2*p0.  Implemented as a gather: each output time
+// reads the (at most ceil(K/s0)) columns that land on it, so threads write
+// disjoint outputs and no atomics/locks are needed.  Parallelized over the time
+// axis so the split stays balanced whatever OC is (down to OC = 1 mono audio).
+// CPU bring-up: F32 only (QVAC-21921).
+void ggml_compute_forward_col2im_1d(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src = dst->src[0]; // [K*OC, T_in]
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int32_t s0 = ggml_get_op_params_i32(dst, 0);
+    const int32_t OC = ggml_get_op_params_i32(dst, 1);
+    const int32_t p0 = ggml_get_op_params_i32(dst, 2);
+
+    const int64_t K_OC  = src->ne[0];
+    const int64_t T_in  = src->ne[1];
+    const int64_t K     = K_OC / OC;
+    const int64_t T_out = dst->ne[0];
+
+    const float * col_data = (const float *) src->data;
+          float * dst_data = (float *)       dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Threads own disjoint output-time bands.
+    const int64_t dr  = (T_out + nth - 1) / nth;
+    const int64_t it0 = dr * ith;
+    const int64_t it1 = it0 + dr < T_out ? it0 + dr : T_out;
+
+    for (int64_t oc = 0; oc < OC; oc++) {
+        for (int64_t t_out = it0; t_out < it1; t_out++) {
+            const int64_t t_abs = t_out + p0; // position in the uncropped signal
+            // Gather every (t_in, k) with t_in*s0 + k == t_abs, 0 <= k < K.
+            int64_t t_in_min = (t_abs - K + 1 + s0 - 1) / s0; // ceil((t_abs-K+1)/s0)
+            if (t_in_min < 0) t_in_min = 0;
+            int64_t t_in_max = t_abs / s0;
+            if (t_in_max >= T_in) t_in_max = T_in - 1;
+
+            float sum = 0.0f;
+            for (int64_t t_in = t_in_min; t_in <= t_in_max; t_in++) {
+                const int64_t k = t_abs - t_in * s0;
+                if (k >= 0 && k < K) {
+                    // col layout [K*OC, T_in]: element (oc*K + k, t_in)
+                    sum += col_data[(oc * K + k) + t_in * K_OC];
+                }
+            }
+            // dst layout [T_out, OC]: element (t_out, oc)
+            dst_data[t_out + oc * T_out] = sum;
+        }
+    }
+}
+
+// ggml_compute_forward_snake
+//
+// Snake activation y = x + sin^2(a*x) * inv_b, with per-channel a and inv_b.
+// x / dst are [T, C] (T = ne0, contiguous); a and inv_b hold one F32 value per
+// channel.  Parallelized over channels (threads own disjoint [c*T, (c+1)*T)
+// bands).  ACE-Step Oobleck VAE (QVAC-21921).  CPU bring-up: F32 only.
+void ggml_compute_forward_snake(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * a     = dst->src[1];
+    const ggml_tensor * inv_b = dst->src[2];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && inv_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t T = x->ne[0];
+    const int64_t C = x->ne[1];
+
+    const float * xd = (const float *) x->data;
+    const float * ad = (const float *) a->data;
+    const float * bd = (const float *) inv_b->data;
+          float * yd = (float *)       dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Split over channels: each thread owns disjoint time bands.
+    for (int64_t c = ith; c < C; c += nth) {
+        const float ac = ad[c];
+        const float bc = bd[c];
+        const float * xc = xd + c * T;
+              float * yc = yd + c * T;
+        for (int64_t t = 0; t < T; t++) {
+            const float xi = xc[t];
+            const float si = sinf(ac * xi);
+            yc[t] = xi + si * si * bc;
+        }
+    }
+}
+
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {

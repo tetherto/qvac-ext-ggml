@@ -1089,9 +1089,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ZERO_UPSAMPLE",
     "CHANNEL_SHUFFLE",
     "AFFINE_PRELU",
+    "COL2IM_1D",
+    "SNAKE",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1210,9 +1212,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "zero_upsample(x)",
     "channel_shuffle(x)",
     "affine_prelu(x,aw,ab,slope)",
+    "col2im_1d(x)",
+    "snake(x,a,inv_b)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5539,6 +5543,67 @@ struct ggml_tensor * ggml_affine_prelu(
     result->src[1] = aw;
     result->src[2] = ab;
     result->src[3] = slope;
+
+    return result;
+}
+
+// ggml_col2im_1d
+
+struct ggml_tensor * ggml_col2im_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   s0,
+        int                   oc,
+        int                   p0) {
+    GGML_ASSERT(ggml_is_matrix(a));
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32); // CPU bring-up: F32 only (QVAC-21921)
+    GGML_ASSERT(s0 > 0);
+    GGML_ASSERT(oc > 0);
+    GGML_ASSERT(p0 >= 0);
+
+    const int64_t K_OC = a->ne[0];
+    const int64_t T_in = a->ne[1];
+    const int64_t K    = K_OC / oc;
+    const int64_t T_out = (T_in - 1) * s0 + K - 2 * p0;
+
+    GGML_ASSERT(K_OC == K * oc);  // a->ne[0] must be a whole number of oc blocks
+    GGML_ASSERT(K > 0 && T_out > 0);
+
+    const int64_t ne[4] = { T_out, oc, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, 2, ne);
+
+    int32_t params[] = { s0, (int32_t) oc, (int32_t) p0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_COL2IM_1D;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_snake
+
+struct ggml_tensor * ggml_snake(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * inv_b) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32); // CPU bring-up: F32 only (QVAC-21921)
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && inv_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(inv_b));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);      // 2D activation [T, C]
+    GGML_ASSERT(ggml_are_same_shape(a, inv_b));
+    GGML_ASSERT(ggml_nelements(a) == x->ne[1]);       // one (a, inv_b) per channel
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                                                     x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+
+    result->op     = GGML_OP_SNAKE;
+    result->src[0] = x;
+    result->src[1] = a;
+    result->src[2] = inv_b;
 
     return result;
 }
