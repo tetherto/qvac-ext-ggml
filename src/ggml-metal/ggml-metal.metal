@@ -5022,6 +5022,86 @@ kernel void kernel_conv_transpose_1d<half>(
     uint3   tpitg[[thread_position_in_threadgroup]],
     uint3     ntg[[threads_per_threadgroup]]);
 
+// col2im_1d: scatter-add GEMM columns [K*OC, T_in] back into a 1D signal
+// [T_out, OC] (GEMM-based conv_transpose_1d, ACE-Step Oobleck VAE - QVAC-21921).
+// One threadgroup per output channel; threads stride over the output time axis.
+// Implemented as a gather (each output time reads its contributing columns) so
+// threads write disjoint outputs -- no atomics needed.  Mirrors the CPU path in
+// ggml_compute_forward_col2im_1d.
+kernel void kernel_col2im_1d_f32(
+        constant ggml_metal_kargs_col2im_1d & args,
+        device const float * col,   // [K*OC, T_in]
+        device       float * dst,   // [T_out, OC]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const int T_out = args.T_out;
+    const int T_in  = args.T_in;
+    const int K     = args.K;
+    const int OC    = args.OC;
+    const int s0    = args.s0;
+    const int p0    = args.p0;
+    const int K_OC  = K * OC;
+
+    // Flat 1D grid over all T_out*OC output elements (grid-stride) so occupancy
+    // stays high even when OC is tiny (e.g. the final stereo transpose-conv).
+    const uint N      = (uint) T_out * (uint) OC;
+    const uint stride = ntg.x * tgpg.x;
+    for (uint gid = tgpig.x * ntg.x + tpitg.x; gid < N; gid += stride) {
+        // dst layout [T_out, OC]: gid == t_out + oc*T_out
+        const int oc    = (int) (gid / (uint) T_out);
+        const int t_out = (int) (gid % (uint) T_out);
+        const int t_abs = t_out + p0; // position in the uncropped signal
+        // Gather every (t_in, k) with t_in*s0 + k == t_abs, 0 <= k < K.
+        int t_in_min = (t_abs - K + 1 + s0 - 1) / s0;
+        if (t_in_min < 0) t_in_min = 0;
+        int t_in_max = t_abs / s0;
+        if (t_in_max >= T_in) t_in_max = T_in - 1;
+
+        float sum = 0.0f;
+        for (int t_in = t_in_min; t_in <= t_in_max; ++t_in) {
+            const int k = t_abs - t_in * s0;
+            if (k >= 0 && k < K) {
+                // col layout [K*OC, T_in]: element (oc*K + k, t_in)
+                sum += col[(oc * K + k) + t_in * K_OC];
+            }
+        }
+        dst[gid] = sum;
+    }
+}
+
+// snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
+// (ACE-Step Oobleck VAE - QVAC-21921).  x / y are [T, C] contiguous; one
+// threadgroup per channel, threads stride over the time axis.  Mirrors the CPU
+// path in ggml_compute_forward_snake.
+kernel void kernel_snake_f32(
+        constant ggml_metal_kargs_snake & args,
+        device const float * x,      // [T, C]
+        device const float * a,      // [C]
+        device const float * inv_b,  // [C]
+        device       float * y,      // [T, C]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint L = (uint) args.L;
+    const uint C = (uint) args.C;
+    const uint N = L * C;
+
+    // Flat 1D grid over all T*C elements (grid-stride).  x/y are contiguous
+    // [T, C] so element index == t + c*L; the per-channel scalars come from c.
+    const uint stride = ntg.x * tgpg.x;
+    for (uint gid = tgpig.x * ntg.x + tpitg.x; gid < N; gid += stride) {
+        const uint  c  = gid / L;
+        const float xi = x[gid];
+        const float si = sin(a[c] * xi);
+        y[gid] = xi + si * si * inv_b[c];
+    }
+}
+
 
 typedef void (conv_transpose_2d_t)(
         constant ggml_metal_kargs_conv_transpose_2d & args,

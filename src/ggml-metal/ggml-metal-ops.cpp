@@ -391,6 +391,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_conv_transpose_1d(ctx, idx);
             } break;
+        case GGML_OP_COL2IM_1D:
+            {
+                n_fuse = ggml_metal_op_col2im_1d(ctx, idx);
+            } break;
+        case GGML_OP_SNAKE:
+            {
+                n_fuse = ggml_metal_op_snake(ctx, idx);
+            } break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 n_fuse = ggml_metal_op_conv_transpose_2d(ctx, idx);
@@ -3961,6 +3969,85 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
     // 32 threads per threadgroup (== 1 simdgroup); threads parallelise IC and
     // reduce via simd_sum. Dispatch one threadgroup per (OL, OC) output pixel.
     ggml_metal_encoder_dispatch_threadgroups(enc, OL, OC, 1, 32, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_col2im_1d(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t s0 = ((const int32_t *)(op->op_params))[0];
+    const int32_t OC = ((const int32_t *)(op->op_params))[1];
+    const int32_t p0 = ((const int32_t *)(op->op_params))[2];
+
+    const int32_t K_OC  = (int32_t) op->src[0]->ne[0];
+    const int32_t T_in  = (int32_t) op->src[0]->ne[1];
+    const int32_t K     = K_OC / OC;
+    const int32_t T_out = (int32_t) op->ne[0];
+
+    ggml_metal_kargs_col2im_1d args = {
+        /*.T_out =*/ T_out,
+        /*.T_in  =*/ T_in,
+        /*.K     =*/ K,
+        /*.OC    =*/ OC,
+        /*.s0    =*/ s0,
+        /*.p0    =*/ p0,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_col2im_1d(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // columns
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2); // signal
+
+    // Flat 1D grid over T_out*OC output elements with a grid-stride loop, so the
+    // GPU stays saturated even when OC is tiny (final stereo transpose-conv).
+    const int64_t N   = (int64_t) T_out * (int64_t) OC;
+    const int     nth = 256;
+    int64_t ntg = (N + nth - 1) / nth;
+    if (ntg < 1)      ntg = 1;
+    if (ntg > 65535)  ntg = 65535;  // grid-stride covers the remainder
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_snake(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS(int32_t, ne, op, ne);
+
+    const int32_t L = ne0; // T (contiguous inner dim)
+    const int32_t C = ne1; // channels
+
+    ggml_metal_kargs_snake args = {
+        /*.L =*/ L,
+        /*.C =*/ C,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_snake(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // x
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // a
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // inv_b
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4); // y
+
+    // Flat 1D grid over T*C elements with a grid-stride loop for high occupancy.
+    const int64_t N   = (int64_t) L * (int64_t) C;
+    const int     nth = 256;
+    int64_t ntg = (N + nth - 1) / nth;
+    if (ntg < 1)      ntg = 1;
+    if (ntg > 65535)  ntg = 65535;  // grid-stride covers the remainder
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
 
     return 1;
 }
