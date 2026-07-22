@@ -1,5 +1,5 @@
 // Smoke test: build the ACE-Step Oobleck VAE decoder graph on CPU and run it
-// end-to-end with synthetic weights (QVAC-21921).
+// end-to-end with synthetic weights.
 //
 // Purpose: prove our two custom ops (ggml_col2im_1d + ggml_snake) carry the real
 // VAE decode topology on the CPU backend -- graph builds, allocates and computes

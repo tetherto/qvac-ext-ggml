@@ -226,9 +226,18 @@
 #define GGML_MAX_OP_PARAMS      64
 
 #ifndef GGML_MAX_NAME
-// ACE-Step DiT tensor names exceed the historical 64-char limit (e.g. 67 chars);
-// upstream acestep.cpp bumps this to 128. Keep it as the fork default so the
-// ggml lib and every consumer (name[] is part of the ggml_tensor ABI) agree.
+// ACE-Step DiT tensor names exceed the historical 64-char limit (e.g. 67 chars),
+// which would truncate/mismatch on load, so this fork bumps the default to 128
+// (matching upstream acestep.cpp).
+//
+// ABI WARNING: name[] is an inline array in struct ggml_tensor, so changing this
+// alters the tensor's size and field offsets. Linking objects built with 64
+// against a lib built with 128 is an ODR/ABI mismatch (silent memory
+// corruption). This is safe here ONLY because the whole QVAC speech stack
+// consumes ggml exclusively through the ggml-speech vcpkg port and is rebuilt
+// from THIS header in the same build (audiogen-cpp, tts-cpp, parakeet-cpp, …) —
+// there are no prebuilt 64-byte-layout artifacts in the link graph. Any change
+// to this value is a HARD rebuild-everything requirement for all downstreams.
 #   define GGML_MAX_NAME        128
 #endif
 
@@ -607,12 +616,12 @@ extern "C" {
         // out = x*aw + ab + max(x,0) + slope*min(x,0).
         GGML_OP_AFFINE_PRELU,
 
-        // col2im for 1D transpose-conv (ACE-Step Oobleck VAE, QVAC-21921):
+        // col2im for 1D transpose-conv (ACE-Step Oobleck VAE):
         // scatter-add GEMM columns back into a 1D signal.
         GGML_OP_COL2IM_1D,
 
         // Snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
-        // (ACE-Step Oobleck VAE, QVAC-21921).
+        // (ACE-Step Oobleck VAE).
         GGML_OP_SNAKE,
 
         GGML_OP_COUNT,
@@ -2509,7 +2518,7 @@ extern "C" {
             struct ggml_tensor  * slope);
 
     // col2im_1d: scatter-add GEMM columns back to a 1D signal (GEMM-based
-    // conv_transpose_1d, ACE-Step Oobleck VAE - QVAC-21921).
+    // conv_transpose_1d, ACE-Step Oobleck VAE).
     // a: [K*OC, T_in]  (columns from the matmul, K = a->ne[0]/oc)
     // result: [T_out, OC]  where T_out = (T_in - 1)*s0 + K - 2*p0
     GGML_API struct ggml_tensor * ggml_col2im_1d(
@@ -2520,7 +2529,7 @@ extern "C" {
             int                   p0); // padding to crop from both sides
 
     // snake activation: y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
-    // (ACE-Step Oobleck VAE - QVAC-21921).  x: [T, C]; a, inv_b: one per channel.
+    // (ACE-Step Oobleck VAE).  x: [T, C]; a, inv_b: one per channel.
     GGML_API struct ggml_tensor * ggml_snake(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,      // [T, C]

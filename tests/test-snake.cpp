@@ -1,4 +1,4 @@
-// Unit test for ggml_snake (ACE-Step Oobleck VAE op, QVAC-21921).
+// Unit test for ggml_snake (ACE-Step Oobleck VAE op).
 //
 // Snake activation: y = x + sin^2(a*x) * inv_b, with per-channel a and inv_b.
 // Checked against a straightforward host reference over the same [T, C] layout.

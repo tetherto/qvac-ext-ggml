@@ -1,4 +1,4 @@
-// Unit test for ggml_col2im_1d (ACE-Step Oobleck VAE op, QVAC-21921).
+// Unit test for ggml_col2im_1d (ACE-Step Oobleck VAE op).
 //
 // The kernel computes the scatter-add of GEMM columns back into a 1D signal
 // via a *gather* (each output time reads the columns that land on it).  Here we

@@ -5557,7 +5557,7 @@ struct ggml_tensor * ggml_col2im_1d(
         int                   p0) {
     GGML_ASSERT(ggml_is_matrix(a));
     GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(a->type == GGML_TYPE_F32); // CPU bring-up: F32 only (QVAC-21921)
+    GGML_ASSERT(a->type == GGML_TYPE_F32); // CPU bring-up: F32 only
     GGML_ASSERT(s0 > 0);
     GGML_ASSERT(oc > 0);
     GGML_ASSERT(p0 >= 0);
@@ -5589,7 +5589,7 @@ struct ggml_tensor * ggml_snake(
         struct ggml_tensor  * x,
         struct ggml_tensor  * a,
         struct ggml_tensor  * inv_b) {
-    GGML_ASSERT(x->type == GGML_TYPE_F32); // CPU bring-up: F32 only (QVAC-21921)
+    GGML_ASSERT(x->type == GGML_TYPE_F32); // CPU bring-up: F32 only
     GGML_ASSERT(a->type == GGML_TYPE_F32 && inv_b->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(inv_b));

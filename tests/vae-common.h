@@ -1,5 +1,5 @@
-// vae-common.h: shared helpers for the ACE-Step Oobleck VAE bring-up on ggml-speech
-// (QVAC-21921). GGUF mmap loader + weight_norm fusion + graph ops (conv1d, snake,
+// vae-common.h: shared helpers for the ACE-Step Oobleck VAE bring-up on ggml-speech.
+// GGUF loader + weight_norm fusion + graph ops (conv1d, snake,
 // col2im-based conv_t1d, res_unit) + encoder/decoder builders + WAV I/O.
 //
 // Logic ported from acestep.cpp src/vae.h and src/vae-enc.h. The two custom ops
@@ -22,32 +22,38 @@
 #include <string>
 #include <vector>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 // ------------------------------------------------------------------ GGUF loader
 struct GGUF {
     gguf_context * ctx      = nullptr;
     ggml_context * meta     = nullptr;
-    uint8_t *      map      = nullptr;
+    uint8_t *      map      = nullptr;  // whole-file buffer (portable fread, not mmap)
     size_t         fsize    = 0;
     size_t         data_off = 0;
-    int            fd       = -1;
 };
 
+// Read the whole file into a heap buffer. This deliberately avoids POSIX mmap
+// (open/mmap/munmap in <sys/mman.h> etc.): ggml-speech is a cross-platform
+// vcpkg port and these test targets must also compile on MSVC/Windows, which
+// have no <sys/mman.h>. The test GGUFs fit comfortably in RAM, so a plain read
+// is equivalent to the previous read-only mapping for `gdata()`'s pointer math.
 static bool gguf_open(GGUF & g, const char * path) {
-    g.fd = open(path, O_RDONLY);
-    if (g.fd < 0) { fprintf(stderr, "[GGUF] cannot open %s\n", path); return false; }
-    struct stat sb;
-    if (fstat(g.fd, &sb) != 0) { fprintf(stderr, "[GGUF] fstat failed\n"); close(g.fd); g.fd = -1; return false; }
-    g.fsize = (size_t) sb.st_size;
-    g.map   = (uint8_t *) mmap(nullptr, g.fsize, PROT_READ, MAP_PRIVATE, g.fd, 0);
-    if (g.map == MAP_FAILED) { fprintf(stderr, "[GGUF] mmap failed\n"); close(g.fd); g.fd = -1; g.map = nullptr; return false; }
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[GGUF] cannot open %s\n", path); return false; }
+    if (fseek(f, 0, SEEK_END) != 0) { fprintf(stderr, "[GGUF] seek failed\n"); fclose(f); return false; }
+    const long sz = ftell(f);
+    if (sz < 0) { fprintf(stderr, "[GGUF] ftell failed\n"); fclose(f); return false; }
+    rewind(f);
+    g.fsize = (size_t) sz;
+    g.map   = (uint8_t *) malloc(g.fsize);
+    if (!g.map) { fprintf(stderr, "[GGUF] alloc %zu failed\n", g.fsize); fclose(f); return false; }
+    if (fread(g.map, 1, g.fsize, f) != g.fsize) {
+        fprintf(stderr, "[GGUF] read failed\n");
+        free(g.map); g.map = nullptr; fclose(f); return false;
+    }
+    fclose(f);
     struct gguf_init_params p = { /*no_alloc=*/true, /*ctx=*/&g.meta };
     g.ctx = gguf_init_from_file(path, p);
-    if (!g.ctx) { fprintf(stderr, "[GGUF] failed to parse %s\n", path); return false; }
+    if (!g.ctx) { fprintf(stderr, "[GGUF] failed to parse %s\n", path); free(g.map); g.map = nullptr; return false; }
     g.data_off = gguf_get_data_offset(g.ctx);
     fprintf(stderr, "[GGUF] %s: %lld tensors, data at offset %zu\n", path,
             (long long) gguf_get_n_tensors(g.ctx), g.data_off);
@@ -57,8 +63,7 @@ static bool gguf_open(GGUF & g, const char * path) {
 static void gguf_close(GGUF & g) {
     if (g.ctx) gguf_free(g.ctx);
     if (g.meta) ggml_free(g.meta);
-    if (g.map) munmap(g.map, g.fsize);
-    if (g.fd >= 0) close(g.fd);
+    if (g.map) free(g.map);
     g = {};
 }
 

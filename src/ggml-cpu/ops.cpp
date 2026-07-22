@@ -8143,7 +8143,7 @@ void ggml_compute_forward_supertonic_edge_pad_1d(
 // reads the (at most ceil(K/s0)) columns that land on it, so threads write
 // disjoint outputs and no atomics/locks are needed.  Parallelized over the time
 // axis so the split stays balanced whatever OC is (down to OC = 1 mono audio).
-// CPU bring-up: F32 only (QVAC-21921).
+// CPU bring-up: F32 only.
 void ggml_compute_forward_col2im_1d(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -8188,11 +8188,9 @@ void ggml_compute_forward_col2im_1d(
             for (int64_t t_in = t_in_min; t_in <= t_in_max; t_in++) {
                 const int64_t k = t_abs - t_in * s0;
                 if (k >= 0 && k < K) {
-                    // col layout [K*OC, T_in]: element (oc*K + k, t_in)
                     sum += col_data[(oc * K + k) + t_in * K_OC];
                 }
             }
-            // dst layout [T_out, OC]: element (t_out, oc)
             dst_data[t_out + oc * T_out] = sum;
         }
     }
@@ -8203,7 +8201,7 @@ void ggml_compute_forward_col2im_1d(
 // Snake activation y = x + sin^2(a*x) * inv_b, with per-channel a and inv_b.
 // x / dst are [T, C] (T = ne0, contiguous); a and inv_b hold one F32 value per
 // channel.  Parallelized over channels (threads own disjoint [c*T, (c+1)*T)
-// bands).  ACE-Step Oobleck VAE (QVAC-21921).  CPU bring-up: F32 only.
+// bands).  ACE-Step Oobleck VAE.  CPU bring-up: F32 only.
 void ggml_compute_forward_snake(
         const ggml_compute_params * params,
               ggml_tensor * dst) {

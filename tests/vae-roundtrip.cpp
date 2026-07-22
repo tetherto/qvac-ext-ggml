@@ -1,5 +1,5 @@
 // vae-roundtrip: REAL end-to-end audio reconstruction through the ACE-Step Oobleck
-// VAE on CPU (QVAC-21921). Reads a 48 kHz WAV, encodes to the 64-ch latent, decodes
+// VAE on CPU. Reads a 48 kHz WAV, encodes to the 64-ch latent, decodes
 // back to audio, writes the reconstruction and reports how close it is to the input.
 //
 // This is the audible "it works": a real waveform in -> real waveform out, using the

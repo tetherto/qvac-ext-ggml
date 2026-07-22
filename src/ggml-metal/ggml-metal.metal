@@ -5023,7 +5023,7 @@ kernel void kernel_conv_transpose_1d<half>(
     uint3     ntg[[threads_per_threadgroup]]);
 
 // col2im_1d: scatter-add GEMM columns [K*OC, T_in] back into a 1D signal
-// [T_out, OC] (GEMM-based conv_transpose_1d, ACE-Step Oobleck VAE - QVAC-21921).
+// [T_out, OC] (GEMM-based conv_transpose_1d, ACE-Step Oobleck VAE).
 // One threadgroup per output channel; threads stride over the output time axis.
 // Implemented as a gather (each output time reads its contributing columns) so
 // threads write disjoint outputs -- no atomics needed.  Mirrors the CPU path in
@@ -5050,7 +5050,6 @@ kernel void kernel_col2im_1d_f32(
     const uint N      = (uint) T_out * (uint) OC;
     const uint stride = ntg.x * tgpg.x;
     for (uint gid = tgpig.x * ntg.x + tpitg.x; gid < N; gid += stride) {
-        // dst layout [T_out, OC]: gid == t_out + oc*T_out
         const int oc    = (int) (gid / (uint) T_out);
         const int t_out = (int) (gid % (uint) T_out);
         const int t_abs = t_out + p0; // position in the uncropped signal
@@ -5064,7 +5063,6 @@ kernel void kernel_col2im_1d_f32(
         for (int t_in = t_in_min; t_in <= t_in_max; ++t_in) {
             const int k = t_abs - t_in * s0;
             if (k >= 0 && k < K) {
-                // col layout [K*OC, T_in]: element (oc*K + k, t_in)
                 sum += col[(oc * K + k) + t_in * K_OC];
             }
         }
@@ -5073,7 +5071,7 @@ kernel void kernel_col2im_1d_f32(
 }
 
 // snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
-// (ACE-Step Oobleck VAE - QVAC-21921).  x / y are [T, C] contiguous; one
+// (ACE-Step Oobleck VAE).  x / y are [T, C] contiguous; one
 // threadgroup per channel, threads stride over the time axis.  Mirrors the CPU
 // path in ggml_compute_forward_snake.
 kernel void kernel_snake_f32(
