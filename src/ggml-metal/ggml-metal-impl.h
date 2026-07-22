@@ -603,6 +603,24 @@ typedef struct {
     uint64_t nb1;
 } ggml_metal_kargs_conv_transpose_1d;
 
+// col2im for 1D transpose-conv (ACE-Step Oobleck VAE): scatter-add
+// GEMM columns [K*OC, T_in] back into a 1D signal [T_out, OC].
+typedef struct {
+    int32_t T_out;
+    int32_t T_in;
+    int32_t K;
+    int32_t OC;
+    int32_t s0;
+    int32_t p0;
+} ggml_metal_kargs_col2im_1d;
+
+// snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
+// (ACE-Step Oobleck VAE).  x / y are [T, C] contiguous.
+typedef struct {
+    int32_t L; // T (time steps, contiguous inner dim)
+    int32_t C; // channels (one a / inv_b per channel)
+} ggml_metal_kargs_snake;
+
 typedef struct {
     int32_t  IC;
     int32_t  IH;

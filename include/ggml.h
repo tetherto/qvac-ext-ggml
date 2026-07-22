@@ -226,7 +226,19 @@
 #define GGML_MAX_OP_PARAMS      64
 
 #ifndef GGML_MAX_NAME
-#   define GGML_MAX_NAME        64
+// ACE-Step DiT tensor names exceed the historical 64-char limit (e.g. 67 chars),
+// which would truncate/mismatch on load, so this fork bumps the default to 128
+// (matching upstream acestep.cpp).
+//
+// ABI WARNING: name[] is an inline array in struct ggml_tensor, so changing this
+// alters the tensor's size and field offsets. Linking objects built with 64
+// against a lib built with 128 is an ODR/ABI mismatch (silent memory
+// corruption). This is safe here ONLY because the whole QVAC speech stack
+// consumes ggml exclusively through the ggml-speech vcpkg port and is rebuilt
+// from THIS header in the same build (audiogen-cpp, tts-cpp, parakeet-cpp, …) —
+// there are no prebuilt 64-byte-layout artifacts in the link graph. Any change
+// to this value is a HARD rebuild-everything requirement for all downstreams.
+#   define GGML_MAX_NAME        128
 #endif
 
 #define GGML_DEFAULT_N_THREADS  4
@@ -603,6 +615,14 @@ extern "C" {
         // Fused affine + per-channel PReLU (LavaSR denoiser):
         // out = x*aw + ab + max(x,0) + slope*min(x,0).
         GGML_OP_AFFINE_PRELU,
+
+        // col2im for 1D transpose-conv (ACE-Step Oobleck VAE):
+        // scatter-add GEMM columns back into a 1D signal.
+        GGML_OP_COL2IM_1D,
+
+        // Snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
+        // (ACE-Step Oobleck VAE).
+        GGML_OP_SNAKE,
 
         GGML_OP_COUNT,
     };
@@ -2496,6 +2516,25 @@ extern "C" {
             struct ggml_tensor  * aw,
             struct ggml_tensor  * ab,
             struct ggml_tensor  * slope);
+
+    // col2im_1d: scatter-add GEMM columns back to a 1D signal (GEMM-based
+    // conv_transpose_1d, ACE-Step Oobleck VAE).
+    // a: [K*OC, T_in]  (columns from the matmul, K = a->ne[0]/oc)
+    // result: [T_out, OC]  where T_out = (T_in - 1)*s0 + K - 2*p0
+    GGML_API struct ggml_tensor * ggml_col2im_1d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // columns [K*OC, T_in]
+            int                   s0,  // stride
+            int                   oc,  // output channels
+            int                   p0); // padding to crop from both sides
+
+    // snake activation: y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
+    // (ACE-Step Oobleck VAE).  x: [T, C]; a, inv_b: one per channel.
+    GGML_API struct ggml_tensor * ggml_snake(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,      // [T, C]
+            struct ggml_tensor  * a,      // per-channel scale inside sin(), F32
+            struct ggml_tensor  * inv_b); // per-channel output scale, F32
 
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.

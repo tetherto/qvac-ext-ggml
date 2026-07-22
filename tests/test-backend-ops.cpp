@@ -3724,6 +3724,49 @@ struct test_affine_prelu : public test_case {
     }
 };
 
+// GGML_OP_COL2IM_1D
+struct test_col2im_1d : public test_case {
+    const int64_t k;     // kernel size
+    const int64_t oc;    // output channels
+    const int64_t t_in;  // input time steps
+    const int     s0;    // stride
+    const int     p0;    // padding cropped from both sides
+
+    std::string vars() override {
+        return VARS_TO_STR5(k, oc, t_in, s0, p0);
+    }
+
+    test_col2im_1d(int64_t k = 4, int64_t oc = 3, int64_t t_in = 10, int s0 = 2, int p0 = 1)
+        : k(k), oc(oc), t_in(t_in), s0(s0), p0(p0) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // columns from the transpose-conv matmul: [K*OC, T_in]
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k * oc, t_in);
+        ggml_set_name(a, "a");
+        return ggml_col2im_1d(ctx, a, s0, (int) oc, p0);
+    }
+};
+
+// GGML_OP_SNAKE
+struct test_snake : public test_case {
+    const int64_t t;  // time (ne0)
+    const int64_t c;  // channels (ne1)
+
+    std::string vars() override {
+        return VARS_TO_STR2(t, c);
+    }
+
+    test_snake(int64_t t = 32, int64_t c = 8) : t(t), c(c) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t, c);
+        ggml_tensor * a     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, c);
+        ggml_tensor * inv_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, c);
+        ggml_set_name(x, "x");
+        return ggml_snake(ctx, x, a, inv_b);
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -8225,6 +8268,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_affine_prelu(16, 10, 6, 2));
     test_cases.emplace_back(new test_affine_prelu(129, 63, 16, 3));
+
+    test_cases.emplace_back(new test_col2im_1d(4, 3, 10, 2, 1));
+    test_cases.emplace_back(new test_col2im_1d(7, 1, 32, 4, 2));
+    test_cases.emplace_back(new test_col2im_1d(3, 8, 16, 1, 0));
+
+    test_cases.emplace_back(new test_snake(32, 8));
+    test_cases.emplace_back(new test_snake(127, 3));
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
