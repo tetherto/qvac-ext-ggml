@@ -783,6 +783,7 @@ struct ggml_backend_opencl_context {
 
     cl_kernel kernel_transpose_32;
     cl_kernel kernel_transpose_32_16;
+    cl_kernel kernel_transpose_32_32;
     cl_kernel kernel_transpose_16;
     cl_kernel kernel_transpose_8_buf;
     cl_kernel kernel_transpose_16_buf;
@@ -805,6 +806,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q4_1_f32;
     cl_kernel kernel_gemm_noshuffle_q4_1_f32;
     cl_kernel kernel_mul_mm_q8_0_f32_8x4;
+    cl_kernel kernel_mul_mm_q8_0_f32_8x4_f32acc;
     cl_kernel CL_mul_mat_vec_q8_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
@@ -3060,6 +3062,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_transpose_32_16 = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32_16", &err), err));
+        CL_CHECK((backend_ctx->kernel_transpose_32_32 = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32_32", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_32    = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_32", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_16    = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_16", &err), err));
         CL_CHECK((backend_ctx->kernel_transpose_8_buf  = clCreateKernel(backend_ctx->program_transpose, "kernel_transpose_8_buf", &err), err));
@@ -3273,6 +3276,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #endif
         backend_ctx->program_CL_gemm = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_q8_8x4_gemm.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f32_8x4 = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mm_q8_0_f32_8x4", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mm_q8_0_f32_8x4_f32acc = clCreateKernel(backend_ctx->program_CL_gemm, "kernel_mul_mm_q8_0_f32_8x4_f32acc", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -11822,14 +11826,19 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
             padding = 8 - extra_elements;
         }
 
+        // The default staging narrows the activations to half and accumulates in half.
+        // Past fp16 range that saturates to inf and the products go to NaN, which is
+        // exactly what GGML_PREC_F32 asks to prevent, so stay in float when it is set.
+        const bool prec_f32 = (ggml_prec) dst->op_params[0] == GGML_PREC_F32;
+
         // subbuffer for transposed activations
         region.origin = 0;
-        region.size = K * (N + padding) * sizeof(float)/2;
+        region.size = K * (N + padding) * (prec_f32 ? sizeof(float) : sizeof(float)/2);
         backend_ctx->prealloc_act_trans.allocate(context, region.size);
         CL_CHECK((b_sub_buf_trans = clCreateSubBuffer(backend_ctx->prealloc_act_trans.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
         // image for transposed activations
-        img_fmt = {CL_RGBA, CL_HALF_FLOAT};
+        img_fmt = {CL_RGBA, (cl_channel_type) (prec_f32 ? CL_FLOAT : CL_HALF_FLOAT)};
         memset(&img_desc, 0, sizeof(img_desc));
         img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
         img_desc.image_width = K * (N + padding) / 4;
@@ -11844,7 +11853,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         int width_B = K/4;
         int padded_height_B = (N + padding)/4;
 
-        kernel = backend_ctx->kernel_transpose_32_16;
+        kernel = prec_f32 ? backend_ctx->kernel_transpose_32_32 : backend_ctx->kernel_transpose_32_16;
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &b_img));
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &b_img_trans));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int),    &height_B));
@@ -11856,7 +11865,8 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size_t, local_work_size_t, dst);
 
         // gemm
-        kernel = backend_ctx->kernel_mul_mm_q8_0_f32_8x4;
+        kernel = prec_f32 ? backend_ctx->kernel_mul_mm_q8_0_f32_8x4_f32acc
+                          : backend_ctx->kernel_mul_mm_q8_0_f32_8x4;
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q8_0->q));
