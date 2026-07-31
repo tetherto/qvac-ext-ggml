@@ -11804,7 +11804,7 @@ static bool ggml_cl_can_fuse_im2col_mul_mat(const ggml_backend_opencl_context * 
 
     const int64_t K = a->ne[0], M = a->ne[1], N = mm->ne[1];
     if (K != im2col->ne[0] || M != im2col->ne[1]) return false;
-    if (K % 32 != 0 || M % 4 != 0 || N <= 1) return false;
+    if (K % 32 != 0 || M % 4 != 0 || N < 1) return false;
     if ((size_t) K * M / 4 > backend_ctx->image_max_buffer_size) return false;
     if ((size_t) K * (N + 8) / 4 > backend_ctx->image_max_buffer_size) return false;
     return true;
@@ -12053,7 +12053,7 @@ static void ggml_cl_mul_mat_im2col_f32_adreno(ggml_backend_t backend, const ggml
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &N));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &offsetd));
         size_t gws[] = { (size_t) CEIL_DIV(N, 8), (size_t) CEIL_DIV(M, 4), 1 };
-        size_t lws[] = { 2, 128, 1 };
+        size_t lws[] = { gws[0] >= 2 ? 2u : 1u, 128, 1 };
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, mm);
     }
 
