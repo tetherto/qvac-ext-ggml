@@ -794,6 +794,7 @@ struct ggml_backend_opencl_context {
     // Gemm and Gemv related programs, kernels, etc
     cl_program program_CL_gemm;
     cl_program program_CL_gemm_f32;
+    cl_program program_im2col_bt;
     cl_program program_CL_gemv_general;
     cl_program program_CL_gemv_4096_1_11008;
     cl_program program_CL_gemv_4096_1_4096;
@@ -810,6 +811,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_q8_0_f32_8x4;
     cl_kernel kernel_mul_mm_q8_0_f32_8x4_f32acc;
     cl_kernel kernel_mul_mm_f32_f32_8x4;
+    cl_kernel kernel_im2col_bt_f32;
     cl_kernel CL_mul_mat_vec_q8_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
@@ -3297,6 +3299,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
+    // im2col_bt_f32
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src_im2col_bt {
+            #include "im2col_bt_f32.cl.h"
+       };
+#else
+        const std::string kernel_src_im2col_bt = read_file("im2col_bt_f32.cl");
+#endif
+        backend_ctx->program_im2col_bt = build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src_im2col_bt.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_im2col_bt_f32 = clCreateKernel(backend_ctx->program_im2col_bt, "kernel_im2col_bt_f32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
     // gemv_noshuffle_general_q8_0_f32
     {
         std::string CL_gemv_compile_opts = std::string("-cl-std=") + opencl_c_std +
@@ -4563,6 +4579,30 @@ static void sync_with_other_backends(ggml_backend_t backend) {
     sync_with_other_backends(backend_ctx);
 }
 
+
+// The im2col node is never computed when fused, so it must have no other reader.
+static bool ggml_cl_im2col_single_use(const struct ggml_cgraph * cgraph, int idx, int last) {
+    const ggml_tensor * im2col = cgraph->nodes[idx];
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        if (j >= idx && j <= last) continue;
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src = n->src[k];
+            if (!src) continue;
+            if (src == im2col || src->view_src == im2col) return false;
+        }
+    }
+    // a graph output must actually be produced
+    for (int j = 0; j < cgraph->n_leafs; ++j) {
+        if (cgraph->leafs[j] == im2col) return false;
+    }
+    return (im2col->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+}
+
+static bool ggml_cl_can_fuse_im2col_mul_mat(const ggml_backend_opencl_context * backend_ctx,
+                                            const ggml_tensor * im2col, const ggml_tensor * mm);
+static void ggml_cl_mul_mat_im2col_f32_adreno(ggml_backend_t backend, const ggml_tensor * im2col, ggml_tensor * mm);
+
 static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
@@ -4653,6 +4693,25 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
+        // conv-as-matmul emits IM2COL, a couple of RESHAPE views, then MUL_MAT. The
+        // reshapes are no-ops, so look past them for the consumer.
+        if (!backend_ctx->disable_fusion && node->op == GGML_OP_IM2COL) {
+            int j = i + 1;
+            while (j < cgraph->n_nodes &&
+                   (cgraph->nodes[j]->op == GGML_OP_RESHAPE  ||
+                    cgraph->nodes[j]->op == GGML_OP_VIEW     ||
+                    cgraph->nodes[j]->op == GGML_OP_PERMUTE  ||
+                    cgraph->nodes[j]->op == GGML_OP_TRANSPOSE)) {
+                j++;
+            }
+            if (j < cgraph->n_nodes &&
+                ggml_cl_can_fuse_im2col_mul_mat(backend_ctx, node, cgraph->nodes[j]) &&
+                ggml_cl_im2col_single_use(cgraph, i, j)) {
+                ggml_cl_mul_mat_im2col_f32_adreno(backend, node, cgraph->nodes[j]);
+                i = j;
+                continue;
+            }
+        }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
@@ -11716,6 +11775,45 @@ static void ggml_cl_mul_mat_iq4_nl_f32_adreno(ggml_backend_t backend, const ggml
 // tier with no Adreno variant, and it is what Parler's DAC (whose conv weights are never
 // quantized) spends its time in. A is transposed per dispatch rather than at set_tensor
 // time so no tensor's stored layout changes and no other op is affected.
+
+// True when a 1-D IM2COL feeds only this MUL_MAT and both fit the Adreno f32 image GEMM,
+// so the im2col matrix never has to be materialised.
+static bool ggml_cl_can_fuse_im2col_mul_mat(const ggml_backend_opencl_context * backend_ctx,
+                                            const ggml_tensor * im2col, const ggml_tensor * mm) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    if (!im2col || !mm || im2col->op != GGML_OP_IM2COL || mm->op != GGML_OP_MUL_MAT) return false;
+
+    // conv-as-matmul feeds the im2col matrix in as operand A, through a reshape view.
+    const ggml_tensor * a = mm->src[0];
+    const ggml_tensor * b = mm->src[1];
+    if (!a || !b) return false;
+    if (a != im2col && a->view_src != im2col) return false;
+
+    if (((const int32_t *)(im2col->op_params))[6] == 1) return false;   // is_2D
+    if (((const int32_t *)(im2col->op_params))[3] != 0) return false;   // p1
+    if (im2col->type != GGML_TYPE_F32) return false;
+    if (!im2col->src[0] || !im2col->src[1]) return false;
+    if (im2col->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(im2col->src[1])) return false;
+    if (im2col->src[1]->ne[2] != 1 || im2col->src[1]->ne[3] != 1) return false;
+    if (im2col->ne[2] != 1 || im2col->ne[3] != 1) return false;
+
+    if (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b)) return false;
+    if (a->type != GGML_TYPE_F32) return false;
+    if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1) return false;
+    if (mm->ne[2] != 1 || mm->ne[3] != 1) return false;
+
+    const int64_t K = a->ne[0], M = a->ne[1], N = mm->ne[1];
+    if (K != im2col->ne[0] || M != im2col->ne[1]) return false;
+    if (K % 32 != 0 || M % 4 != 0 || N <= 1) return false;
+    if ((size_t) K * M / 4 > backend_ctx->image_max_buffer_size) return false;
+    if ((size_t) K * (N + 8) / 4 > backend_ctx->image_max_buffer_size) return false;
+    return true;
+#else
+    GGML_UNUSED(backend_ctx); GGML_UNUSED(im2col); GGML_UNUSED(mm);
+    return false;
+#endif
+}
+
 static void ggml_cl_mul_mat_f32_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_ASSERT(src0 && src0->extra);
@@ -11838,6 +11936,134 @@ static void ggml_cl_mul_mat_f32_f32_adreno(ggml_backend_t backend, const ggml_te
     CL_CHECK(clReleaseMemObject(a_sub));
 #else
     GGML_UNUSED(backend); GGML_UNUSED(src0); GGML_UNUSED(src1); GGML_UNUSED(dst);
+#endif
+}
+
+
+// MUL_MAT(A, IM2COL(kernel, signal)) computed without ever materialising the im2col
+// matrix: the GEMM wants B transposed anyway, and the transposed form is a set of
+// contiguous slices of the signal.
+static void ggml_cl_mul_mat_im2col_f32_adreno(ggml_backend_t backend, const ggml_tensor * im2col, ggml_tensor * mm) {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    const ggml_tensor * b   = mm->src[1];        // conv weights
+    const ggml_tensor * sig = im2col->src[1];    // the signal im2col would have expanded
+
+    ggml_tensor_extra_cl * extra_b   = (ggml_tensor_extra_cl *)b->extra;
+    ggml_tensor_extra_cl * extra_sig = (ggml_tensor_extra_cl *)sig->extra;
+    ggml_tensor_extra_cl * extrad    = (ggml_tensor_extra_cl *)mm->extra;
+
+    cl_ulong offset_b   = extra_b->offset   + b->view_offs;
+    cl_ulong offset_sig = extra_sig->offset + sig->view_offs;
+    cl_ulong offsetd    = extrad->offset    + mm->view_offs;
+
+    const int K = mm->src[0]->ne[0];   // CHW = IC*KW
+    const int M = mm->src[0]->ne[1];   // OW
+    const int N = mm->ne[1];           // OC
+
+    const int s0 = ((const int32_t *)(im2col->op_params))[0];
+    const int p0 = ((const int32_t *)(im2col->op_params))[2];
+    const int d0 = ((const int32_t *)(im2col->op_params))[4];
+
+    const int IW = sig->ne[0];
+    const int IC = sig->ne[1];
+    const int KW = im2col->src[0]->ne[0];
+    const cl_ulong delta_offset = sig->nb[1] / 4;
+
+    const int padding  = (N % 8) ? (8 - (N % 8)) : 0;
+    const int padded_N = N + padding;
+
+    cl_context context = backend_ctx->context;
+    cl_int           err;
+    cl_image_format  img_fmt = { CL_RGBA, CL_FLOAT };
+    cl_image_desc    img_desc;
+    cl_buffer_region region;
+
+    cl_mem at_sub = nullptr;
+    cl_mem b_sub = nullptr, b_img = nullptr, bt_sub = nullptr, bt_img = nullptr;
+
+    memset(&img_desc, 0, sizeof(img_desc));
+    img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+
+    // ---- A transposed, built straight from the signal (no im2col matrix) ----
+    // at[chw][ix] = sig[ic*delta + ix*s0 + kx*d0 - p0]; contiguous in ix on both sides.
+    region.origin = 0;
+    region.size   = (size_t) K * M * sizeof(float);
+    backend_ctx->prealloc_wt_trans.allocate(context, region.size);
+    CL_CHECK((at_sub = clCreateSubBuffer(backend_ctx->prealloc_wt_trans.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+    {
+        cl_kernel kernel = backend_ctx->kernel_im2col_bt_f32;
+        cl_ulong zero = 0;
+        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra_sig->data_device));
+        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset_sig));
+        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &at_sub));
+        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &zero));
+        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &IW));
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),      &IC));
+        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &M));
+        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &KW));
+        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &M));
+        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &delta_offset));
+        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &s0));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &p0));
+        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &d0));
+        size_t lws[2] = { 64, 1 };
+        size_t gws[2] = { (size_t) ((M + 63) / 64) * 64, (size_t) K };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, mm);
+    }
+
+    // ---- B: [N][K] -> [K][N+pad] ----
+    region.origin = offset_b;
+    region.size   = (size_t) K * N * sizeof(float);
+    CL_CHECK((b_sub = clCreateSubBuffer(extra_b->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+    img_desc.image_width = (size_t) K * N / 4;
+    img_desc.buffer      = b_sub;
+    CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+    region.origin = 0;
+    region.size   = (size_t) K * padded_N * sizeof(float);
+    backend_ctx->prealloc_act_trans.allocate(context, region.size);
+    CL_CHECK((bt_sub = clCreateSubBuffer(backend_ctx->prealloc_act_trans.buffer, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
+    img_desc.image_width = (size_t) K * padded_N / 4;
+    img_desc.buffer      = bt_sub;
+    CL_CHECK((bt_img = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
+    {
+        cl_kernel kernel = backend_ctx->kernel_transpose_32_32;
+        int rows = (N / 4) ? (N / 4) : 1, cols = K / 4, prows = padded_N / 4;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &b_img));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &bt_img));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(int),    &rows));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),    &cols));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),    &prows));
+        size_t lws[2] = { 1, 16 };
+        size_t gws[2] = { (size_t) cols, (size_t) prows };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, mm);
+    }
+
+    // ---- GEMM ----
+    {
+        cl_kernel kernel = backend_ctx->kernel_mul_mm_f32_f32_8x4;
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &at_sub));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &bt_img));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int),      &K));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &M));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &padded_N));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &N));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &offsetd));
+        size_t gws[] = { (size_t) CEIL_DIV(N, 8), (size_t) CEIL_DIV(M, 4), 1 };
+        size_t lws[] = { 2, 128, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, mm);
+    }
+
+    CL_CHECK(clReleaseMemObject(bt_img));
+    CL_CHECK(clReleaseMemObject(bt_sub));
+    CL_CHECK(clReleaseMemObject(b_img));
+    CL_CHECK(clReleaseMemObject(b_sub));
+    CL_CHECK(clReleaseMemObject(at_sub));
+#else
+    GGML_UNUSED(backend); GGML_UNUSED(im2col); GGML_UNUSED(mm);
 #endif
 }
 
