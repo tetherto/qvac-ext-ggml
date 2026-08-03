@@ -5316,6 +5316,56 @@ struct test_im2col : public test_case {
     }
 };
 
+// GGML_OP_IM2COL + GGML_OP_MUL_MAT (conv1d lowered to a GEMM; fused operation)
+//
+// Backends may compute this without ever materialising the im2col matrix. That path
+// has its own alignment constraints on the GEMM's M (= OW), so sweep every residue of
+// OW mod 4 and an output-channel count that is not a multiple of 4.
+struct test_im2col_mul_mat : public test_case {
+    const int64_t OW;   // output positions == the GEMM's M
+    const int64_t IC;   // input channels
+    const int64_t KW;   // kernel width
+    const int64_t OC;   // output channels == the GEMM's N
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "IM2COL_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // The same bound test_mul_mat uses -- this is a GEMM and accumulates like one.
+    // The small-OW cases are what actually detect a misaligned store: they corrupt
+    // ~4% of the output, roughly two orders above this bound. The 27121 case is here
+    // for buffer-size and dispatch-limit realism, not as a precision probe.
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(OW, IC, KW, OC);
+    }
+
+    test_im2col_mul_mat(int64_t OW = 64, int64_t IC = 64, int64_t KW = 3, int64_t OC = 64)
+        : OW(OW), IC(IC), KW(KW), OC(OC) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, OW + KW - 1, IC, 1);
+        ggml_set_name(x, "signal");
+
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, KW, IC, OC);
+        ggml_set_name(w, "kernel");
+
+        ggml_tensor * im = ggml_im2col(ctx, w, x, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
+        ggml_set_name(im, "im2col");
+
+        ggml_tensor * out = ggml_mul_mat(ctx,
+            ggml_reshape_2d(ctx, im, im->ne[0], im->ne[2] * im->ne[1]),
+            ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_IM2COL_3D
 struct test_im2col_3d : public test_case {
     const ggml_type type_input;
@@ -7908,6 +7958,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // conv1d-as-GEMM: every residue of OW mod 4, with OC both aligned and not.
+    for (int64_t ow : {64, 65, 66, 67}) {
+        for (int64_t kw : {3, 11}) {
+            for (int64_t oc : {18, 64}) {
+                test_cases.emplace_back(new test_im2col_mul_mat(ow, 64, kw, oc));
+            }
+        }
+    }
+    // a realistic vocoder-sized odd OW, which is what makes the alignment matter
+    test_cases.emplace_back(new test_im2col_mul_mat(27121, 64, 11, 64));
+    test_cases.emplace_back(new test_im2col_mul_mat(27121, 64,  7, 18));
 
     // im2col 2D
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
