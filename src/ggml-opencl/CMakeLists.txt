@@ -159,6 +159,8 @@ set(GGML_OPENCL_KERNELS
     zero_upsample
     channel_shuffle
     affine_prelu
+    snake
+    col2im_1d
     tsembd
     upscale
     tanh
