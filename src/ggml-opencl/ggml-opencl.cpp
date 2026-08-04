@@ -11195,11 +11195,9 @@ static bool ggml_cl_can_use_adreno_xmem_gemm_f16_f32(
     }
     const int kpack = K / 4;
     const int npack = CEIL_DIV(M, 4);
-    if (static_cast<size_t>(N) > backend_ctx->image2d_max_width ||
-        static_cast<size_t>(kpack) > backend_ctx->image2d_max_height) {
-        return false;
-    }
-    if (static_cast<size_t>(N) > backend_ctx->image2d_max_width ||
+    // N is sliced by the dispatcher (src1 and dst are both contiguous along N), so only
+    // the K/M-derived image heights have to fit; N itself does not.
+    if (static_cast<size_t>(kpack) > backend_ctx->image2d_max_height ||
         static_cast<size_t>(npack) > backend_ctx->image2d_max_height) {
         return false;
     }
@@ -11223,10 +11221,16 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
 
     const int K = src0->ne[0];
     const int M = src0->ne[1];
-    const int N = src1->ne[1];
+    const int N_full = src1->ne[1];
     const int kpack = K / 4;
     const int npack = CEIL_DIV(M, 4);
     const int os = 8;
+
+    // The src/dst images are indexed by N, so N must fit image2d_max_width. src1 [K,N]
+    // and dst [M,N] are both contiguous along N, so slice it and reuse the packed
+    // weights (which depend only on src0) across slices.
+    const int N_step = (int) std::min<size_t>((size_t) N_full, backend_ctx->image2d_max_width);
+    int N = N_step;
 
     const size_t xmem_bytes = 6144;
     const size_t weight_bytes = static_cast<size_t>(kpack) * static_cast<size_t>(npack) * 4u * sizeof(cl_half4);
@@ -11294,48 +11298,55 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     size_t gws = CEIL_DIV(static_cast<size_t>(kpack) * static_cast<size_t>(npack), lws) * lws;
     backend_ctx->enqueue_ndrange_kernel(prepack, 1, &gws, &lws, dst);
 
-    cl_kernel pack_src = backend_ctx->kernel_adreno_xmem_pack_src_f32;
-    CL_CHECK(clSetKernelArg(pack_src, 0, sizeof(cl_mem),   &extra1->data_device));
-    CL_CHECK(clSetKernelArg(pack_src, 1, sizeof(cl_ulong), &offset1));
-    CL_CHECK(clSetKernelArg(pack_src, 2, sizeof(cl_mem),   &src_img));
-    CL_CHECK(clSetKernelArg(pack_src, 3, sizeof(int),      &K));
-    CL_CHECK(clSetKernelArg(pack_src, 4, sizeof(int),      &N));
-    size_t pack_src_lws[2] = { 16, 16 };
-    size_t pack_src_gws[2] = {
-        CEIL_DIV(static_cast<size_t>(N), pack_src_lws[0])*pack_src_lws[0],
-        CEIL_DIV(static_cast<size_t>(kpack), pack_src_lws[1])*pack_src_lws[1]
-    };
-    backend_ctx->enqueue_ndrange_kernel(pack_src, 2, pack_src_gws, pack_src_lws, dst);
+    // Weights are packed once above; only src1/dst move per slice.
+    for (int n0 = 0; n0 < N_full; n0 += N_step) {
+        N = std::min(N_step, N_full - n0);
+        const cl_ulong offset1_n = offset1 + (cl_ulong) n0 * (cl_ulong) K * sizeof(float);
+        const cl_ulong offsetd_n = offsetd + (cl_ulong) n0 * (cl_ulong) M * sizeof(float);
 
-    cl_kernel gemm = backend_ctx->kernel_gemm_xmem_f16_f32_os8;
-    CL_CHECK(clSetKernelArg(gemm, 0, sizeof(cl_mem), &weights));
-    CL_CHECK(clSetKernelArg(gemm, 1, sizeof(cl_mem), &backend_ctx->prealloc_adreno_xmem_const.buffer));
-    CL_CHECK(clSetKernelArg(gemm, 2, sizeof(cl_mem), &src_img));
-    CL_CHECK(clSetKernelArg(gemm, 3, sizeof(cl_mem), &dst_img));
-    CL_CHECK(clSetKernelArg(gemm, 4, sizeof(int),    &N));
-    CL_CHECK(clSetKernelArg(gemm, 5, sizeof(int),    &npack));
-    CL_CHECK(clSetKernelArg(gemm, 6, sizeof(int),    &kpack));
-    const size_t z_values = CEIL_DIV(static_cast<size_t>(npack), static_cast<size_t>(os));
-    size_t gemm_lws[3] = { 64, 1, 1 };
-    size_t gemm_gws[3] = {
-        z_values*gemm_lws[0],
-        CEIL_DIV(static_cast<size_t>(N), gemm_lws[0]),
-        1
-    };
-    backend_ctx->enqueue_ndrange_kernel(gemm, 3, gemm_gws, gemm_lws, dst);
+        cl_kernel pack_src = backend_ctx->kernel_adreno_xmem_pack_src_f32;
+        CL_CHECK(clSetKernelArg(pack_src, 0, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(pack_src, 1, sizeof(cl_ulong), &offset1_n));
+        CL_CHECK(clSetKernelArg(pack_src, 2, sizeof(cl_mem),   &src_img));
+        CL_CHECK(clSetKernelArg(pack_src, 3, sizeof(int),      &K));
+        CL_CHECK(clSetKernelArg(pack_src, 4, sizeof(int),      &N));
+        size_t pack_src_lws[2] = { 16, 16 };
+        size_t pack_src_gws[2] = {
+            CEIL_DIV(static_cast<size_t>(N), pack_src_lws[0])*pack_src_lws[0],
+            CEIL_DIV(static_cast<size_t>(kpack), pack_src_lws[1])*pack_src_lws[1]
+        };
+        backend_ctx->enqueue_ndrange_kernel(pack_src, 2, pack_src_gws, pack_src_lws, dst);
 
-    cl_kernel store_dst = backend_ctx->kernel_adreno_xmem_store_dst_f32;
-    CL_CHECK(clSetKernelArg(store_dst, 0, sizeof(cl_mem),   &dst_img));
-    CL_CHECK(clSetKernelArg(store_dst, 1, sizeof(cl_mem),   &extrad->data_device));
-    CL_CHECK(clSetKernelArg(store_dst, 2, sizeof(cl_ulong), &offsetd));
-    CL_CHECK(clSetKernelArg(store_dst, 3, sizeof(int),      &M));
-    CL_CHECK(clSetKernelArg(store_dst, 4, sizeof(int),      &N));
-    size_t store_lws[2] = { 16, 16 };
-    size_t store_gws[2] = {
-        CEIL_DIV(static_cast<size_t>(N), store_lws[0])*store_lws[0],
-        CEIL_DIV(static_cast<size_t>(npack), store_lws[1])*store_lws[1]
-    };
-    backend_ctx->enqueue_ndrange_kernel(store_dst, 2, store_gws, store_lws, dst);
+        cl_kernel gemm = backend_ctx->kernel_gemm_xmem_f16_f32_os8;
+        CL_CHECK(clSetKernelArg(gemm, 0, sizeof(cl_mem), &weights));
+        CL_CHECK(clSetKernelArg(gemm, 1, sizeof(cl_mem), &backend_ctx->prealloc_adreno_xmem_const.buffer));
+        CL_CHECK(clSetKernelArg(gemm, 2, sizeof(cl_mem), &src_img));
+        CL_CHECK(clSetKernelArg(gemm, 3, sizeof(cl_mem), &dst_img));
+        CL_CHECK(clSetKernelArg(gemm, 4, sizeof(int),    &N));
+        CL_CHECK(clSetKernelArg(gemm, 5, sizeof(int),    &npack));
+        CL_CHECK(clSetKernelArg(gemm, 6, sizeof(int),    &kpack));
+        const size_t z_values = CEIL_DIV(static_cast<size_t>(npack), static_cast<size_t>(os));
+        size_t gemm_lws[3] = { 64, 1, 1 };
+        size_t gemm_gws[3] = {
+            z_values*gemm_lws[0],
+            CEIL_DIV(static_cast<size_t>(N), gemm_lws[0]),
+            1
+        };
+        backend_ctx->enqueue_ndrange_kernel(gemm, 3, gemm_gws, gemm_lws, dst);
+
+        cl_kernel store_dst = backend_ctx->kernel_adreno_xmem_store_dst_f32;
+        CL_CHECK(clSetKernelArg(store_dst, 0, sizeof(cl_mem),   &dst_img));
+        CL_CHECK(clSetKernelArg(store_dst, 1, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(store_dst, 2, sizeof(cl_ulong), &offsetd_n));
+        CL_CHECK(clSetKernelArg(store_dst, 3, sizeof(int),      &M));
+        CL_CHECK(clSetKernelArg(store_dst, 4, sizeof(int),      &N));
+        size_t store_lws[2] = { 16, 16 };
+        size_t store_gws[2] = {
+            CEIL_DIV(static_cast<size_t>(N), store_lws[0])*store_lws[0],
+            CEIL_DIV(static_cast<size_t>(npack), store_lws[1])*store_lws[1]
+        };
+        backend_ctx->enqueue_ndrange_kernel(store_dst, 2, store_gws, store_lws, dst);
+    }
 
     // src_img / dst_img / weights are persistent (backend_ctx) scratch — do NOT release per call.
 }
