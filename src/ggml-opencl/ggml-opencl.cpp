@@ -4107,6 +4107,18 @@ static void ggml_cl2_free(ggml_backend_t backend) {
 }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+// Launch geometry for the tiled kernel_transpose_*_buf kernels: one 32x32 tile per
+// workgroup, 8 rows of work-items each handling 4 elements. Rounded up, so the
+// kernels bounds-check the edge tiles.
+static void transpose_launch_dims(cl_int ldi, cl_int ldo, size_t global[3], size_t local[3]) {
+    local[0]  = 32;
+    local[1]  = 8;
+    local[2]  = 1;
+    global[0] = (size_t) ((ldi + 31) / 32) * 32;
+    global[1] = (size_t) ((ldo + 31) / 32) * 8;
+    global[2] = 1;
+}
+
 static void transpose_2d(
     ggml_backend_opencl_context * backend_ctx,
     cl_kernel kernel,
@@ -4135,8 +4147,8 @@ static void transpose_2d(
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_int), &stride));
     CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &rows));
 
-    size_t local_size[3] = {64, 1, 1};
-    size_t global_size[3] = {(size_t)stride, (size_t)rows, 1};;
+    size_t local_size[3], global_size[3];
+    transpose_launch_dims(stride, rows, global_size, local_size);
     CL_CHECK(clEnqueueNDRangeKernel(backend_ctx->queue, kernel, 3, NULL,
         global_size, local_size, 0, NULL, NULL));
 
@@ -6036,9 +6048,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         GGML_ASSERT(size_d + size_q == ggml_nbytes(tensor) && "Incorrect tensor size");
 
         cl_int err;
-        cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
-            ggml_nbytes(tensor), NULL, &err);
-        CL_CHECK(err);
+        // Grow-only staging shared by every Q8_0 weight: a model with N quantised
+        // tensors does one device allocation instead of N create/release pairs, and
+        // the write lands in already-committed pages. The convert below waits before
+        // returning, so the next tensor cannot race it.
+        static ggml_cl_buffer q8_0_staging;
+        q8_0_staging.allocate(context, ggml_nbytes(tensor));
+        cl_mem data_device = q8_0_staging.buffer;
         CL_CHECK(clEnqueueWriteBuffer(
             queue, data_device, CL_TRUE, 0,
             ggml_nbytes(tensor), data, 0, NULL, NULL));
@@ -6076,7 +6092,6 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         cl_event evt;
         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 3, NULL, global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
-        CL_CHECK(clReleaseMemObject(data_device));
 
         tensor->extra = extra;
 
@@ -6568,8 +6583,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
             // transpose q back
             cl_int stride_k_q = K/4;
-            size_t local_size_q[3] = {64, 1, 1};
-            size_t global_size_q[3] = {(size_t)M, (size_t)stride_k_q, 1};
+            size_t local_size_q[3], global_size_q[3];
+            transpose_launch_dims(M, stride_k_q, global_size_q, local_size_q);
 
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buf_trans_q));
@@ -6581,8 +6596,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
             // transpose scales back
             cl_int stride_k_d = K/32;
-            size_t local_size_d[3] = {64, 1, 1};
-            size_t global_size_d[3] = {(size_t)M, (size_t)stride_k_d, 1};
+            size_t local_size_d[3], global_size_d[3];
+            transpose_launch_dims(M, stride_k_d, global_size_d, local_size_d);
 
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->d));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &buf_trans_d));
