@@ -16074,9 +16074,18 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
     CL_CHECK(clSetKernelArg(kernel,  19, sizeof(int),      &d0));
     CL_CHECK(clSetKernelArg(kernel,  20, sizeof(int),      &d1));
 
-    const int num_blocks = (pelements + 256 - 1) / 256;
-    size_t global_work_size[] = {(size_t)num_blocks*256, (size_t)OH, (size_t)batch*IC};
-    size_t local_work_size[] = {256, 1, 1};
+    // One workgroup per output position (batch, OH, OW); its threads walk the CHW
+    // columns, which are contiguous in dst. Size the workgroup from CHW (rounded to a
+    // wave, capped at the device max) rather than from the kernel window: a 1-D conv has
+    // KH == 1 and audio decodes one sequence, so the old (pelements/256, OH, batch*IC)
+    // grid left adjacent lanes writing CHW elements apart.
+    size_t wg = 64;
+    while (wg < (size_t) CHW && wg < 256) wg *= 2;
+    const size_t max_wg = (size_t) backend_ctx->get_kernel_workgroup_size(kernel);
+    if (wg > max_wg) wg = max_wg;
+
+    size_t global_work_size[] = {(size_t)OW*wg, (size_t)OH, (size_t)batch};
+    size_t local_work_size[]  = {wg, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
