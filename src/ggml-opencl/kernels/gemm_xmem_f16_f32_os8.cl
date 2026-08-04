@@ -24,6 +24,28 @@ __kernel void adreno_xmem_pack_src_f32(
     write_imageh(src_img, (int2)(x, y), v);
 }
 
+// Same packing as adreno_xmem_pack_src_f32, for an F16 source. Used when the packed
+// operand is a conv1d im2col activation, which ggml_conv_1d emits as F16.
+__kernel void adreno_xmem_pack_src_f16(
+    __global const void * src_void,
+    ulong offset,
+    __write_only image2d_t src_img,
+    int K,
+    int N) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int kpack = K / 4;
+
+    if (x >= N || y >= kpack) {
+        return;
+    }
+
+    __global const half * src = (__global const half *)((__global const char *)src_void + offset);
+    const int base = x*K + y*4;
+    const half4 v = (half4)(src[base + 0], src[base + 1], src[base + 2], src[base + 3]);
+    write_imageh(src_img, (int2)(x, y), v);
+}
+
 __kernel void adreno_xmem_prepack_weight_f16(
     __global half4 * dst,
     __global const void * src_void,
@@ -230,4 +252,34 @@ __kernel void adreno_xmem_store_dst_f32(
     if (m + 1 < M) dst[x*M + m + 1] = (float)hv.s1;
     if (m + 2 < M) dst[x*M + m + 2] = (float)hv.s2;
     if (m + 3 < M) dst[x*M + m + 3] = (float)hv.s3;
+}
+
+// Transposed store, for the operand-swapped dispatch: the caller computed C[m][n] with
+// the SMALL operand as xmem's M, so ggml's dst wants it at dst[m*N_full + n] rather than
+// dst[n*M + m]. Consecutive x are consecutive n, so unlike the untransposed store above
+// (which strides by M) these writes coalesce.
+__kernel void adreno_xmem_store_dst_f32_t(
+    __read_only image2d_t dst_img,
+    __global void * dst_void,
+    ulong offset,
+    int M,
+    int N,
+    int N_full,
+    int n0) {
+    const int x = get_global_id(0);
+    const int y = get_global_id(1);
+    const int npack = (M + 3) / 4;
+
+    if (x >= N || y >= npack) {
+        return;
+    }
+
+    __global float * dst = (__global float *)((__global char *)dst_void + offset);
+    const half4 hv = read_imageh(dst_img, smp_zero, (int2)(x, y));
+    const int  m   = y*4;
+    const long col = (long)n0 + (long)x;
+    if (m + 0 < M) dst[(long)(m + 0)*N_full + col] = (float)hv.s0;
+    if (m + 1 < M) dst[(long)(m + 1)*N_full + col] = (float)hv.s1;
+    if (m + 2 < M) dst[(long)(m + 2)*N_full + col] = (float)hv.s2;
+    if (m + 3 < M) dst[(long)(m + 3)*N_full + col] = (float)hv.s3;
 }

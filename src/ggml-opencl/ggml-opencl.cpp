@@ -589,9 +589,11 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mat_f16_f32_l4_dr_lq;
     cl_kernel kernel_mul_mat_f16_f32_tiled;
     cl_kernel kernel_adreno_xmem_pack_src_f32;
+    cl_kernel kernel_adreno_xmem_pack_src_f16;
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
     cl_kernel kernel_gemm_xmem_f16_f32_os8;
     cl_kernel kernel_adreno_xmem_store_dst_f32;
+    cl_kernel kernel_adreno_xmem_store_dst_f32_t;
     cl_kernel kernel_mul_mm_f16_f32_kqv;
     cl_kernel kernel_mul_mm_f16_f32_kq;
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
@@ -1885,12 +1887,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 
         CL_CHECK((backend_ctx->kernel_adreno_xmem_pack_src_f32 =
             clCreateKernel(prog, "adreno_xmem_pack_src_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_adreno_xmem_pack_src_f16 =
+            clCreateKernel(prog, "adreno_xmem_pack_src_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_adreno_xmem_prepack_weight_f16 =
             clCreateKernel(prog, "adreno_xmem_prepack_weight_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_gemm_xmem_f16_f32_os8 =
             clCreateKernel(prog, "kernel_gemm_xmem_f16_f32_os8", &err), err));
         CL_CHECK((backend_ctx->kernel_adreno_xmem_store_dst_f32 =
             clCreateKernel(prog, "adreno_xmem_store_dst_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_adreno_xmem_store_dst_f32_t =
+            clCreateKernel(prog, "adreno_xmem_store_dst_f32_t", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -11231,12 +11237,72 @@ static bool ggml_cl_can_use_adreno_xmem_gemm_f16_f32(
     return true;
 }
 
+// Operand-swapped variant. ggml_mul_mat is symmetric in (src0,ne01) <-> (src1,ne11): the
+// only asymmetry is which index is contiguous in dst, and that lives in the store kernel.
+// So a matmul whose SMALL operand is src1 can be computed as its transpose with src1 as
+// the weight-stationary operand, then written out transposed. That is exactly the shape
+// ggml_conv_1d produces -- mul_mat(im2col, weights), where src0 is a huge per-call
+// activation and src1 is a small weight matrix -- which the un-swapped gate rejects
+// because npack = CEIL_DIV(src0->ne[1], 4) blows past image2d_max_height.
+// Shape-driven, not conv1d-driven, so any matmul of this class benefits.
+static bool ggml_cl_can_use_adreno_xmem_gemm_swapped(
+        const ggml_backend_opencl_context * backend_ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst) {
+    if (!backend_ctx->adreno_xmem_gemm_enabled) {
+        return false;
+    }
+    if (backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        dst->ne[2]  != 1 || dst->ne[3]  != 1) {
+        return false;
+    }
+    const int K = src0->ne[0];
+    const int M = src1->ne[1];   // weight-stationary operand after the swap
+    const int N = src0->ne[1];   // streamed operand after the swap
+    if (src1->ne[0] != K || dst->ne[0] != N || dst->ne[1] != M) {
+        return false;
+    }
+    if ((K % 8) != 0 || K < 64) {
+        return false;
+    }
+    // Only worth swapping when src1 really is the small operand and src0 the large one;
+    // otherwise the un-swapped path already applies and is cheaper (no transposed store).
+    if (M < 64 || M > 512 || N < 4096) {
+        return false;
+    }
+    const int kpack = K / 4;
+    const int npack = CEIL_DIV(M, 4);
+    if (static_cast<size_t>(kpack) > backend_ctx->image2d_max_height ||
+        static_cast<size_t>(npack) > backend_ctx->image2d_max_height) {
+        return false;
+    }
+    return true;
+}
+
 static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
         ggml_backend_t backend,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        bool swapped = false) {
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // When swapped, src1 is the weight-stationary operand and src0 is streamed; the
+    // result is written out transposed by adreno_xmem_store_dst_f32_t.
+    if (swapped) {
+        std::swap(src0, src1);
+    }
 
     ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
@@ -11328,10 +11394,15 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
     // Weights are packed once above; only src1/dst move per slice.
     for (int n0 = 0; n0 < N_full; n0 += N_step) {
         N = std::min(N_step, N_full - n0);
-        const cl_ulong offset1_n = offset1 + (cl_ulong) n0 * (cl_ulong) K * sizeof(float);
-        const cl_ulong offsetd_n = offsetd + (cl_ulong) n0 * (cl_ulong) M * sizeof(float);
+        const size_t   src_elt   = swapped ? sizeof(cl_half) : sizeof(float);
+        const cl_ulong offset1_n = offset1 + (cl_ulong) n0 * (cl_ulong) K * src_elt;
+        // The transposed store addresses dst by (m, n0 + x) itself, so it takes the base
+        // offset and the slice origin rather than a pre-advanced pointer.
+        const cl_ulong offsetd_n = swapped ? offsetd
+                                           : offsetd + (cl_ulong) n0 * (cl_ulong) M * sizeof(float);
 
-        cl_kernel pack_src = backend_ctx->kernel_adreno_xmem_pack_src_f32;
+        cl_kernel pack_src = swapped ? backend_ctx->kernel_adreno_xmem_pack_src_f16
+                                     : backend_ctx->kernel_adreno_xmem_pack_src_f32;
         CL_CHECK(clSetKernelArg(pack_src, 0, sizeof(cl_mem),   &extra1->data_device));
         CL_CHECK(clSetKernelArg(pack_src, 1, sizeof(cl_ulong), &offset1_n));
         CL_CHECK(clSetKernelArg(pack_src, 2, sizeof(cl_mem),   &src_img));
@@ -11361,13 +11432,21 @@ static void ggml_cl_mul_mat_f16_f32_adreno_xmem(
         };
         backend_ctx->enqueue_ndrange_kernel(gemm, 3, gemm_gws, gemm_lws, dst);
 
-        cl_kernel store_dst = backend_ctx->kernel_adreno_xmem_store_dst_f32;
+        cl_kernel store_dst = swapped ? backend_ctx->kernel_adreno_xmem_store_dst_f32_t
+                                      : backend_ctx->kernel_adreno_xmem_store_dst_f32;
         CL_CHECK(clSetKernelArg(store_dst, 0, sizeof(cl_mem),   &dst_img));
         CL_CHECK(clSetKernelArg(store_dst, 1, sizeof(cl_mem),   &extrad->data_device));
         CL_CHECK(clSetKernelArg(store_dst, 2, sizeof(cl_ulong), &offsetd_n));
         CL_CHECK(clSetKernelArg(store_dst, 3, sizeof(int),      &M));
         CL_CHECK(clSetKernelArg(store_dst, 4, sizeof(int),      &N));
+        if (swapped) {
+            CL_CHECK(clSetKernelArg(store_dst, 5, sizeof(int),  &N_full));
+            CL_CHECK(clSetKernelArg(store_dst, 6, sizeof(int),  &n0));
+        }
+        // Consecutive x are consecutive dst columns in the transposed store, so a wide
+        // x group keeps those writes contiguous.
         size_t store_lws[2] = { 16, 16 };
+        if (swapped) { store_lws[0] = 64; store_lws[1] = 4; }
         size_t store_gws[2] = {
             CEIL_DIV(static_cast<size_t>(N), store_lws[0])*store_lws[0],
             CEIL_DIV(static_cast<size_t>(npack), store_lws[1])*store_lws[1]
@@ -14256,6 +14335,16 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                     nrows = 4;
                 }
             } else {
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+                // A tall-src0 / narrow-src1 f16 x f16 matmul (conv1d via ggml_conv_1d) is
+                // the weight-stationary GEMM's shape with the operands the other way
+                // round; take it on the xmem path transposed instead of the GEMV.
+                if (ggml_cl_can_use_adreno_xmem_gemm_swapped(backend_ctx, src0, src1, dst)) {
+                    ggml_cl_mulmat_trace(src0, src1, dst, "xmem_f16_f16_swapped");
+                    ggml_cl_mul_mat_f16_f32_adreno_xmem(backend, src0, src1, dst, /*swapped=*/true);
+                    return;
+                }
+#endif
                 kernel = backend_ctx->kernel_mul_mat_f16_f16;
                 nrows = 16;  // must match N_F16_F16 in mul_mv_f16_f16.cl
                 ggml_cl_mulmat_trace(src0, src1, dst, "mul_mat_f16_f16_gemv");
