@@ -11278,7 +11278,9 @@ static bool ggml_cl_can_use_adreno_xmem_gemm_swapped(
     }
     // Only worth swapping when src1 really is the small operand and src0 the large one;
     // otherwise the un-swapped path already applies and is cheaper (no transposed store).
-    if (M < 64 || M > 512 || N < 4096) {
+    // The bounds are set by what the image geometry admits (npack = CEIL_DIV(M,4) must fit
+    // image2d_max_height, checked below) rather than by the shapes of any one model.
+    if (M < 64 || M > 2048 || N < 2048) {
         return false;
     }
     const int kpack = K / 4;
