@@ -14219,7 +14219,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
             } else {
                 kernel = backend_ctx->kernel_mul_mat_f16_f16;
-                nrows = 4;
+                nrows = 16;  // must match N_F16_F16 in mul_mv_f16_f16.cl
                 ggml_cl_mulmat_trace(src0, src1, dst, "mul_mat_f16_f16_gemv");
             }
 
