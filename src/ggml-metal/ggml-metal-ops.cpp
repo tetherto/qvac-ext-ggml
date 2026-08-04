@@ -2171,6 +2171,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     const int ne11_mm_min = 8;
 
+    // Metal simdgroup matrix multiplication converts F32 operands to half
+    // internally. GGML_PREC_F32 is a correctness request, so keep F32 x F32 on
+    // the float mat-vec implementation instead of silently taking that path.
+    const bool require_full_f32 =
+        op->src[0]->type == GGML_TYPE_F32 &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        (ggml_prec) op->op_params[0] == GGML_PREC_F32;
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
@@ -2274,6 +2282,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
     } else if (
+        !require_full_f32 &&
         !ggml_is_transposed(op->src[0]) &&
         !ggml_is_transposed(op->src[1]) &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs

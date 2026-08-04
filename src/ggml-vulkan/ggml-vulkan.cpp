@@ -848,6 +848,7 @@ struct vk_device_struct {
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
+    vk_matmul_pipeline pipeline_matmul_f32_full {};
     vk_matmul_pipeline pipeline_matmul_f32_cm1 {};
     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
     vk_matmul_pipeline pipeline_matmul_bf16 {};
@@ -4807,6 +4808,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (!device->pipeline_matmul_f32) {
         device->pipeline_matmul_f32 = std::make_shared<vk_matmul_pipeline_struct>();
     }
+    if (!device->pipeline_matmul_f32_full) {
+        device->pipeline_matmul_f32_full = std::make_shared<vk_matmul_pipeline_struct>();
+    }
     if (!device->pipeline_matmul_f32_cm1) {
         device->pipeline_matmul_f32_cm1 = std::make_shared<vk_matmul_pipeline_struct>();
     }
@@ -5807,6 +5811,34 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_id_bf16, matmul_id_bf16, , wg_denoms, warptile, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, 0);
     }
 #undef CREATE_MM
+
+    // Keep a scalar F32 x F32 pipeline available even when cooperative-matrix
+    // support selects a different default family above. GGML_PREC_F32 routes
+    // here so both operands and accumulation remain F32.
+    if (device->mul_mat_l[GGML_TYPE_F32]) {
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->l,
+            "matmul_f32_f32_l", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
+            "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, l_warptile, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_l,
+            "matmul_f32_f32_aligned_l", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
+            "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, l_warptile, l_align);
+    }
+    if (device->mul_mat_m[GGML_TYPE_F32]) {
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->m,
+            "matmul_f32_f32_m", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
+            "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, m_warptile, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_m,
+            "matmul_f32_f32_aligned_m", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
+            "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, m_warptile, m_align);
+    }
+    if (device->mul_mat_s[GGML_TYPE_F32]) {
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->s,
+            "matmul_f32_f32_s", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
+            "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, s_warptile, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_s,
+            "matmul_f32_f32_aligned_s", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
+            "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, s_warptile, s_align);
+    }
 
     // mul mat vec
 
@@ -8690,6 +8722,9 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
 static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+        if (prec == GGML_PREC_F32) {
+            return ctx->device->pipeline_matmul_f32_full;
+        }
         if (ctx->device->coopmat_f32_support_16x16x16_f32acc) {
             assert(ctx->device->coopmat_support);
             return ctx->device->pipeline_matmul_f32_cm1;
