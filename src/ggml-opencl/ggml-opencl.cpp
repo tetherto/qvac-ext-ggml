@@ -13622,11 +13622,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
     // NOTE: f16 x f16 is deliberately NOT admitted here. Routing the ACE-Step VAE's
-    // conv1d matmuls onto kernel_mul_mm_f16_f16_l4_lm was measured 1.8x SLOWER than
-    // leaving them on the mul_mat_f16_f16 matrix-vector kernel (82.5 s vs 46.0 s for an
-    // isolated T_latent=32 decode, plugin as the only variable). These convs are
-    // short-M / wide-N (e.g. src0 7168x80 x src1 7168x1024), and a 64x64 tile yields
-    // only ceil(80/64)*ceil(1024/64) = 32 workgroups -- far too few to fill an Adreno.
+    // conv1d matmuls onto kernel_mul_mm_f16_f16_l4_lm measured 1.8x SLOWER than leaving
+    // them on the mul_mat_f16_f16 matrix-vector kernel (82.5 s vs 46.0 s for an isolated
+    // T_latent=32 decode, plugin as the only variable). That measurement is the whole
+    // basis for this exclusion -- the cause was never established, so treat it as an
+    // empirical result to re-test rather than a rule about tile sizes.
     if (src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
         ne11 > 1) {
