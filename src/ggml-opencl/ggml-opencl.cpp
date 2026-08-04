@@ -13595,12 +13595,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
-    // f16 x f16 is admitted too: ggml_conv_1d hardcodes an F16 im2col dst (ggml.c),
-    // so an F16-kernel conv1d produces an f16 x f16 GEMM that would otherwise fall
-    // through to the mul_mat_f16_f16 matrix-VECTOR kernel -- one workgroup per output
-    // row (ne01 up to ~676k in the ACE-Step VAE). The tiled f16_f16 kernel already
-    // exists and accumulates in float, so this is faster AND more accurate.
-    if ((src1t == GGML_TYPE_F32 || (src1t == GGML_TYPE_F16 && src0t == GGML_TYPE_F16)) &&
+    // NOTE: f16 x f16 is deliberately NOT admitted here. Routing the ACE-Step VAE's
+    // conv1d matmuls onto kernel_mul_mm_f16_f16_l4_lm was measured 1.8x SLOWER than
+    // leaving them on the mul_mat_f16_f16 matrix-vector kernel (82.5 s vs 46.0 s for an
+    // isolated T_latent=32 decode, plugin as the only variable). These convs are
+    // short-M / wide-N (e.g. src0 7168x80 x src1 7168x1024), and a 64x64 tile yields
+    // only ceil(80/64)*ceil(1024/64) = 32 workgroups -- far too few to fill an Adreno.
+    if (src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
         ne11 > 1) {
         switch(src0t) {
@@ -13673,15 +13674,13 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             }
             case GGML_TYPE_F16: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-                if (src1t == GGML_TYPE_F32 &&
-                    ggml_cl_can_use_adreno_xmem_gemm_f16_f32(backend_ctx, src0, src1, dst)) {
+                if (ggml_cl_can_use_adreno_xmem_gemm_f16_f32(backend_ctx, src0, src1, dst)) {
                     ggml_cl_mul_mat_f16_f32_adreno_xmem(backend, src0, src1, dst);
                     return;
                 }
 #endif
-                // Same arg list either way; the kernels differ only in src1's element type.
-                kernel = src1t == GGML_TYPE_F16 ? backend_ctx->kernel_mul_mm_f16_f16_l4_lm
-                                                : backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
+                kernel = backend_ctx->kernel_mul_mm_f16_f32_l4_lm;
+                ggml_cl_mulmat_trace(src0, src1, dst, "f16_f32_l4_lm");
                 nth0 = 128; // calculated as (BM*BN)/(TM*TN)
 
                 int batch_stride_a = ne00*ne01;
@@ -14221,6 +14220,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             } else {
                 kernel = backend_ctx->kernel_mul_mat_f16_f16;
                 nrows = 4;
+                ggml_cl_mulmat_trace(src0, src1, dst, "mul_mat_f16_f16_gemv");
             }
 
             CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
