@@ -38,6 +38,13 @@ extern "C" {
     GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer  (ggml_backend_buffer_type_t buft, size_t size);
     GGML_API size_t                ggml_backend_buft_get_alignment (ggml_backend_buffer_type_t buft);
     GGML_API size_t                ggml_backend_buft_get_max_size  (ggml_backend_buffer_type_t buft);
+    // Conservative upper bound for one logical buffer allocation.
+    // This is a fixed backend/device limit, not currently free or total memory,
+    // and does not guarantee that an allocation will succeed. SIZE_MAX means
+    // that the backend does not advertise a finite fixed limit.
+    GGML_API size_t                ggml_backend_buft_get_max_capacity(ggml_backend_buffer_type_t buft);
+    // No-allocation preflight against ggml_backend_buft_get_max_capacity().
+    GGML_API bool                  ggml_backend_buft_is_size_supported(ggml_backend_buffer_type_t buft, size_t size);
     GGML_API size_t                ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
     GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
@@ -82,6 +89,8 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size);
     GGML_API size_t                     ggml_backend_get_alignment(ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_get_max_size(ggml_backend_t backend);
+    GGML_API size_t                     ggml_backend_get_max_buffer_capacity(ggml_backend_t backend);
+    GGML_API bool                       ggml_backend_is_buffer_size_supported(ggml_backend_t backend, size_t size);
 
     GGML_API void ggml_backend_tensor_set_async   (ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
     GGML_API void ggml_backend_tensor_get_async   (ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
@@ -213,6 +222,8 @@ extern "C" {
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
+    // Optional implementation for ggml_backend_buft_get_max_capacity().
+    typedef size_t (*ggml_backend_get_buffer_capacity_t)(ggml_backend_buffer_type_t buft);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
