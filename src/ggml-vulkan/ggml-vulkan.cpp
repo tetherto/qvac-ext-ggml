@@ -5485,6 +5485,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        // UMA reads host-visible memory at full speed, so device-local-first only buys a staging
+        // copy. Set here rather than beside the env read above: uma is not known until now.
+        if (device->uma) {
+            device->prefer_host_memory = true;
+        }
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
