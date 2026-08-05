@@ -15417,9 +15417,31 @@ static const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t 
     return ctx->name.c_str();
 }
 
+static size_t ggml_backend_vk_buffer_type_get_max_capacity(ggml_backend_buffer_type_t buft) {
+    // The shared host buffer type has no device-specific context and retains
+    // its existing fixed chunk/allocation limit.
+    if (buft->context == nullptr) {
+        return ggml_backend_buft_get_max_size(buft);
+    }
+
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    const uint64_t capacity = std::min({
+        ctx->device->max_buffer_size,
+        ctx->device->max_memory_allocation_size,
+        (uint64_t) ctx->device->properties.limits.maxStorageBufferRange,
+        (uint64_t) SIZE_MAX,
+    });
+    return (size_t) capacity;
+}
+
 static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+
+    if (size > ggml_backend_vk_buffer_type_get_max_capacity(buft)) {
+        VK_LOG_DEBUG("ggml_backend_vk_buffer_type_alloc_buffer: requested size exceeds logical buffer capacity\n");
+        return nullptr;
+    }
 
     vk_buffer dev_buffer = nullptr;
     try {
@@ -17979,11 +18001,20 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device].get();
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_get_buffer_capacity") == 0) {
+        return (void *) ggml_backend_vk_buffer_type_get_max_capacity;
+    }
+
+    UNUSED(reg);
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
