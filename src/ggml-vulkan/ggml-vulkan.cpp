@@ -1,5 +1,6 @@
 #include "ggml-vulkan.h"
 #include "ggml-vulkan-capacity.h"
+#include "ggml-vulkan-matmul.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -4693,32 +4694,51 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 #undef CREATE_MM
 
-    // Keep a scalar F32 x F32 pipeline available even when cooperative-matrix
-    // support selects a different default family above. GGML_PREC_F32 routes
-    // here so both operands and accumulation remain F32.
-    if (device->mul_mat_l[GGML_TYPE_F32]) {
+    // Keep a scalar F32 x F32 pipeline available when no full-F32
+    // cooperative-matrix pipeline exists. These shaders use mul_mm.comp, so
+    // they need scalar specialization constants regardless of which
+    // cooperative-matrix branches configured the default families above.
+    const auto scalar_f32_configs = ggml_vk_scalar_f32_matmul_configs(device->subgroup_size);
+    const auto & scalar_f32_l = scalar_f32_configs[0];
+    const auto & scalar_f32_m = scalar_f32_configs[1];
+    const auto & scalar_f32_s = scalar_f32_configs[2];
+    const size_t max_scalar_f32_shmem = device->properties.limits.maxComputeSharedMemorySize;
+    GGML_ASSERT(scalar_f32_l.specialization_constants.size() == 11 &&
+                scalar_f32_m.specialization_constants.size() == 11 &&
+                scalar_f32_s.specialization_constants.size() == 11);
+
+    if (device->mul_mat_l[GGML_TYPE_F32] &&
+        ggml_vk_scalar_f32_matmul_shmem_supported(scalar_f32_l, max_scalar_f32_shmem)) {
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->l,
             "matmul_f32_f32_l", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
-            "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, l_warptile, 1);
+            "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_l.work_group_denominators,
+            scalar_f32_l.specialization_constants, 1);
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_l,
             "matmul_f32_f32_aligned_l", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
-            "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, l_warptile, l_align);
+            "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_l.work_group_denominators,
+            scalar_f32_l.specialization_constants, scalar_f32_l.alignment);
     }
-    if (device->mul_mat_m[GGML_TYPE_F32]) {
+    if (device->mul_mat_m[GGML_TYPE_F32] &&
+        ggml_vk_scalar_f32_matmul_shmem_supported(scalar_f32_m, max_scalar_f32_shmem)) {
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->m,
             "matmul_f32_f32_m", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
-            "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, m_warptile, 1);
+            "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_m.work_group_denominators,
+            scalar_f32_m.specialization_constants, 1);
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_m,
             "matmul_f32_f32_aligned_m", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
-            "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, m_warptile, m_align);
+            "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_m.work_group_denominators,
+            scalar_f32_m.specialization_constants, scalar_f32_m.alignment);
     }
-    if (device->mul_mat_s[GGML_TYPE_F32]) {
+    if (device->mul_mat_s[GGML_TYPE_F32] &&
+        ggml_vk_scalar_f32_matmul_shmem_supported(scalar_f32_s, max_scalar_f32_shmem)) {
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->s,
             "matmul_f32_f32_s", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
-            "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, s_warptile, 1);
+            "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_s.work_group_denominators,
+            scalar_f32_s.specialization_constants, 1);
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_s,
             "matmul_f32_f32_aligned_s", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
-            "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, s_warptile, s_align);
+            "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_s.work_group_denominators,
+            scalar_f32_s.specialization_constants, scalar_f32_s.alignment);
     }
 
     // mul mat vec
@@ -7104,7 +7124,18 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
         if (prec == GGML_PREC_F32) {
-            return ctx->device->pipeline_matmul_f32_full;
+            switch (ggml_vk_select_f32_matmul_pipeline(
+                        ctx->device->coopmat_f32_support_16x16x16_f32acc,
+                        ctx->device->pipeline_matmul_f32_cm1->is_empty(),
+                        ctx->device->pipeline_matmul_f32_full->is_empty())) {
+                case ggml_vk_f32_matmul_pipeline_kind::cooperative_matrix:
+                    return ctx->device->pipeline_matmul_f32_cm1;
+                case ggml_vk_f32_matmul_pipeline_kind::scalar:
+                    return ctx->device->pipeline_matmul_f32_full;
+                case ggml_vk_f32_matmul_pipeline_kind::none:
+                    return nullptr;
+            }
+            GGML_ABORT("invalid F32 matmul pipeline selection");
         }
         if (ctx->device->coopmat_f32_support_16x16x16_f32acc) {
             assert(ctx->device->coopmat_support);
