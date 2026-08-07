@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-vulkan/ggml-vulkan-capacity.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -96,6 +97,12 @@ int main() {
     assert(ggml_backend_buft_is_size_supported(&unbounded, SIZE_MAX));
     assert(allocation_calls == 0);
 
+    const uint64_t gib = UINT64_C(1024) * 1024 * 1024;
+    assert(ggml_vk_buffer_capacity(16 * gib, 12 * gib, 4 * gib - 1, false) == 4 * gib - 1);
+    assert(ggml_vk_buffer_capacity(16 * gib, 12 * gib, 4 * gib - 1, true) == 12 * gib);
+    assert(ggml_vk_buffer_capacity(8 * gib, 16 * gib, 4 * gib - 1, true) == 8 * gib);
+    assert(ggml_vk_buffer_capacity(16 * gib, 8 * gib, 4 * gib - 1, true) == 8 * gib);
+
     ggml_backend_load_all();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -113,6 +120,12 @@ int main() {
             assert(ggml_backend_get_max_buffer_capacity(backend) == capacity);
             assert(ggml_backend_is_buffer_size_supported(backend, capacity));
             ggml_backend_free(backend);
+        }
+
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft != nullptr && std::strcmp(ggml_backend_buft_name(host_buft), "Vulkan_Host") == 0) {
+            assert(ggml_backend_buft_get_max_capacity(host_buft) == SIZE_MAX);
+            assert(ggml_backend_buft_is_size_supported(host_buft, SIZE_MAX));
         }
 
         std::printf("%s capacity: %" PRIu64 " bytes\n",

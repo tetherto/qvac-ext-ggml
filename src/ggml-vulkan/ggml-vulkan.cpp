@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "ggml-vulkan-capacity.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -8865,41 +8866,48 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         src1_uma = d_Qy != nullptr;
     }
 
-    // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
-    const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
+    const ggml_prec requested_prec = (ggml_prec) dst->op_params[0];
+    const bool full_f32 = requested_prec == GGML_PREC_F32 &&
+                          src0->type == GGML_TYPE_F32 &&
+                          src1->type == GGML_TYPE_F32;
+
+    // Reformat non-contiguous inputs. Coopmat2 normally converts contiguous F32
+    // inputs to F16 for performance, but explicit F32 must retain both operands.
+    const bool x_non_contig = (!full_f32 && ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+    const bool y_non_contig = (!full_f32 && ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
                               !ggml_vk_dim01_contiguous(src1);
 
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    const ggml_type reformat_type = full_f32 ? GGML_TYPE_F32 : f16_type;
 
-    bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+    bool y_f32_kernel = src1->type == GGML_TYPE_F32 && (!y_non_contig || full_f32);
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    bool quantize_y = !full_f32 && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, requested_prec) : nullptr;
 
     if (mmp == nullptr) {
-        // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, (y_non_contig || !y_f32_kernel) ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+        // Fall back to the requested reformat type.
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, (y_non_contig || !y_f32_kernel) ? reformat_type : src1->type, requested_prec);
         quantize_y = false;
     }
 
     bool qx_needs_dequant = mmp == nullptr || x_non_contig;
-    const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
+    const bool qy_needs_dequant = !quantize_y && ((src1->type != reformat_type && !y_f32_kernel) || y_non_contig);
 
     if (qx_needs_dequant) {
-        // Fall back to dequant + f16 mulmat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
+        // Fall back to reformat + mulmat.
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, reformat_type, y_f32_kernel ? GGML_TYPE_F32 : reformat_type, requested_prec);
     }
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type)));
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? reformat_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type)));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type));
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? reformat_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type));
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -8916,7 +8924,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : ggml_type_size(reformat_type) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
@@ -8924,13 +8932,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline to_fp16_vk_1 = nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
-    if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
+    if (x_non_contig || full_f32) {
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, reformat_type);
     } else {
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
     }
-    if (y_non_contig) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, f16_type);
+    if (y_non_contig || full_f32) {
+        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, reformat_type);
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
@@ -9120,8 +9128,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // compute
     if (do_tiling) {
-        ggml_type a_type = qx_needs_dequant ? f16_type : src0->type;
-        ggml_type b_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : f16_type);
+        ggml_type a_type = qx_needs_dequant ? reformat_type : src0->type;
+        ggml_type b_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : reformat_type);
         ggml_type d_type = GGML_TYPE_F32;
 
         GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
@@ -15418,20 +15426,18 @@ static const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t 
 }
 
 static size_t ggml_backend_vk_buffer_type_get_max_capacity(ggml_backend_buffer_type_t buft) {
-    // The shared host buffer type has no device-specific context and retains
-    // its existing fixed chunk/allocation limit.
+    // The shared host allocator may fall back to the CPU allocator, so it has
+    // no finite backend-specific ceiling.
     if (buft->context == nullptr) {
-        return ggml_backend_buft_get_max_size(buft);
+        return SIZE_MAX;
     }
 
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
-    const uint64_t capacity = std::min({
+    return ggml_vk_buffer_capacity(
         ctx->device->max_buffer_size,
         ctx->device->max_memory_allocation_size,
         (uint64_t) ctx->device->properties.limits.maxStorageBufferRange,
-        (uint64_t) SIZE_MAX,
-    });
-    return (size_t) capacity;
+        ctx->device->shader_64b_indexing);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -15509,6 +15515,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         // fallback to cpu buffer
+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    }
+    if (ptr == nullptr) {
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
 

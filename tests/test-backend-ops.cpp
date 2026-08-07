@@ -8439,14 +8439,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
     // F32 precision is a backend contract, not merely an accumulator hint.
-    // These aligned and tail shapes take matrix-matrix/cooperative-matrix
-    // paths when available and are checked against the CPU at 1e-10 NMSE.
+    // These aligned, tail, and non-contiguous shapes take matrix-matrix or
+    // reformat paths and are checked against the CPU at 1e-10 NMSE.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 32, 64,
                                              {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, GGML_PREC_F32));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 257, 128,
                                              {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, GGML_PREC_F32));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 96, 33, 65,
                                              {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, GGML_PREC_F32));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 96, 33, 65,
+                                             {1, 1}, {1, 1}, {0, 1, 2, 3}, 96, 1, GGML_PREC_F32));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
