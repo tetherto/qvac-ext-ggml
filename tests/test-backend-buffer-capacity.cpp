@@ -98,10 +98,15 @@ int main() {
     assert(allocation_calls == 0);
 
     const uint64_t gib = UINT64_C(1024) * 1024 * 1024;
-    assert(ggml_vk_buffer_capacity(16 * gib, 12 * gib, 4 * gib - 1, false) == 4 * gib - 1);
-    assert(ggml_vk_buffer_capacity(16 * gib, 12 * gib, 4 * gib - 1, true) == 12 * gib);
-    assert(ggml_vk_buffer_capacity(8 * gib, 16 * gib, 4 * gib - 1, true) == 8 * gib);
-    assert(ggml_vk_buffer_capacity(16 * gib, 8 * gib, 4 * gib - 1, true) == 8 * gib);
+    // Allocation capacity is unchanged by descriptor range, indexing, or BDA
+    // features. Operation support applies those restrictions separately.
+    assert(ggml_vk_buffer_capacity(16 * gib, 12 * gib, 4 * gib - 1, false, false) == 12 * gib);
+    assert(ggml_vk_buffer_capacity(16 * gib, 12 * gib, 4 * gib - 1, true,  false) == 12 * gib);
+    assert(ggml_vk_buffer_capacity(16 * gib, 12 * gib, 4 * gib - 1, false, true)  == 12 * gib);
+    assert(ggml_vk_buffer_capacity(16 * gib, 12 * gib, 4 * gib - 1, true,  true)  == 12 * gib);
+    assert(ggml_vk_buffer_capacity(8 * gib, 16 * gib, 4 * gib - 1, true, true) == 8 * gib);
+    assert(ggml_vk_buffer_capacity(16 * gib, 8 * gib, 4 * gib - 1, false, false) == 8 * gib);
+    assert(ggml_vk_buffer_capacity(UINT64_MAX, UINT64_MAX, 1, false, false) == SIZE_MAX);
 
     ggml_backend_load_all();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {

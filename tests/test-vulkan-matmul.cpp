@@ -52,11 +52,30 @@ static void test_f32_pipeline_selection() {
            kind::none);
 }
 
+static void test_partial_pipeline_family() {
+    using tier = ggml_vk_matmul_pipeline_tier;
+
+    // The large family can be unavailable while medium and small remain
+    // populated. Large shapes must select medium rather than a null large
+    // pipeline.
+    assert(ggml_vk_select_matmul_pipeline_tier(false, true, true, 128, 128) ==
+           tier::medium);
+    assert(ggml_vk_select_matmul_pipeline_tier(false, true, true, 64, 128) ==
+           tier::medium);
+    assert(ggml_vk_select_matmul_pipeline_tier(false, false, true, 128, 128) ==
+           tier::small);
+    assert(ggml_vk_select_matmul_pipeline_tier(true, true, true, 128, 128) ==
+           tier::large);
+    assert(ggml_vk_select_matmul_pipeline_tier(false, false, false, 128, 128) ==
+           tier::none);
+}
+
 int main() {
     test_scalar_f32_configs(8);
     test_scalar_f32_configs(16);
     test_scalar_f32_configs(32);
     test_scalar_f32_configs(64);
     test_f32_pipeline_selection();
+    test_partial_pipeline_family();
     return 0;
 }
