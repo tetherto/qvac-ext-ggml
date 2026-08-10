@@ -12,6 +12,35 @@ enum class ggml_vk_f32_matmul_pipeline_kind {
     cooperative_matrix,
 };
 
+enum class ggml_vk_matmul_pipeline_tier {
+    none,
+    small,
+    medium,
+    large,
+};
+
+static inline ggml_vk_matmul_pipeline_tier
+ggml_vk_select_matmul_pipeline_tier(bool large_available,
+                                    bool medium_available,
+                                    bool small_available,
+                                    uint32_t m,
+                                    uint32_t n) {
+    if ((small_available && (m <= 32 || n <= 32)) ||
+        (!medium_available && !large_available)) {
+        return small_available
+            ? ggml_vk_matmul_pipeline_tier::small
+            : ggml_vk_matmul_pipeline_tier::none;
+    }
+    if ((medium_available && (m <= 64 || n <= 64)) || !large_available) {
+        return medium_available
+            ? ggml_vk_matmul_pipeline_tier::medium
+            : ggml_vk_matmul_pipeline_tier::none;
+    }
+    return large_available
+        ? ggml_vk_matmul_pipeline_tier::large
+        : ggml_vk_matmul_pipeline_tier::none;
+}
+
 static inline ggml_vk_f32_matmul_pipeline_kind
 ggml_vk_select_f32_matmul_pipeline(bool cooperative_matrix_supported,
                                    bool cooperative_matrix_pipeline_empty,

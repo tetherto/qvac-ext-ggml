@@ -9933,52 +9933,70 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
+    if (mmp == nullptr) {
+        return nullptr;
+    }
+
     // The q8_1 (integer dot) mmq path uses a different shader with its own
     // shared-memory layout, so use the int-specific availability flags.
     const bool is_q8_1 = (src1_type == GGML_TYPE_Q8_1);
-    const bool mm_l = is_q8_1 ? ctx->device->mul_mat_l_int[src0_type] : ctx->device->mul_mat_l[src0_type];
-    const bool mm_m = is_q8_1 ? ctx->device->mul_mat_m_int[src0_type] : ctx->device->mul_mat_m[src0_type];
-    const bool mm_s = is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type];
+    const bool has_l = (is_q8_1 ? ctx->device->mul_mat_l_int[src0_type] : ctx->device->mul_mat_l[src0_type]) && mmp->l != nullptr;
+    const bool has_m = (is_q8_1 ? ctx->device->mul_mat_m_int[src0_type] : ctx->device->mul_mat_m[src0_type]) && mmp->m != nullptr;
+    const bool has_s = (is_q8_1 ? ctx->device->mul_mat_s_int[src0_type] : ctx->device->mul_mat_s[src0_type]) && mmp->s != nullptr;
+    const auto select_pipeline = [aligned](const vk_pipeline & unaligned, const vk_pipeline & aligned_pipeline) {
+        return aligned && aligned_pipeline != nullptr ? aligned_pipeline : unaligned;
+    };
 
     if (ctx->device->coopmat2) {
         const uint32_t shader_core_count = ctx->device->shader_core_count;
-        const uint32_t tiles_l = CEIL_DIV(m, mmp->a_l->wg_denoms[0]) * CEIL_DIV(n, mmp->a_l->wg_denoms[1]);
-        const uint32_t tiles_m = CEIL_DIV(m, mmp->a_m->wg_denoms[0]) * CEIL_DIV(n, mmp->a_m->wg_denoms[1]);
+        const vk_pipeline pipeline_l = mmp->a_l != nullptr ? mmp->a_l : mmp->l;
+        const vk_pipeline pipeline_m = mmp->a_m != nullptr ? mmp->a_m : mmp->m;
+        const uint32_t tiles_l = has_l ? CEIL_DIV(m, pipeline_l->wg_denoms[0]) * CEIL_DIV(n, pipeline_l->wg_denoms[1]) : 0;
+        const uint32_t tiles_m = has_m ? CEIL_DIV(m, pipeline_m->wg_denoms[0]) * CEIL_DIV(n, pipeline_m->wg_denoms[1]) : 0;
 
         // Use large shader when the N dimension is greater than the medium shader's tile size
-        uint32_t crossover_large = mmp->m->wg_denoms[1];
+        const uint32_t crossover_large = has_m ? mmp->m->wg_denoms[1] : 0;
 
         // Prefer large over medium if either:
         // - medium or large tiles would overfill the GPU
         // - large tiles with a split_k==3 fits in the GPU and medium tiles with split_k==2 does not
         //   (medium with split_k==2 is probably better if it fits - more workgroups running and less split_k overhead)
-        bool prefer_large = tiles_m > shader_core_count || tiles_l > shader_core_count ||
+        bool prefer_large = has_l && (tiles_m > shader_core_count || tiles_l > shader_core_count ||
                             // split_k==3 with large tiles likely better than medium tiles with no split_k.
-                            (tiles_l <= shader_core_count / 3 && tiles_m > shader_core_count / 2);
+                            (tiles_l <= shader_core_count / 3 && tiles_m > shader_core_count / 2));
 
-        if ((mm_l && (n > crossover_large && prefer_large)) || (!mm_m && !mm_s)) {
-            return aligned ? mmp->a_l : mmp->l;
+        if ((has_l && has_m && n > crossover_large && prefer_large) || (!has_m && !has_s)) {
+            return select_pipeline(mmp->l, mmp->a_l);
         }
         // Use medium shader when the N dimension is greater than the small shader's tile size
-        uint32_t crossover_medium = mmp->s->wg_denoms[1];
-        if ((mm_m && (n > crossover_medium)) || !mm_s) {
-            return aligned ? mmp->a_m : mmp->m;
+        const uint32_t crossover_medium = has_s ? mmp->s->wg_denoms[1] : 0;
+        if ((has_m && has_s && n > crossover_medium) || !has_s) {
+            return select_pipeline(mmp->m, mmp->a_m);
         }
-        return aligned ? mmp->a_s : mmp->s;
+        return select_pipeline(mmp->s, mmp->a_s);
     }
 
-    if ((mm_s && (m <= 32 || n <= 32)) || (!mm_m && !mm_l)) {
-        return aligned ? mmp->a_s : mmp->s;
+    switch (ggml_vk_select_matmul_pipeline_tier(has_l, has_m, has_s, m, n)) {
+        case ggml_vk_matmul_pipeline_tier::small:
+            return select_pipeline(mmp->s, mmp->a_s);
+        case ggml_vk_matmul_pipeline_tier::medium:
+            return select_pipeline(mmp->m, mmp->a_m);
+        case ggml_vk_matmul_pipeline_tier::large:
+            return select_pipeline(mmp->l, mmp->a_l);
+        case ggml_vk_matmul_pipeline_tier::none:
+            return nullptr;
     }
-    if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
-        return aligned ? mmp->a_m : mmp->m;
-    }
-    return aligned ? mmp->a_l : mmp->l;
+
+    return nullptr;
 }
 
 static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline_align(" << m << ", " << n << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
-    return ggml_vk_guess_matmul_pipeline(ctx, mmp, m, n, true, src0_type, src1_type)->align;
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, m, n, true, src0_type, src1_type);
+    if (pipeline == nullptr) {
+        GGML_ABORT("No compatible Vulkan matmul pipeline");
+    }
+    return pipeline->align;
 }
 
 static void ggml_vk_matmul(
@@ -18360,7 +18378,8 @@ static size_t ggml_backend_vk_buffer_type_get_max_capacity(ggml_backend_buffer_t
         ctx->device->max_buffer_size,
         ctx->device->max_memory_allocation_size,
         (uint64_t) ctx->device->properties.limits.maxStorageBufferRange,
-        ctx->device->shader_64b_indexing);
+        ctx->device->shader_64b_indexing,
+        ctx->device->buffer_device_address);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
