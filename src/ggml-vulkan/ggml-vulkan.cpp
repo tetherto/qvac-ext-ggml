@@ -5834,7 +5834,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_l.work_group_denominators,
             scalar_f32_l.specialization_constants, 1);
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_l,
-            "matmul_f32_f32_aligned_l", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
+            "matmul_f32_f32_aligned_l", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
             "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_l.work_group_denominators,
             scalar_f32_l.specialization_constants, scalar_f32_l.alignment);
     }
@@ -5845,7 +5845,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_m.work_group_denominators,
             scalar_f32_m.specialization_constants, 1);
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_m,
-            "matmul_f32_f32_aligned_m", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
+            "matmul_f32_f32_aligned_m", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
             "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_m.work_group_denominators,
             scalar_f32_m.specialization_constants, scalar_f32_m.alignment);
     }
@@ -5856,7 +5856,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_s.work_group_denominators,
             scalar_f32_s.specialization_constants, 1);
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32_full->a_s,
-            "matmul_f32_f32_aligned_s", matmul_f32_f32_aligned_fp32_len, matmul_f32_f32_aligned_fp32_data,
+            "matmul_f32_f32_aligned_s", matmul_f32_f32_fp32_len, matmul_f32_f32_fp32_data,
             "main", 3, sizeof(vk_mat_mat_push_constants), scalar_f32_s.work_group_denominators,
             scalar_f32_s.specialization_constants, scalar_f32_s.alignment);
     }
