@@ -1299,10 +1299,6 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
         exit(1);
     }
 
-#ifdef GGML_OPENCL_KERNEL_CACHE
-    cl_program_cache_try_save(cache, p, dev, program_buffer, compile_opts);
-#endif
-
     return p;
 }
 

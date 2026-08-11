@@ -1177,7 +1177,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ROPE_FLUX",
 };
 
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1305,7 +1305,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rope_flux(x)",
 };
 
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 

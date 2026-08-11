@@ -681,16 +681,6 @@ static void ggml_compute_forward_add_q_f32(
     }
 }
 
-#define GGML_CASE_TBQ_TYPES       \
-        case GGML_TYPE_TBQ3_0:    \
-        case GGML_TYPE_TBQ4_0:    \
-        case GGML_TYPE_TBQ3_0_64: \
-        case GGML_TYPE_TBQ4_0_64: \
-        case GGML_TYPE_PQ3_0:     \
-        case GGML_TYPE_PQ3_0_64:  \
-        case GGML_TYPE_PQ4_0:     \
-        case GGML_TYPE_PQ4_0_64
-
 void ggml_compute_forward_add(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -737,7 +727,6 @@ void ggml_compute_forward_add(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
-        GGML_CASE_TBQ_TYPES:
             {
                 ggml_compute_forward_add_q_f32(params, dst);
             } break;
@@ -1198,7 +1187,6 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
-        GGML_CASE_TBQ_TYPES:
             {
                 ggml_compute_forward_add1_q_f32(params, dst);
             } break;
@@ -1338,7 +1326,6 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
-        GGML_CASE_TBQ_TYPES:
         default:
             {
                 GGML_ABORT("fatal error");
@@ -5214,7 +5201,6 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
-        GGML_CASE_TBQ_TYPES:
             {
                 ggml_compute_forward_out_prod_q_f32(params, dst);
             } break;
@@ -5500,7 +5486,6 @@ void ggml_compute_forward_set(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
-        GGML_CASE_TBQ_TYPES:
         default:
             {
                 GGML_ABORT("fatal error");
@@ -5734,7 +5719,6 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
-        GGML_CASE_TBQ_TYPES:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -6513,7 +6497,6 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
-        GGML_CASE_TBQ_TYPES:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");
