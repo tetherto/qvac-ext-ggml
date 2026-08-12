@@ -14775,8 +14775,6 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
-    // K = recurrent snapshot/rollback slot count = state (src[5]) ne[1].
-    const uint32_t K = (uint32_t)dst->src[5]->ne[1];
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
