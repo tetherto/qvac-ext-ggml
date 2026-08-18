@@ -15664,7 +15664,6 @@ static void ggml_vk_cross_entropy_loss_masked_back(ggml_backend_vk_context * ctx
     const int64_t nrows = ggml_nrows(logits);
 
     // Read the upstream gradient on the host and pass it as a push constant.
-    const ggml_tensor * grad = dst->src[0];
 
     float upstream_grad = 1.0f;
     if (grad && grad->data) {
