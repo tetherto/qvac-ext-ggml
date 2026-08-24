@@ -7555,12 +7555,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
                    (pool_op == GGML_OP_POOL_AVG || pool_op == GGML_OP_POOL_MAX);
         }
-        case GGML_OP_POOL_2D: {
-            const int pool_op = ggml_get_op_params_i32(op, 0);
-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
-                   (pool_op == GGML_OP_POOL_AVG || pool_op == GGML_OP_POOL_MAX);
-        }
         case GGML_OP_CONV_2D:
             return (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) ||
                    (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ||
