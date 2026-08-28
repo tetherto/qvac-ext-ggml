@@ -113,6 +113,11 @@ verified mechanisms.
   remaining labels if the new case is appended at the list tail (cost: lost
   element overrides, e.g. cpy_transpose tiles). Verify the intended branch
   fires with a print after any such split.
+- GGML_VULKAN_STRIP_UNUSED_SHADERS=ON (the ggml-speech vcpkg port enables it)
+  replaces the iq*/mxfp4/nvfp4 and training/backward shader payloads with
+  no-op stubs (linux-x64 backend 63 MB -> 34 MB). On such a build,
+  test-backend-ops FAILs on those families are the stripping, not a
+  regression — reproduce suspected real failures on a default build.
 
 ## HIP/ROCm on this machine
 

@@ -324,7 +324,44 @@ compile_count_guard acquire_compile_slot() {
     return compile_count_guard(&compile_count, &decrement_compile_count);
 }
 
+#ifdef GGML_VULKAN_STRIP_UNUSED_SHADERS
+// Shader families no speech engine dispatches: iq*/mxfp4/nvfp4 weight
+// quantizations (the shipped GGUFs use q4_0/q5_0/q5_1/q8_0/k-quants/f16)
+// and the training/backward pipelines. Their SPIR-V payloads are replaced
+// with no-op stubs, so a Vulkan dispatch of a stripped pipeline returns
+// garbage instead of failing — only enable this for deployments whose
+// model set is known to stay clear of these families.
+bool should_strip_shader_payload(const std::string & name) {
+    return name.find("iq1_s") != std::string::npos ||
+        name.find("iq1_m") != std::string::npos ||
+        name.find("iq2_xxs") != std::string::npos ||
+        name.find("iq2_xs") != std::string::npos ||
+        name.find("iq2_s") != std::string::npos ||
+        name.find("iq3_xxs") != std::string::npos ||
+        name.find("iq3_s") != std::string::npos ||
+        name.find("iq4_xs") != std::string::npos ||
+        name.find("iq4_nl") != std::string::npos ||
+        name.find("mxfp4") != std::string::npos ||
+        name.find("nvfp4") != std::string::npos ||
+        name.find("repeat_back") != std::string::npos ||
+        name.find("rms_norm_back") != std::string::npos ||
+        name.find("silu_back") != std::string::npos ||
+        name.find("soft_max_back") != std::string::npos ||
+        name.find("opt_step") != std::string::npos;
+}
+#endif
+
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
+#ifdef GGML_VULKAN_STRIP_UNUSED_SHADERS
+    if (should_strip_shader_payload(name)) {
+        const std::string noop_path = out_path + ".noop.comp";
+        write_binary_file(noop_path, "#version 450\nlayout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;\nvoid main() {}\n");
+        in_path = noop_path;
+        defines.clear();
+        coopmat = false;
+    }
+#endif
+
     std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
 
     #ifdef _WIN32
