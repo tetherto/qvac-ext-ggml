@@ -2,7 +2,9 @@
 
 #include <cstdio>
 
-extern "C" GGML_BACKEND_API bool ggml_backend_vk_test_sticky_status(void);
+extern "C" {
+GGML_BACKEND_API bool ggml_backend_vk_test_sticky_status(void);
+}
 
 int main() {
     if (!ggml_backend_vk_test_sticky_status()) {
