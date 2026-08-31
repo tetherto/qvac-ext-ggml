@@ -16124,7 +16124,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 }
 
 #ifdef GGML_VULKAN_TESTING
-extern "C" GGML_BACKEND_API bool ggml_backend_vk_test_sticky_status(void) {
+// GGML_BACKEND_API carries its own `extern`, so it can only appear inside a
+// braced linkage specification -- `extern "C" <decl-with-extern>` is invalid
+// and GCC rejects it.
+extern "C" {
+
+GGML_BACKEND_API bool ggml_backend_vk_test_sticky_status(void);
+
+bool ggml_backend_vk_test_sticky_status(void) {
     ggml_backend_vk_context ctx = {};
     ctx.status = GGML_STATUS_FAILED;
 
@@ -16134,6 +16141,8 @@ extern "C" GGML_BACKEND_API bool ggml_backend_vk_test_sticky_status(void) {
 
     return ggml_vk_synchronize(&ctx) == GGML_STATUS_FAILED &&
            ggml_backend_vk_graph_compute(&backend, &graph) == GGML_STATUS_FAILED;
+}
+
 }
 #endif
 
