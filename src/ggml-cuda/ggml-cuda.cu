@@ -831,6 +831,11 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
         return nullptr;
     }
 
+    if (ggml_backend_cuda_reg_find_device(device) == nullptr) {
+        GGML_LOG_ERROR("%s: device %d has no kernels compiled for its compute capability\n", __func__, device);
+        return nullptr;
+    }
+
     static ggml_backend_buffer_type ggml_backend_cuda_buffer_types[GGML_CUDA_MAX_DEVICES];
 
     static bool ggml_backend_cuda_buffer_type_initialized = false;
@@ -1287,6 +1292,11 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
 ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, const float * tensor_split) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
+
+    if (ggml_backend_cuda_reg_find_device(main_device) == nullptr) {
+        GGML_LOG_ERROR("%s: device %d has no kernels compiled for its compute capability\n", __func__, main_device);
+        return nullptr;
+    }
 
     static std::map<std::pair<int, std::array<float, GGML_CUDA_MAX_DEVICES>>, struct ggml_backend_buffer_type> buft_map;
 
