@@ -1,0 +1,25 @@
+# Specialized GitHub Actions runner labels for qvac-ext-ggml CI.
+# Edit this file, then run: node .github/scripts/sync-runner-names.mjs
+#
+# ubuntu-latest / macos-latest / windows-latest are intentionally omitted; keep
+# them hardcoded as GitHub's rolling aliases.
+#
+# FORMAT CONTRACT: a flat `key: value # comment` list, one entry per line. The
+# parser (.github/scripts/lib/runner-names.mjs) is line-based, not YAML. A value
+# is EITHER a bare single label (`ubuntu-22.04`) OR a flow array of bare tokens
+# (`[self-hosted, Linux, X64, NVIDIA]`) for composite self-hosted label sets. Do
+# not quote values or nest maps (the parser fails loudly). If real YAML is ever
+# needed, swap the parser at the same time.
+#
+# SCOPE: this catalog governs only where jobs RUN (runs-on). It does NOT manage
+# `matrix.os` identities or `if:` conditionals. Bumping a label here never
+# requires editing those, and vice versa.
+
+# GitHub-hosted (pinned images)
+ubuntu_2204: ubuntu-22.04 # Ubuntu 22.04 hosted x64
+ubuntu_2204_arm: ubuntu-22.04-arm # Ubuntu 22.04 hosted arm64
+
+# Self-hosted composite label sets (all labels must match; AND semantics)
+selfhosted_linux_x64_nvidia: [self-hosted, Linux, X64, NVIDIA] # Linux x64 NVIDIA GPU
+selfhosted_linux_x64_nvidia_coopmat2: [self-hosted, Linux, X64, NVIDIA, COOPMAT2] # + Vulkan coopmat2
+selfhosted_macos_arm64: [self-hosted, macOS, ARM64] # Apple Silicon (Metal/Vulkan)
