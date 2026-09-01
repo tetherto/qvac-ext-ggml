@@ -821,6 +821,8 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .is_host          = */ NULL,
 };
 
+static ggml_backend_dev_t ggml_backend_cuda_reg_find_device(int device);
+
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -837,7 +839,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
         for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
             ggml_backend_cuda_buffer_types[i] = {
                 /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
-                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .device   = */ ggml_backend_cuda_reg_find_device(i),
                 /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i)},
             };
         }
@@ -1316,7 +1318,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, 
 
     struct ggml_backend_buffer_type buft {
         /* .iface   = */ ggml_backend_cuda_split_buffer_type_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), main_device),
+        /* .device  = */ ggml_backend_cuda_reg_find_device(main_device),
         /* .context = */ ctx,
     };
 
@@ -5493,12 +5495,18 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
             for (int i = 0; i < ggml_cuda_info().device_count; i++) {
+                cudaDeviceProp prop;
+                CUDA_CHECK(cudaGetDeviceProperties(&prop, i));
+
+                if (!ggml_cuda_compiled_code_available(ggml_cuda_info().devices[i].cc)) {
+                    GGML_LOG_WARN("%s: skipping device %d (%s): no kernels compiled for compute capability %d.%d\n",
+                                  __func__, i, prop.name, prop.major, prop.minor);
+                    continue;
+                }
+
                 ggml_backend_cuda_device_context * dev_ctx = new ggml_backend_cuda_device_context;
                 dev_ctx->device = i;
                 dev_ctx->name = GGML_CUDA_NAME + std::to_string(i);
-
-                cudaDeviceProp prop;
-                CUDA_CHECK(cudaGetDeviceProperties(&prop, i));
                 dev_ctx->description = prop.name;
 
                 char pci_bus_id[16] = {};
@@ -5527,9 +5535,24 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+static ggml_backend_dev_t ggml_backend_cuda_reg_find_device(int device) {
+    ggml_backend_cuda_reg_context * ctx = (ggml_backend_cuda_reg_context *) ggml_backend_cuda_reg()->context;
+    for (ggml_backend_dev_t dev : ctx->devices) {
+        if (((ggml_backend_cuda_device_context *) dev->context)->device == device) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
+        return nullptr;
+    }
+
+    if (!ggml_cuda_compiled_code_available(ggml_cuda_info().devices[device].cc)) {
+        GGML_LOG_ERROR("%s: device %d has no kernels compiled for its compute capability\n", __func__, device);
         return nullptr;
     }
 
