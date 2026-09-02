@@ -387,6 +387,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_conv_2d(ctx, idx);
             } break;
+        case GGML_OP_CONV_2D_DW:
+            {
+                n_fuse = ggml_metal_op_conv_2d_dw(ctx, idx);
+            } break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
                 n_fuse = ggml_metal_op_conv_transpose_1d(ctx, idx);
@@ -4049,6 +4053,50 @@ int ggml_metal_op_snake(ggml_metal_op_t ctx, int idx) {
     int64_t ntg = (N + nth - 1) / nth;
     if (ntg < 1)      ntg = 1;
     if (ntg > 65535)  ntg = 65535;  // grid-stride covers the remainder
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_conv_2d_dw(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t * p = (const int32_t *) op->op_params;
+
+    ggml_metal_kargs_conv_2d_dw args = {
+        /*.IW   =*/ (int32_t) op->src[1]->ne[0],
+        /*.IH   =*/ (int32_t) op->src[1]->ne[1],
+        /*.OW   =*/ (int32_t) op->ne[0],
+        /*.OH   =*/ (int32_t) op->ne[1],
+        /*.KW   =*/ (int32_t) op->src[0]->ne[0],
+        /*.KH   =*/ (int32_t) op->src[0]->ne[1],
+        /*.C    =*/ (int32_t) op->src[1]->ne[2],
+        /*.N    =*/ (int32_t) op->src[1]->ne[3],
+        /*.s0   =*/ p[0],
+        /*.s1   =*/ p[1],
+        /*.p0   =*/ p[2],
+        /*.p1   =*/ p[3],
+        /*.d0   =*/ p[4],
+        /*.d1   =*/ p[5],
+        /*.cwhn =*/ ggml_is_contiguous(op->src[1]) ? 0 : 1,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_conv_2d_dw(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+    const int64_t total = (int64_t) args.N * args.C * args.OH * args.OW;
+    const int     nth   = 256;
+    int64_t ntg = (total + nth - 1) / nth;
+    if (ntg < 1)     ntg = 1;
+    if (ntg > 65535) ntg = 65535; // grid-stride loop covers the remainder
     ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
 
     return 1;

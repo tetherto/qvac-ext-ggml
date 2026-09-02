@@ -5188,6 +5188,92 @@ kernel void kernel_conv_transpose_2d<half>(
     uint3   tpitg[[thread_position_in_threadgroup]],
     uint3     ntg[[threads_per_threadgroup]]);
 
+// depthwise 2-D convolution (GGML_OP_CONV_2D_DW), one output element per thread with a
+// grid-stride loop. Mirrors ggml-cpu: WHCN kernel index c*KH*KW + ky*KW + kx, CWHN kernel index
+// (ky*KW + kx)*C + c, and the input/output strides follow the same two layouts.
+template <typename T>
+kernel void kernel_conv_2d_dw(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const T     * knl,
+        device const float * src,
+        device       float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int C  = args.C;
+    const int OW = args.OW;
+    const int OH = args.OH;
+    const int IW = args.IW;
+    const int IH = args.IH;
+    const int KW = args.KW;
+    const int KH = args.KH;
+
+    const uint total  = (uint) args.N * (uint) C * (uint) OH * (uint) OW;
+    const uint stride = ntg.x * tgpg.x;
+
+    for (uint gid = tgpig.x * ntg.x + tpitg.x; gid < total; gid += stride) {
+        int n, c, oy, ox;
+        if (args.cwhn) {
+            c  = gid % C;
+            ox = (gid / C) % OW;
+            oy = (gid / (C * OW)) % OH;
+            n  = gid / (C * OW * OH);
+        } else {
+            ox = gid % OW;
+            oy = (gid / OW) % OH;
+            c  = (gid / (OW * OH)) % C;
+            n  = gid / (OW * OH * C);
+        }
+
+        const int ky0 = max(0,  (args.p1 - oy * args.s1 + args.d1 - 1) / args.d1);
+        const int ky1 = min(KH, (IH + args.p1 - oy * args.s1 + args.d1 - 1) / args.d1);
+        const int kx0 = max(0,  (args.p0 - ox * args.s0 + args.d0 - 1) / args.d0);
+        const int kx1 = min(KW, (IW + args.p0 - ox * args.s0 + args.d0 - 1) / args.d0);
+
+        device const float * src_n = src + (size_t) n * C * IW * IH;
+
+        float acc = 0.0f;
+        for (int ky = ky0; ky < ky1; ++ky) {
+            const int iy = oy * args.s1 + ky * args.d1 - args.p1;
+            for (int kx = kx0; kx < kx1; ++kx) {
+                const int ix = ox * args.s0 + kx * args.d0 - args.p0;
+                const float v = args.cwhn ? src_n[((size_t) iy * IW + ix) * C + c]
+                                          : src_n[(size_t) c * IW * IH + (size_t) iy * IW + ix];
+                const float w = args.cwhn ? (float) knl[(ky * KW + kx) * C + c]
+                                          : (float) knl[c * KH * KW + ky * KW + kx];
+                acc += v * w;
+            }
+        }
+
+        const size_t o = args.cwhn ? (size_t) n * C * OW * OH + ((size_t) oy * OW + ox) * C + c
+                                   : (size_t) n * C * OW * OH + (size_t) c * OW * OH + (size_t) oy * OW + ox;
+        dst[o] = acc;
+    }
+}
+
+template [[host_name("kernel_conv_2d_dw_f32_f32")]]
+kernel void kernel_conv_2d_dw<float>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const float * knl,
+        device const float * src,
+        device       float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_conv_2d_dw_f16_f32")]]
+kernel void kernel_conv_2d_dw<half>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const half  * knl,
+        device const float * src,
+        device       float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
+
 constant bool FC_upscale_aa [[function_constant(FC_UPSCALE + 0)]];
 
 kernel void kernel_upscale_nearest_f32(

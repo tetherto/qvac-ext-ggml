@@ -635,6 +635,24 @@ typedef struct {
 } ggml_metal_kargs_conv_transpose_2d;
 
 typedef struct {
+    int32_t IW;
+    int32_t IH;
+    int32_t OW;
+    int32_t OH;
+    int32_t KW;
+    int32_t KH;
+    int32_t C;
+    int32_t N;
+    int32_t s0;
+    int32_t s1;
+    int32_t p0;
+    int32_t p1;
+    int32_t d0;
+    int32_t d1;
+    int32_t cwhn; // 1: input/output/kernel are channel-contiguous (CWHN), 0: WHCN
+} ggml_metal_kargs_conv_2d_dw;
+
+typedef struct {
     uint64_t nb00;
     uint64_t nb01;
     uint64_t nb02;
