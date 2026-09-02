@@ -8241,6 +8241,80 @@ void ggml_compute_forward_snake(
     }
 }
 
+// ggml_compute_forward_lstm_cell
+
+// The two products feeding c_new must not contract into an FMA: the decomposed
+// mul/mul/add graph rounds each product, and the fused op has to match it exactly.
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC push_options
+#    pragma GCC optimize("fp-contract=off")
+#elif defined(_MSC_VER)
+#    pragma fp_contract(off)
+#endif
+
+static float ggml_lstm_cell_sigmoid_f32(float x) {
+    return 1.f / (1.f + expf(-x));
+}
+
+// One [h_new | c_new] pair per index of the flattened H*N grid.
+static void ggml_lstm_cell_band_f32(
+        const float * gates, const float * c_prev, float * dst,
+        int64_t H, int64_t first, int64_t last) {
+#if defined(__clang__)
+    #pragma clang fp contract(off)
+#endif
+    for (int64_t k = first; k < last; k++) {
+        const int64_t n = k / H;
+        const int64_t j = k - n*H;
+
+        const float * g = gates + n*GGML_LSTM_N_GATES*H;
+
+        const float gi = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_INPUT *H + j]);
+        const float gf = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_FORGET*H + j]);
+        const float gg =                      tanhf(g[GGML_LSTM_GATE_CELL  *H + j]);
+        const float go = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_OUTPUT*H + j]);
+
+        const float c_new = gf*c_prev[k] + gi*gg;
+
+        float * out = dst + n*GGML_LSTM_N_OUTS*H;
+
+        out[GGML_LSTM_OUT_H*H + j] = go*tanhf(c_new);
+        out[GGML_LSTM_OUT_C*H + j] = c_new;
+    }
+}
+
+void ggml_compute_forward_lstm_cell(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * gates  = dst->src[0];
+    const ggml_tensor * c_prev = dst->src[1];
+
+    GGML_ASSERT(gates->type  == GGML_TYPE_F32);
+    GGML_ASSERT(c_prev->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gates));
+    GGML_ASSERT(ggml_is_contiguous(c_prev));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t H     = c_prev->ne[0];
+    const int64_t total = H*c_prev->ne[1];
+
+    // Threads own disjoint bands of the flattened H*N grid.
+    const int64_t per   = (total + params->nth - 1) / params->nth;
+    const int64_t first = per*params->ith;
+    const int64_t last  = MIN(first + per, total);
+
+    ggml_lstm_cell_band_f32((const float *) gates->data, (const float *) c_prev->data,
+                            (float *) dst->data, H, first, last);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC pop_options
+#elif defined(_MSC_VER)
+#    pragma fp_contract(on)
+#endif
+
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {

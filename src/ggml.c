@@ -1091,9 +1091,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "AFFINE_PRELU",
     "COL2IM_1D",
     "SNAKE",
+    "LSTM_CELL",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1215,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "affine_prelu(x,aw,ab,slope)",
     "col2im_1d(x)",
     "snake(x,a,inv_b)",
+    "lstm_cell(gates,c)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5605,6 +5607,31 @@ struct ggml_tensor * ggml_snake(
     result->src[0] = x;
     result->src[1] = a;
     result->src[2] = inv_b;
+
+    return result;
+}
+
+// ggml_lstm_cell
+
+struct ggml_tensor * ggml_lstm_cell(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gates,
+        struct ggml_tensor  * c_prev) {
+    GGML_ASSERT(gates->type  == GGML_TYPE_F32);
+    GGML_ASSERT(c_prev->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gates));
+    GGML_ASSERT(ggml_is_contiguous(c_prev));
+    GGML_ASSERT(gates->ne[0] == GGML_LSTM_N_GATES*c_prev->ne[0]);
+    GGML_ASSERT(gates->ne[1] == c_prev->ne[1]);
+    GGML_ASSERT(gates->ne[2] == 1 && gates->ne[3] == 1);
+    GGML_ASSERT(c_prev->ne[2] == 1 && c_prev->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                     GGML_LSTM_N_OUTS*c_prev->ne[0], c_prev->ne[1]);
+
+    result->op     = GGML_OP_LSTM_CELL;
+    result->src[0] = gates;
+    result->src[1] = c_prev;
 
     return result;
 }

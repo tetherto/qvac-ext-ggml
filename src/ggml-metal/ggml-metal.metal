@@ -5097,6 +5097,59 @@ kernel void kernel_snake_f32(
     }
 }
 
+// Gate chunks along ne0 of the LSTM pre-activation tensor (PyTorch/NeMo order), and the
+// result chunks along ne0.  Mirrors enum ggml_lstm_gate / ggml_lstm_out in ggml-impl.h.
+constant uint LSTM_GATE_INPUT  = 0;
+constant uint LSTM_GATE_FORGET = 1;
+constant uint LSTM_GATE_CELL   = 2;
+constant uint LSTM_GATE_OUTPUT = 3;
+constant uint LSTM_N_GATES     = 4;
+constant uint LSTM_OUT_H       = 0;
+constant uint LSTM_OUT_C       = 1;
+constant uint LSTM_N_OUTS      = 2;
+
+// Fused LSTM cell, one [h_new, c_new] pair per thread over a flat H*N grid-stride loop.
+// sigmoid / tanh are spelled exactly as the unary kernels spell them.
+kernel void kernel_lstm_cell_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,  // [4H, N]
+        device const float * c_prev, // [H, N]
+        device       float * dst,    // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H     = (uint) args.H;
+    const uint total = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        device const float * g = gates + n * LSTM_N_GATES * H;
+
+        const float gi = 1 / (1 + exp(-g[LSTM_GATE_INPUT  * H + j]));
+        const float gf = 1 / (1 + exp(-g[LSTM_GATE_FORGET * H + j]));
+        const float gg = precise::tanh(g[LSTM_GATE_CELL   * H + j]);
+        const float go = 1 / (1 + exp(-g[LSTM_GATE_OUTPUT * H + j]));
+
+        // Metal compiles with fast math; the barrier stops the two products from
+        // contracting into an FMA, which the decomposed mul/mul/add graph cannot do.
+        float c_new;
+        {
+            #pragma clang fp contract(off)
+            c_new = gf * c_prev[k] + gi * gg;
+        }
+
+        device float * out = dst + n * LSTM_N_OUTS * H;
+
+        out[LSTM_OUT_H * H + j] = go * precise::tanh(c_new);
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
 
 typedef void (conv_transpose_2d_t)(
         constant ggml_metal_kargs_conv_transpose_2d & args,

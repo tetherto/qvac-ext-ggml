@@ -403,6 +403,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_snake(ctx, idx);
             } break;
+        case GGML_OP_LSTM_CELL:
+            {
+                n_fuse = ggml_metal_op_lstm_cell(ctx, idx);
+            } break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 n_fuse = ggml_metal_op_conv_transpose_2d(ctx, idx);
@@ -4051,6 +4055,39 @@ int ggml_metal_op_snake(ggml_metal_op_t ctx, int idx) {
     const int64_t N   = (int64_t) L * (int64_t) C;
     const int     nth = 256;
     int64_t ntg = (N + nth - 1) / nth;
+    if (ntg < 1)      ntg = 1;
+    if (ntg > 65535)  ntg = 65535;  // grid-stride covers the remainder
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_lstm_cell(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t H = (int32_t) op->src[1]->ne[0];
+    const int32_t N = (int32_t) op->src[1]->ne[1];
+
+    ggml_metal_kargs_lstm_cell args = {
+        /*.H =*/ H,
+        /*.N =*/ N,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_lstm_cell(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // gates
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // c_prev
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3); // h_new | c_new
+
+    // Flat 1D grid over H*N elements with a grid-stride loop for high occupancy.
+    const int64_t total = (int64_t) H * (int64_t) N;
+    const int     nth   = 256;
+    int64_t ntg = (total + nth - 1) / nth;
     if (ntg < 1)      ntg = 1;
     if (ntg > 65535)  ntg = 65535;  // grid-stride covers the remainder
     ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg, 1, 1, nth, 1, 1);

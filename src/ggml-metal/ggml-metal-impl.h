@@ -621,6 +621,13 @@ typedef struct {
     int32_t C; // channels (one a / inv_b per channel)
 } ggml_metal_kargs_snake;
 
+// fused LSTM cell: gates [4H, N] pre-activations (i | f | g | o along ne0),
+// c_prev [H, N], result [2H, N] with h_new above c_new.
+typedef struct {
+    int32_t H; // hidden size
+    int32_t N; // batch (columns)
+} ggml_metal_kargs_lstm_cell;
+
 typedef struct {
     int32_t  IC;
     int32_t  IH;
