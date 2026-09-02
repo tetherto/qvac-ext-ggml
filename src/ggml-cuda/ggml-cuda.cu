@@ -822,6 +822,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
 };
 
 static ggml_backend_dev_t ggml_backend_cuda_reg_find_device(int device);
+static int ggml_backend_cuda_dev_ordinal(ggml_backend_dev_t dev);
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
@@ -1289,50 +1290,78 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
 #endif // GGML_USE_NCCL
 }
 
+// Spread the caller's per-registered-device fractions onto raw CUDA ordinals,
+// leaving skipped devices as zero-width ranges, which every consumer already
+// treats as "no rows on this device" (get_row_rounding, nrows_split == 0). A
+// null or all-zero input splits by the registered devices' VRAM instead.
+static std::array<float, GGML_CUDA_MAX_DEVICES> ggml_cuda_build_tensor_split(const float * tensor_split, size_t reg_dev_count) {
+    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split_arr = {};
+    const int device_count = ggml_backend_cuda_get_device_count();
+    const std::array<float, GGML_CUDA_MAX_DEVICES> & default_split = ggml_cuda_info().default_tensor_split;
+
+    const bool by_vram = tensor_split == nullptr ||
+        std::all_of(tensor_split, tensor_split + reg_dev_count, [](float x) { return x == 0.0f; });
+
+    float split_sum = 0.0f;
+    size_t reg_index = 0;
+    for (int id = 0; id < device_count; ++id) {
+        tensor_split_arr[id] = split_sum;
+        if (ggml_backend_cuda_reg_find_device(id) == nullptr) {
+            continue;
+        }
+        if (by_vram) {
+            const float next = id + 1 < device_count ? default_split[id + 1] : 1.0f;
+            split_sum += next - default_split[id];
+        } else {
+            split_sum += tensor_split[reg_index];
+        }
+        ++reg_index;
+    }
+    for (int id = 0; id < device_count; ++id) {
+        tensor_split_arr[id] /= split_sum;
+    }
+    return tensor_split_arr;
+}
+
 ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, const float * tensor_split) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (ggml_backend_cuda_reg_find_device(main_device) == nullptr) {
-        GGML_LOG_ERROR("%s: device %d has no kernels compiled for its compute capability\n", __func__, main_device);
+    // Callers index this backend's registry (llama.cpp's make_gpu_buft_list
+    // passes the position of the device within its reg), which after skipping
+    // holds only the devices with compiled kernels; the split machinery below
+    // works in raw CUDA ordinals. Resolve the registered device and translate.
+    ggml_backend_reg_t reg = ggml_backend_cuda_reg();
+    const size_t reg_dev_count = ggml_backend_reg_dev_count(reg);
+    if (main_device < 0 || (size_t) main_device >= reg_dev_count) {
+        GGML_LOG_ERROR("%s: invalid device index %d (%zu CUDA devices registered)\n",
+                       __func__, main_device, reg_dev_count);
         return nullptr;
     }
+    ggml_backend_dev_t main_dev = ggml_backend_reg_dev_get(reg, main_device);
+    const int cuda_main_device = ggml_backend_cuda_dev_ordinal(main_dev);
 
     static std::map<std::pair<int, std::array<float, GGML_CUDA_MAX_DEVICES>>, struct ggml_backend_buffer_type> buft_map;
 
-    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split_arr = {};
+    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split_arr = ggml_cuda_build_tensor_split(tensor_split, reg_dev_count);
 
-    bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + GGML_CUDA_MAX_DEVICES, [](float x) { return x == 0.0f; });
-    if (all_zero) {
-        tensor_split_arr = ggml_cuda_info().default_tensor_split;
-    } else {
-        float split_sum = 0.0f;
-        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
-            tensor_split_arr[i] = split_sum;
-            split_sum += tensor_split[i];
-        }
-        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
-            tensor_split_arr[i] /= split_sum;
-        }
-    }
-
-    auto it = buft_map.find({main_device, tensor_split_arr});
+    auto it = buft_map.find({cuda_main_device, tensor_split_arr});
     if (it != buft_map.end()) {
         return &it->second;
     }
     auto * ctx = new ggml_backend_cuda_split_buffer_type_context{
-        main_device,
+        cuda_main_device,
         tensor_split_arr,
-        GGML_CUDA_NAME + std::to_string(main_device) + "_Split",
+        GGML_CUDA_NAME + std::to_string(cuda_main_device) + "_Split",
     };
 
     struct ggml_backend_buffer_type buft {
         /* .iface   = */ ggml_backend_cuda_split_buffer_type_interface,
-        /* .device  = */ ggml_backend_cuda_reg_find_device(main_device),
+        /* .device  = */ main_dev,
         /* .context = */ ctx,
     };
 
-    auto result = buft_map.emplace(std::make_pair(main_device, tensor_split_arr), buft);
+    auto result = buft_map.emplace(std::make_pair(cuda_main_device, tensor_split_arr), buft);
     return &result.first->second;
 }
 
@@ -5553,6 +5582,10 @@ static ggml_backend_dev_t ggml_backend_cuda_reg_find_device(int device) {
         }
     }
     return nullptr;
+}
+
+static int ggml_backend_cuda_dev_ordinal(ggml_backend_dev_t dev) {
+    return ((ggml_backend_cuda_device_context *) dev->context)->device;
 }
 
 ggml_backend_t ggml_backend_cuda_init(int device) {
