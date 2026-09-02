@@ -8458,6 +8458,83 @@ void ggml_compute_forward_lstm_cell(
 #    pragma fp_contract(on)
 #endif
 
+// ggml_compute_forward_tdt_step
+
+// Reference greedy transducer step control. Every backend kernel mirrors this
+// line by line; see ggml_tdt_step in ggml.h for the semantics.
+static void ggml_tdt_step_f32(
+        int32_t tok, int32_t dur_idx,
+        const float * state, const float * dur_table, int64_t n_dur,
+        int32_t blank_id, int32_t max_symbols, int32_t rnnt,
+        float * dst) {
+    const float t = state[GGML_TDT_STEP_IN_T];
+    const float s = state[GGML_TDT_STEP_IN_S];
+    const float n = state[GGML_TDT_STEP_IN_N];
+
+    float t_next = t;
+    float s_next = s;
+    float update = 0.0f;
+
+    if (t < n) {
+        const int64_t di  = dur_idx < 0 ? 0 : (dur_idx < n_dur ? dur_idx : n_dur - 1);
+        const float   dur = rnnt ? 0.0f : dur_table[di];
+        const float   adv = rnnt ? 1.0f : (dur > 1.0f ? dur : 1.0f);
+
+        if (tok == blank_id) {
+            t_next = t + adv;
+            s_next = 0.0f;
+        } else {
+            update = 1.0f;
+            s_next = s + 1.0f;
+            if ((!rnnt && dur > 0.0f) || s_next >= (float) max_symbols) {
+                t_next = t + adv;
+                s_next = 0.0f;
+            }
+        }
+    }
+
+    float frame = t_next > n - 1.0f ? n - 1.0f : t_next;
+    if (frame < 0.0f) {
+        frame = 0.0f;
+    }
+
+    dst[GGML_TDT_STEP_OUT_T]      = t_next;
+    dst[GGML_TDT_STEP_OUT_S]      = s_next;
+    dst[GGML_TDT_STEP_OUT_N]      = n;
+    dst[GGML_TDT_STEP_OUT_UPDATE] = update;
+    dst[GGML_TDT_STEP_OUT_HOLD]   = 1.0f - update;
+    dst[GGML_TDT_STEP_OUT_FRAME]  = frame;
+}
+
+void ggml_compute_forward_tdt_step(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * token     = dst->src[0];
+    const ggml_tensor * dur_idx   = dst->src[1];
+    const ggml_tensor * state     = dst->src[2];
+    const ggml_tensor * dur_table = dst->src[3];
+
+    GGML_ASSERT(token->type     == GGML_TYPE_I32);
+    GGML_ASSERT(dur_idx->type   == GGML_TYPE_I32);
+    GGML_ASSERT(state->type     == GGML_TYPE_F32);
+    GGML_ASSERT(dur_table->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(dst) == GGML_TDT_STEP_N_OUTS);
+
+    int32_t op_params[3];
+    memcpy(op_params, dst->op_params, sizeof(op_params));
+
+    ggml_tdt_step_f32(*(const int32_t *) token->data, *(const int32_t *) dur_idx->data,
+                      (const float *) state->data, (const float *) dur_table->data,
+                      ggml_nelements(dur_table),
+                      op_params[0], op_params[1], op_params[2],
+                      (float *) dst->data);
+}
+
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {

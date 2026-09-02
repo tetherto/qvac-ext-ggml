@@ -628,7 +628,33 @@ extern "C" {
         // the new cell and hidden state as one op.
         GGML_OP_LSTM_CELL,
 
+        // Greedy transducer (RNN-T / TDT) step control: turns one decoded
+        // (token, duration index) pair into the next loop counters and the
+        // 0/1 mask that says whether the step's predictor update is kept.
+        GGML_OP_TDT_STEP,
+
         GGML_OP_COUNT,
+    };
+
+    // GGML_OP_TDT_STEP loop counters along ne0 of the F32 state vector. The
+    // result repeats this layout in its first GGML_TDT_STEP_N_INS slots, so a
+    // view of the result feeds the next step directly.
+    enum ggml_tdt_step_in {
+        GGML_TDT_STEP_IN_T  = 0,  // encoder frame the step reads
+        GGML_TDT_STEP_IN_S  = 1,  // symbols already emitted at that frame
+        GGML_TDT_STEP_IN_N  = 2,  // frames in the window
+        GGML_TDT_STEP_N_INS = 3,
+    };
+
+    // GGML_OP_TDT_STEP result layout along ne0, all integer-valued F32.
+    enum ggml_tdt_step_out {
+        GGML_TDT_STEP_OUT_T      = GGML_TDT_STEP_IN_T,
+        GGML_TDT_STEP_OUT_S      = GGML_TDT_STEP_IN_S,
+        GGML_TDT_STEP_OUT_N      = GGML_TDT_STEP_IN_N,
+        GGML_TDT_STEP_OUT_UPDATE = 3,  // 1.0 when the step's predictor update is kept
+        GGML_TDT_STEP_OUT_HOLD   = 4,  // 1.0 - update
+        GGML_TDT_STEP_OUT_FRAME  = 5,  // next frame index, clamped to [0, n_frames)
+        GGML_TDT_STEP_N_OUTS     = 6,
     };
 
     enum ggml_unary_op {
@@ -2561,6 +2587,25 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
             struct ggml_tensor  * c_prev); // [H, N] previous cell state, F32
+
+    // one greedy transducer step, run entirely on the backend so K steps can be
+    // unrolled into a single graph. With t = state[T], s = state[S], n = state[N]
+    // and dur = dur_table[dur_idx]:
+    //   t >= n            -> update = 0, counters unchanged (the step is a no-op)
+    //   token == blank_id -> update = 0, t += rnnt ? 1 : max(1, dur), s = 0
+    //   otherwise         -> update = 1, s += 1, and when (!rnnt && dur > 0) or
+    //                        s >= max_symbols_per_step: t += rnnt ? 1 : max(1, dur), s = 0
+    // rnnt != 0 ignores dur_idx / dur_table and advances t by one frame.
+    // All values are integers held exactly in F32.
+    GGML_API struct ggml_tensor * ggml_tdt_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * token,      // I32 [1] argmax over the vocabulary
+            struct ggml_tensor  * dur_idx,    // I32 [1] argmax over the duration head
+            struct ggml_tensor  * state,      // F32 [GGML_TDT_STEP_N_INS] loop counters
+            struct ggml_tensor  * dur_table,  // F32 [D] frame advance per duration index
+            int                   blank_id,
+            int                   max_symbols_per_step,
+            int                   rnnt);
 
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.

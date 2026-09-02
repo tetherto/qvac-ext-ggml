@@ -5173,6 +5173,66 @@ kernel void kernel_lstm_cell_f32(
 }
 
 
+// Result slots along ne0.  Mirrors enum ggml_tdt_step_in / ggml_tdt_step_out in ggml.h.
+constant uint TDT_STEP_IN_T      = 0;
+constant uint TDT_STEP_IN_S      = 1;
+constant uint TDT_STEP_IN_N      = 2;
+constant uint TDT_STEP_OUT_T     = 0;
+constant uint TDT_STEP_OUT_S     = 1;
+constant uint TDT_STEP_OUT_N     = 2;
+constant uint TDT_STEP_OUT_UPD   = 3;
+constant uint TDT_STEP_OUT_HOLD  = 4;
+constant uint TDT_STEP_OUT_FRAME = 5;
+
+// Greedy transducer step control, mirroring ggml_tdt_step_f32 in ggml-cpu/ops.cpp.
+kernel void kernel_tdt_step_f32(
+        constant ggml_metal_kargs_tdt_step & args,
+        device const int   * token,
+        device const int   * dur_idx,
+        device const float * state,
+        device const float * dur_table,
+        device       float * dst) {
+    const float t = state[TDT_STEP_IN_T];
+    const float s = state[TDT_STEP_IN_S];
+    const float n = state[TDT_STEP_IN_N];
+
+    float t_next = t;
+    float s_next = s;
+    float update = 0.0f;
+
+    if (t < n) {
+        const int   raw = dur_idx[0];
+        const int   di  = raw < 0 ? 0 : (raw < args.n_dur ? raw : args.n_dur - 1);
+        const float dur = args.rnnt ? 0.0f : dur_table[di];
+        const float adv = args.rnnt ? 1.0f : (dur > 1.0f ? dur : 1.0f);
+
+        if (token[0] == args.blank_id) {
+            t_next = t + adv;
+            s_next = 0.0f;
+        } else {
+            update = 1.0f;
+            s_next = s + 1.0f;
+            if ((args.rnnt == 0 && dur > 0.0f) || s_next >= (float) args.max_symbols) {
+                t_next = t + adv;
+                s_next = 0.0f;
+            }
+        }
+    }
+
+    float frame = t_next > n - 1.0f ? n - 1.0f : t_next;
+    if (frame < 0.0f) {
+        frame = 0.0f;
+    }
+
+    dst[TDT_STEP_OUT_T]     = t_next;
+    dst[TDT_STEP_OUT_S]     = s_next;
+    dst[TDT_STEP_OUT_N]     = n;
+    dst[TDT_STEP_OUT_UPD]   = update;
+    dst[TDT_STEP_OUT_HOLD]  = 1.0f - update;
+    dst[TDT_STEP_OUT_FRAME] = frame;
+}
+
+
 typedef void (conv_transpose_2d_t)(
         constant ggml_metal_kargs_conv_transpose_2d & args,
         device const float * src0,

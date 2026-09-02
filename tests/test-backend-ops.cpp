@@ -3859,6 +3859,61 @@ struct test_lstm_cell : public test_case {
     }
 };
 
+// GGML_OP_TDT_STEP
+struct test_tdt_step : public test_case {
+    const int tok;
+    const int dur_idx;
+    const int t;
+    const int s;
+    const int n_frames;
+    const int blank_id;
+    const int max_symbols;
+    const int rnnt;
+
+    // Duration table of the released TDT models, plus the identity table the
+    // engine passes when the GGUF carries no explicit durations.
+    static std::vector<float> durations(int rnnt) {
+        return rnnt ? std::vector<float>{ 0.0f } : std::vector<float>{ 0.0f, 1.0f, 2.0f, 3.0f, 4.0f };
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(tok, dur_idx, t, s, n_frames, blank_id, max_symbols, rnnt);
+    }
+
+    test_tdt_step(int tok = 0, int dur_idx = 0, int t = 0, int s = 0, int n_frames = 8,
+                  int blank_id = 1024, int max_symbols = 10, int rnnt = 0)
+        : tok(tok), dur_idx(dur_idx), t(t), s(s), n_frames(n_frames),
+          blank_id(blank_id), max_symbols(max_symbols), rnnt(rnnt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * dur   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, GGML_TDT_STEP_N_INS);
+        ggml_tensor * table = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) durations(rnnt).size());
+        ggml_set_name(token, "token");
+        ggml_set_name(dur,   "dur_idx");
+        ggml_set_name(state, "state");
+        ggml_set_name(table, "dur_table");
+        return ggml_tdt_step(ctx, token, dur, state, table, blank_id, max_symbols, rnnt);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const std::vector<float> table = durations(rnnt);
+        const std::vector<float> state = { (float) t, (float) s, (float) n_frames };
+        for (ggml_tensor * v = ggml_get_first_tensor(ctx); v != NULL; v = ggml_get_next_tensor(ctx, v)) {
+            if (std::string(v->name) == "token") {
+                ggml_backend_tensor_set(v, &tok, 0, sizeof(int));
+            } else if (std::string(v->name) == "dur_idx") {
+                ggml_backend_tensor_set(v, &dur_idx, 0, sizeof(int));
+            } else if (std::string(v->name) == "state") {
+                ggml_backend_tensor_set(v, state.data(), 0, state.size()*sizeof(float));
+            } else if (std::string(v->name) == "dur_table") {
+                ggml_backend_tensor_set(v, table.data(), 0, table.size()*sizeof(float));
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -8643,6 +8698,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lstm_cell(h, n));
         }
     }
+
+    // blank, token with dur 0, token with dur > 0, the max_symbols forced advance,
+    // t past the end of the window, and the RNN-T variant (no duration head).
+    test_cases.emplace_back(new test_tdt_step(1024, 2, 3, 0, 8));
+    test_cases.emplace_back(new test_tdt_step(1024, 0, 3, 0, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    0, 3, 0, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    4, 3, 2, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    0, 3, 9, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    0, 8, 1, 8));
+    test_cases.emplace_back(new test_tdt_step(1024, 0, 7, 0, 8));
+    test_cases.emplace_back(new test_tdt_step(7,    0, 3, 0, 8, 1024, 10, 1));
+    test_cases.emplace_back(new test_tdt_step(1024, 0, 3, 0, 8, 1024, 10, 1));
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
