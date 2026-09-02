@@ -1840,11 +1840,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lstm_cell(ggml_m
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->type         == GGML_TYPE_F32);
+    if (op->src[2]) {
+        GGML_ASSERT(ggml_is_contiguous(op->src[2]));
+        GGML_ASSERT(op->src[2]->type == GGML_TYPE_F32);
+    }
 
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_lstm_cell_%s", ggml_type_name(op->type));
+    if (op->src[2]) {
+        snprintf(base, 256, "kernel_lstm_cell_masked_%s", ggml_type_name(op->type));
+    } else {
+        snprintf(base, 256, "kernel_lstm_cell_%s", ggml_type_name(op->type));
+    }
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

@@ -631,10 +631,14 @@ typedef struct {
 } ggml_metal_kargs_snake;
 
 // fused LSTM cell: gates [4H, N] pre-activations (i | f | g | o along ne0),
-// c_prev [H, N], result [2H, N] with h_new above c_new.
+// previous state [H, N] (c_prev) or [2H, N] (h | c, masked form), result [2H, N]
+// with h_new above c_new.
 typedef struct {
-    int32_t H; // hidden size
-    int32_t N; // batch (columns)
+    int32_t H;           // hidden size
+    int32_t N;           // batch (columns)
+    int32_t prev_row;    // elements per column of the previous state: H, or 2H when masked
+    int32_t c_base;      // where c starts inside a previous-state column
+    int32_t mask_stride; // 0 broadcasts a single mask entry over every column
 } ggml_metal_kargs_lstm_cell;
 
 // greedy transducer step control: one [GGML_TDT_STEP_N_OUTS] f32 result.

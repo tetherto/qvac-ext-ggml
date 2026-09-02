@@ -8399,16 +8399,27 @@ static float ggml_lstm_cell_sigmoid_f32(float x) {
     return 1.f / (1.f + expf(-x));
 }
 
-// One [h_new | c_new] pair per index of the flattened H*N grid.
+// One [h_new | c_new] pair per index of the flattened H*N grid. A column whose
+// mask entry is zero copies its previous pair instead of computing a fresh one.
 static void ggml_lstm_cell_band_f32(
-        const float * gates, const float * c_prev, float * dst,
-        int64_t H, int64_t first, int64_t last) {
+        const float * gates, const float * prev, const float * mask, float * dst,
+        int64_t H, int64_t prev_row, int64_t c_base, int64_t mask_stride,
+        int64_t first, int64_t last) {
 #if defined(__clang__)
     #pragma clang fp contract(off)
 #endif
     for (int64_t k = first; k < last; k++) {
         const int64_t n = k / H;
         const int64_t j = k - n*H;
+
+        const float * p   = prev + n*prev_row;
+        float       * out = dst  + n*GGML_LSTM_N_OUTS*H;
+
+        if (mask && mask[n*mask_stride] == 0.f) {
+            out[GGML_LSTM_OUT_H*H + j] = p[j];
+            out[GGML_LSTM_OUT_C*H + j] = p[c_base + j];
+            continue;
+        }
 
         const float * g = gates + n*GGML_LSTM_N_GATES*H;
 
@@ -8417,9 +8428,7 @@ static void ggml_lstm_cell_band_f32(
         const float gg =                      tanhf(g[GGML_LSTM_GATE_CELL  *H + j]);
         const float go = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_OUTPUT*H + j]);
 
-        const float c_new = gf*c_prev[k] + gi*gg;
-
-        float * out = dst + n*GGML_LSTM_N_OUTS*H;
+        const float c_new = gf*p[c_base + j] + gi*gg;
 
         out[GGML_LSTM_OUT_H*H + j] = go*tanhf(c_new);
         out[GGML_LSTM_OUT_C*H + j] = c_new;
@@ -8430,26 +8439,32 @@ void ggml_compute_forward_lstm_cell(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
 
-    const ggml_tensor * gates  = dst->src[0];
-    const ggml_tensor * c_prev = dst->src[1];
+    const ggml_tensor * gates = dst->src[0];
+    const ggml_tensor * prev  = dst->src[1];
+    const ggml_tensor * mask  = dst->src[2];
 
-    GGML_ASSERT(gates->type  == GGML_TYPE_F32);
-    GGML_ASSERT(c_prev->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
+    GGML_ASSERT(gates->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(gates));
-    GGML_ASSERT(ggml_is_contiguous(c_prev));
+    GGML_ASSERT(ggml_is_contiguous(prev));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
-    const int64_t H     = c_prev->ne[0];
-    const int64_t total = H*c_prev->ne[1];
+    // Unmasked: prev is c_prev [H, N]. Masked: prev is hc_prev [2H, N] and c
+    // starts half a row in.
+    const int64_t H      = dst->ne[0]/GGML_LSTM_N_OUTS;
+    const int64_t c_base = mask ? H : 0;
+    const int64_t total  = H*prev->ne[1];
 
     // Threads own disjoint bands of the flattened H*N grid.
     const int64_t per   = (total + params->nth - 1) / params->nth;
     const int64_t first = per*params->ith;
     const int64_t last  = MIN(first + per, total);
 
-    ggml_lstm_cell_band_f32((const float *) gates->data, (const float *) c_prev->data,
-                            (float *) dst->data, H, first, last);
+    ggml_lstm_cell_band_f32((const float *) gates->data, (const float *) prev->data,
+                            mask ? (const float *) mask->data : NULL, (float *) dst->data,
+                            H, prev->ne[0], c_base,
+                            (mask && ggml_nelements(mask) > 1) ? 1 : 0, first, last);
 }
 
 #if defined(__GNUC__) && !defined(__clang__)

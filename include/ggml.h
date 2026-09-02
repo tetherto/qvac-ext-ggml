@@ -2588,6 +2588,15 @@ extern "C" {
             struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
             struct ggml_tensor  * c_prev); // [H, N] previous cell state, F32
 
+    // Same cell over a packed [h | c] previous state, selected per column: a column
+    // whose mask entry is non-zero takes the fresh pair, the rest copy hc_prev bit
+    // for bit (a select, so a held column is exact even for non-finite values).
+    GGML_API struct ggml_tensor * ggml_lstm_cell_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
+            struct ggml_tensor  * hc_prev, // [2H, N] previous h | c, F32
+            struct ggml_tensor  * mask);   // [N] or [1] F32
+
     // one greedy transducer step, run entirely on the backend so K steps can be
     // unrolled into a single graph. With t = state[T], s = state[S], n = state[N]
     // and dur = dur_table[dur_idx]:

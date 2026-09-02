@@ -3859,6 +3859,42 @@ struct test_lstm_cell : public test_case {
     }
 };
 
+// GGML_OP_LSTM_CELL, masked form over a packed [h | c] previous state
+struct test_lstm_cell_masked : public test_case {
+    const int64_t h;      // hidden size
+    const int64_t n;      // batch (columns)
+    const float mask_val; // 0 holds the previous pair, non-zero takes the fresh one
+    const bool broadcast; // one mask entry for every column instead of one each
+
+    std::string vars() override {
+        return VARS_TO_STR4(h, n, mask_val, broadcast);
+    }
+
+    test_lstm_cell_masked(int64_t h = 32, int64_t n = 1, float mask_val = 1.0f, bool broadcast = false)
+        : h(h), n(n), mask_val(mask_val), broadcast(broadcast) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gates   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*h, n);
+        ggml_tensor * hc_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*h, n);
+        ggml_tensor * mask    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, broadcast ? 1 : n);
+        ggml_set_name(gates,   "gates");
+        ggml_set_name(hc_prev, "hc_prev");
+        ggml_set_name(mask,    "mask");
+        return ggml_lstm_cell_masked(ctx, gates, hc_prev, mask);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(t->name) == "mask") {
+                std::vector<float> m((size_t) ggml_nelements(t), mask_val);
+                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_TDT_STEP
 struct test_tdt_step : public test_case {
     const int tok;
@@ -8696,6 +8732,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t h : {32, 640}) {
         for (int64_t n : {1, 5}) {
             test_cases.emplace_back(new test_lstm_cell(h, n));
+        }
+    }
+
+    for (int64_t h : {32, 640}) {
+        for (int64_t n : {1, 4}) {
+            for (float mask_val : {0.0f, 1.0f}) {
+                for (bool broadcast : {false, true}) {
+                    test_cases.emplace_back(new test_lstm_cell_masked(h, n, mask_val, broadcast));
+                }
+            }
         }
     }
 
