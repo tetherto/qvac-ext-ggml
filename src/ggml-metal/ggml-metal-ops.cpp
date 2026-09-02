@@ -1882,16 +1882,83 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+enum ggml_metal_cpy_path {
+    GGML_METAL_CPY_PATH_GENERIC,
+    GGML_METAL_CPY_PATH_ROWS,
+    GGML_METAL_CPY_PATH_TRANSPOSE,
+};
+
+static bool ggml_metal_op_cpy_is_fast_type(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16;
+}
+
+// the fast paths need a contiguous dst of the same shape - the src strides then say which one fits
+static ggml_metal_cpy_path ggml_metal_op_cpy_select_path(const ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+
+    if (!ggml_metal_op_cpy_is_fast_type(src0->type) || !ggml_metal_op_cpy_is_fast_type(op->type)) {
+        return GGML_METAL_CPY_PATH_GENERIC;
+    }
+
+    if (!ggml_is_contiguous(op) || !ggml_are_same_shape(src0, op)) {
+        return GGML_METAL_CPY_PATH_GENERIC;
+    }
+
+    const size_t ts = ggml_type_size(src0->type);
+
+    if (src0->nb[0] == ts) {
+        return GGML_METAL_CPY_PATH_ROWS;
+    }
+
+    if (src0->nb[1] == ts) {
+        return GGML_METAL_CPY_PATH_TRANSPOSE;
+    }
+
+    return GGML_METAL_CPY_PATH_GENERIC;
+}
+
+static ggml_metal_kargs_cpy ggml_metal_op_cpy_make_args(const ggml_tensor * op, int64_t nk0) {
+    const ggml_tensor * src0 = op->src[0];
+
+    return {
+        /*.nk0  =*/ nk0,
+        /*.ne00 =*/ src0->ne[0],
+        /*.ne01 =*/ src0->ne[1],
+        /*.ne02 =*/ src0->ne[2],
+        /*.ne03 =*/ src0->ne[3],
+        /*.nb00 =*/ src0->nb[0],
+        /*.nb01 =*/ src0->nb[1],
+        /*.nb02 =*/ src0->nb[2],
+        /*.nb03 =*/ src0->nb[3],
+        /*.ne0  =*/ op->ne[0],
+        /*.ne1  =*/ op->ne[1],
+        /*.ne2  =*/ op->ne[2],
+        /*.ne3  =*/ op->ne[3],
+        /*.nb0  =*/ op->nb[0],
+        /*.nb1  =*/ op->nb[1],
+        /*.nb2  =*/ op->nb[2],
+        /*.nb3  =*/ op->nb[3],
+    };
+}
+
+static void ggml_metal_op_cpy_encode(
+        ggml_metal_encoder_t enc,
+        ggml_metal_pipeline_with_params pipeline,
+        const ggml_tensor * op,
+        ggml_metal_kargs_cpy & args) {
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+}
+
+static int ggml_metal_op_cpy_generic(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
-    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
-    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
     auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
 
@@ -1923,36 +1990,79 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
 
     nth = std::min<int>(nth, nk0);
 
-    ggml_metal_kargs_cpy args = {
-        /*.nk0  =*/ nk0,
-        /*.ne00 =*/ ne00,
-        /*.ne01 =*/ ne01,
-        /*.ne02 =*/ ne02,
-        /*.ne03 =*/ ne03,
-        /*.nb00 =*/ nb00,
-        /*.nb01 =*/ nb01,
-        /*.nb02 =*/ nb02,
-        /*.nb03 =*/ nb03,
-        /*.ne0  =*/ ne0,
-        /*.ne1  =*/ ne1,
-        /*.ne2  =*/ ne2,
-        /*.ne3  =*/ ne3,
-        /*.nb0  =*/ nb0,
-        /*.nb1  =*/ nb1,
-        /*.nb2  =*/ nb2,
-        /*.nb3  =*/ nb3,
-    };
+    ggml_metal_kargs_cpy args = ggml_metal_op_cpy_make_args(op, nk0);
 
     const int nw0 = nrptg == 1 ? (nk0 + nth - 1)/nth : 1;
 
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+    ggml_metal_op_cpy_encode(enc, pipeline, op, args);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nw0*(ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
 
     return 1;
+}
+
+static int ggml_metal_op_cpy_rows(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+
+    auto pipeline = ggml_metal_library_get_pipeline_cpy_rows(lib, op->src[0]->type, op->type);
+
+    const int64_t nk0 = (ne00 + N_CPY_ROW - 1)/N_CPY_ROW;
+
+    const int max_nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+
+    const int nth   = std::min<int>(nk0, max_nth);
+    const int nrptg = std::min<int>(std::max(1, max_nth/nth), ne01);
+
+    const int nw0 = nrptg == 1 ? (nk0 + nth - 1)/nth : 1;
+
+    ggml_metal_kargs_cpy args = ggml_metal_op_cpy_make_args(op, nk0);
+
+    ggml_metal_op_cpy_encode(enc, pipeline, op, args);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, nw0*((ne01 + nrptg - 1)/nrptg), ne02, ne03, nth, nrptg, 1);
+
+    return 1;
+}
+
+static int ggml_metal_op_cpy_transpose(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+
+    auto pipeline = ggml_metal_library_get_pipeline_cpy_transpose(lib, op->src[0]->type, op->type);
+
+    if (ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < SZ_CPY_TRANSPOSE*N_CPY_TRANSPOSE_ROWS) {
+        return ggml_metal_op_cpy_generic(ctx, idx);
+    }
+
+    ggml_metal_kargs_cpy args = ggml_metal_op_cpy_make_args(op, ne00);
+
+    ggml_metal_op_cpy_encode(enc, pipeline, op, args);
+
+    const int nblk0 = (ne00 + SZ_CPY_TRANSPOSE - 1)/SZ_CPY_TRANSPOSE;
+    const int nblk1 = (ne01 + SZ_CPY_TRANSPOSE - 1)/SZ_CPY_TRANSPOSE;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, ne02*ne03, SZ_CPY_TRANSPOSE, N_CPY_TRANSPOSE_ROWS, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+    switch (ggml_metal_op_cpy_select_path(ctx->node(idx))) {
+        case GGML_METAL_CPY_PATH_ROWS:      return ggml_metal_op_cpy_rows     (ctx, idx);
+        case GGML_METAL_CPY_PATH_TRANSPOSE: return ggml_metal_op_cpy_transpose(ctx, idx);
+        case GGML_METAL_CPY_PATH_GENERIC:   break;
+    }
+
+    return ggml_metal_op_cpy_generic(ctx, idx);
 }
 
 int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) {

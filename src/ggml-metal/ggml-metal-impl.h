@@ -145,6 +145,15 @@
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
 
+// kernel parameters for the cpy fast paths
+//
+// N_CPY_ROW: elements copied per thread when the src rows are contiguous
+// SZ_CPY_TRANSPOSE / N_CPY_TRANSPOSE_ROWS: tile side and tile rows per thread pass of the transpose
+
+#define N_CPY_ROW             8
+#define SZ_CPY_TRANSPOSE      32
+#define N_CPY_TRANSPOSE_ROWS  8
+
 // kernel argument structs
 //
 // - element counters (e.g. ne00) typically use int32_t to reduce register usage

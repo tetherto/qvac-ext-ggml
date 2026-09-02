@@ -8018,6 +8018,120 @@ template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
 #endif
 
+template<typename T0, typename T1>
+kernel void kernel_cpy_rows_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int ne00 = args.ne00;
+    const int ne01 = args.ne01;
+    const int nk0  = args.nk0;
+
+    const int i03 = tgpig[2];
+    const int i02 = tgpig[1];
+    const int i01 = ntg[1] == 1 ? (int) tgpig[0]%ne01 : (int) tgpig[0]*ntg[1] + tiitg/ntg[0];
+    const int iw0 = ntg[1] == 1 ? (int) tgpig[0]/ne01 : 0;
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    device const T0 * src_row = (device const T0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device       T1 * dst_row = (device       T1 *)(dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    const int i0 = iw0*ntg[0] + tiitg%ntg[0];
+
+    for (short k = 0; k < N_CPY_ROW; ++k) {
+        const int i00 = i0 + k*nk0;
+
+        if (i00 < ne00) {
+            dst_row[i00] = (T1) src_row[i00];
+        }
+    }
+}
+
+typedef decltype(kernel_cpy_rows_t_t<float, float>) kernel_cpy_rows_t;
+
+template [[host_name("kernel_cpy_rows_f32_f32")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<float, float>;
+template [[host_name("kernel_cpy_rows_f32_f16")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<float, half>;
+template [[host_name("kernel_cpy_rows_f16_f32")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<half,  float>;
+template [[host_name("kernel_cpy_rows_f16_f16")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<half,  half>;
+
+// the src rows run along ne01, so read the tile along ne01 and write it back along ne00 - both coalesced
+template<typename T0, typename T1>
+static void cpy_transpose_load(
+        constant ggml_metal_kargs_cpy & args,
+        device const char * src_base,
+        threadgroup T1 (&tile)[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1],
+        int i00_0,
+        int i01_0,
+        ushort2 tpitg) {
+    for (ushort k = 0; k < SZ_CPY_TRANSPOSE; k += N_CPY_TRANSPOSE_ROWS) {
+        const int i00 = i00_0 + tpitg.y + k;
+        const int i01 = i01_0 + tpitg.x;
+
+        if (i00 < args.ne00 && i01 < args.ne01) {
+            device const T0 * src = (device const T0 *)(src_base + i00*args.nb00 + i01*args.nb01);
+
+            tile[tpitg.y + k][tpitg.x] = (T1) *src;
+        }
+    }
+}
+
+template<typename T1>
+static void cpy_transpose_store(
+        constant ggml_metal_kargs_cpy & args,
+        device char * dst_base,
+        threadgroup const T1 (&tile)[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1],
+        int i00_0,
+        int i01_0,
+        ushort2 tpitg) {
+    for (ushort k = 0; k < SZ_CPY_TRANSPOSE; k += N_CPY_TRANSPOSE_ROWS) {
+        const int i00 = i00_0 + tpitg.x;
+        const int i01 = i01_0 + tpitg.y + k;
+
+        if (i00 < args.ne00 && i01 < args.ne01) {
+            device T1 * dst_row = (device T1 *)(dst_base + i01*args.nb1);
+
+            dst_row[i00] = tile[tpitg.x][tpitg.y + k];
+        }
+    }
+}
+
+template<typename T0, typename T1>
+kernel void kernel_cpy_transpose_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup T1 tile[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1];
+
+    const int ne02 = args.ne02;
+
+    const int i03 = (int) tgpig[2]/ne02;
+    const int i02 = (int) tgpig[2]%ne02;
+
+    const int i00_0 = (int) tgpig[0]*SZ_CPY_TRANSPOSE;
+    const int i01_0 = (int) tgpig[1]*SZ_CPY_TRANSPOSE;
+
+    cpy_transpose_load<T0, T1>(args, src0 + i03*args.nb03 + i02*args.nb02, tile, i00_0, i01_0, tpitg.xy);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    cpy_transpose_store<T1>(args, dst + i03*args.nb3 + i02*args.nb2, tile, i00_0, i01_0, tpitg.xy);
+}
+
+typedef decltype(kernel_cpy_transpose_t_t<float, float>) kernel_cpy_transpose_t;
+
+template [[host_name("kernel_cpy_transpose_f32_f32")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<float, float>;
+template [[host_name("kernel_cpy_transpose_f32_f16")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<float, half>;
+template [[host_name("kernel_cpy_transpose_f16_f32")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<half,  float>;
+template [[host_name("kernel_cpy_transpose_f16_f16")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<half,  half>;
+
 template<short QK,
          typename block_q,
          void (*quantize_func)(device const float *, device block_q &)>

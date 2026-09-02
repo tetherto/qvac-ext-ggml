@@ -2938,6 +2938,48 @@ struct test_cpy : public test_case {
     }
 };
 
+// GGML_OP_CPY from a row-contiguous view whose rows are padded in the source
+struct test_cpy_view : public test_case {
+    const ggml_type type_src;
+    const ggml_type type_dst;
+    const std::array<int64_t, 4> ne;
+    const int64_t pad0;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_src, type_dst, ne, pad0);
+    }
+
+    double max_nmse_err() override {
+        return type_src == type_dst ? 0.0 : 1e-6;
+    }
+
+    size_t op_size(ggml_tensor * t) override {
+        return ggml_nbytes(t) + ggml_nbytes(t->src[0]);
+    }
+
+    test_cpy_view(ggml_type type_src = GGML_TYPE_F32, ggml_type type_dst = GGML_TYPE_F16,
+            std::array<int64_t, 4> ne = {10, 10, 10, 1},
+            int64_t pad0 = 1)
+        : type_src(type_src), type_dst(type_dst), ne(ne), pad0(pad0) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * base = ggml_new_tensor_4d(ctx, type_src, ne[0] + pad0, ne[1], ne[2], ne[3]);
+        ggml_set_name(base, "base");
+
+        ggml_tensor * src = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3],
+            base->nb[1], base->nb[2], base->nb[3], 0);
+        ggml_set_name(src, "src_view");
+
+        ggml_tensor * dst = ggml_new_tensor(ctx, type_dst, 4, src->ne);
+        ggml_set_name(dst, "dst");
+
+        ggml_tensor * out = ggml_cpy(ctx, src, dst);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_CONT
 struct test_cont : public test_case {
     const ggml_type type;
@@ -8348,6 +8390,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 1, 4, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 1, 4, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
 
+    for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int64_t pad0 : { 1, 3, 374 }) {
+            test_cases.emplace_back(new test_cpy_view(GGML_TYPE_F32, type_dst, {37, 11, 3, 2}, pad0));
+            test_cases.emplace_back(new test_cpy_view(GGML_TYPE_F16, type_dst, {37, 11, 3, 2}, pad0));
+        }
+    }
+
     for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         for (bool use_view_slice : { true, false }) {
             for (std::array<int64_t, 4> ne : std::initializer_list<std::array<int64_t, 4>>{ {2, 1, 1, 1}, {2, 1, 3, 5},
@@ -9545,6 +9594,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768*1024, 256, 1, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768, 1024, 256, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {768, 1024, 256, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
+
+    // conv2d permute+cont and the strided f32->f16 views seen in speech encoders
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {64, 1501, 256, 1}, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {32,  751, 256, 1}, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_cpy_view(GGML_TYPE_F32, GGML_TYPE_F16, {376, 376, 8, 1}, 374));
+
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {2048, 2048, 8, 1}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, {2048, 2048, 8, 1}));
 
 
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4096, 4096, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
