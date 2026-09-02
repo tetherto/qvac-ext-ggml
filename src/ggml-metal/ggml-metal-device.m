@@ -1146,10 +1146,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D_DW:
-            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
-                op->src[1]->type == GGML_TYPE_F32 &&
-                op->type == GGML_TYPE_F32 &&
-                (ggml_is_contiguous(op->src[1]) || ggml_is_contiguous_channels(op->src[1]));
+            if (op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_F32) return false;
+            if (op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+            if (ggml_is_contiguous(op->src[1])) return true;
+            // Channel-contiguous input: the kernel is read channel-contiguous too, as on CPU.
+            return ggml_is_contiguous_channels(op->src[1]) &&
+                op->src[0]->nb[0] >= op->src[0]->nb[2] && op->src[0]->nb[1] >= op->src[0]->nb[0];
         case GGML_OP_CONV_3D:
             return ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]) &&
