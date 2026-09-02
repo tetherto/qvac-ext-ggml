@@ -575,16 +575,17 @@ static void ggml_cuda_op_norm_epilogue(ggml_backend_cuda_context & ctx,
                           mul, add_src ? &add : nullptr, ctx.stream());
 }
 
-void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
-    ggml_cuda_op_norm_epilogue(ctx, dst, mul_tensor, norm_epilogue_src(mul_tensor, dst), nullptr);
+// norm is the NORM node, mul the MUL that consumes it, dst the node whose buffer receives the result.
+void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * dst) {
+    ggml_cuda_op_norm_epilogue(ctx, norm, dst, norm_epilogue_src(dst, norm), nullptr);
 }
 
 void ggml_cuda_op_norm_fused_add(ggml_backend_cuda_context & ctx,
-                                 ggml_tensor *               dst,
-                                 ggml_tensor *               mul_tensor,
-                                 ggml_tensor *               add_tensor) {
-    ggml_cuda_op_norm_epilogue(ctx, dst, add_tensor, norm_epilogue_src(mul_tensor, dst),
-                               norm_epilogue_src(add_tensor, mul_tensor));
+                                 ggml_tensor *               norm,
+                                 ggml_tensor *               mul,
+                                 ggml_tensor *               dst) {
+    ggml_cuda_op_norm_epilogue(ctx, norm, dst, norm_epilogue_src(mul, norm),
+                               norm_epilogue_src(dst, mul));
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
