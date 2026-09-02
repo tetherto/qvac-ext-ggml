@@ -4075,8 +4075,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     }
 }
 
-// Widest tile with the fewest column tiles. Narrower tiles reuse the loaded x data less often, so
-// avoid_k_split restricts the search to those that in exchange do not have to split K.
+// Narrowest tile that still reaches the fewest column tiles. Narrower tiles reuse the loaded x data
+// less often, so avoid_k_split restricts the search to those that in exchange do not have to split K.
 template <ggml_type type>
 static int get_mmq_x_best(const mmq_args & args, const int mmq_y, const int cc, const int warp_size,
         const int nwarps, const size_t smpbo, const int nsm, const bool avoid_k_split) {
@@ -4122,8 +4122,10 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     int mmq_x_best = get_mmq_x_best<type>(args, mmq_y, cc, warp_size, nwarps, smpbo, nsm, /*avoid_k_split =*/ false);
 
     // Splitting K makes the partial sums of every tile travel through memory twice, which for few
-    // wide tiles costs more than the x data that a narrower tile has to load again.
-    if (mmq_splits_k(args, mmq_x_best, mmq_y, cc, nsm)) {
+    // wide tiles costs more than the x data that a narrower tile has to load again. Only NVIDIA
+    // parts get the tiled stream-k grid that makes a no-split width possible; elsewhere every
+    // width splits, so the retry would search for nothing.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && mmq_splits_k(args, mmq_x_best, mmq_y, cc, nsm)) {
         const int mmq_x_no_split = get_mmq_x_best<type>(args, mmq_y, cc, warp_size, nwarps, smpbo, nsm, /*avoid_k_split =*/ true);
 
         if (mmq_x_no_split != 0) {
