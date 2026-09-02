@@ -8831,6 +8831,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 #if 1
+    {
+        // Batch sizes that leave the MMQ tile grid unable to fill the SMs, which makes the CUDA
+        // backend pick a narrower tile than the widest supported one.
+        for (int n : {376, 512}) {
+            for (int m : {1024, 2048, 4096}) {
+                for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 1024, {1, 1}, {1, 1}));
+                }
+            }
+        }
+    }
+#endif
+
+#if 1
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             std::vector<int> ks = { 256 };

@@ -14,6 +14,10 @@ using namespace ggml_cuda_mma;
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+// Min. percentage of the CUDA blocks in the last wave that has to be doing work for one block per
+// output tile to be preferred over one block per SM with the K dimension split across blocks.
+#define MMQ_TILING_MIN_EFFICIENCY_PERCENT 90
+
 typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
@@ -3939,6 +3943,27 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
 
+static int mmq_get_ntiles_dst(const mmq_args & args, const int mmq_x, const int mmq_y) {
+    const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
+    const int ntiles_y = (args.nrows_x   + mmq_y - 1) / mmq_y;
+    return ntiles_x * ntiles_y * args.nchannels_y * args.nsamples_y;
+}
+
+// One CUDA block per output tile if the tiles already keep almost all SMs busy, one block per SM
+// with K split across blocks otherwise.
+static int mmq_get_nblocks_stream_k(const int cc, const int ntiles_dst, const int nsm) {
+    const int nwaves = (ntiles_dst + nsm - 1) / nsm;
+    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*nwaves);
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= MMQ_TILING_MIN_EFFICIENCY_PERCENT ? ntiles_dst : nsm;
+}
+
+// Whether the K dimension of an output tile gets split across CUDA blocks, which makes every block
+// write a partial tile that the fixup kernel then has to read back and sum up.
+static bool mmq_splits_k(const mmq_args & args, const int mmq_x, const int mmq_y, const int cc, const int nsm) {
+    const int ntiles_dst = mmq_get_ntiles_dst(args, mmq_x, mmq_y);
+    return args.use_stream_k && mmq_get_nblocks_stream_k(cc, ntiles_dst, nsm) != ntiles_dst;
+}
+
 template <ggml_type type, int mmq_x>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -3996,9 +4021,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
     const int ntiles_dst = ntx * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    const dim3 block_nums_stream_k(mmq_get_nblocks_stream_k(cc, ntiles_dst, nsm), 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
@@ -4052,18 +4075,15 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     }
 }
 
+// Widest tile with the fewest column tiles. Narrower tiles reuse the loaded x data less often, so
+// avoid_k_split restricts the search to those that in exchange do not have to split K.
 template <ggml_type type>
-void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    const int    id     = ggml_cuda_get_device();
-    const int    cc     = ggml_cuda_info().devices[id].cc;
-    const size_t smpbo  = ggml_cuda_info().devices[id].smpbo;
-    const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
+static int get_mmq_x_best(const mmq_args & args, const int mmq_y, const int cc, const int warp_size,
+        const int nwarps, const size_t smpbo, const int nsm, const bool avoid_k_split) {
+    const int mmq_x_max       = get_mmq_x_max_host(cc);
+    const int granularity_max = mmq_get_granularity_host(mmq_x_max, cc);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
-    const int mmq_y = get_mmq_y_host(cc);
-
-    int mmq_x_best  = 0;
+    int mmq_x_best    = 0;
     int ntiles_x_best = INT_MAX;
 
     for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
@@ -4073,11 +4093,41 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
             continue;
         }
 
+        if (avoid_k_split && (granularity != granularity_max || mmq_splits_k(args, mmq_x, mmq_y, cc, nsm))) {
+            continue;
+        }
+
         const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
 
         if (ntiles_x < ntiles_x_best) {
             mmq_x_best = mmq_x;
             ntiles_x_best = ntiles_x;
+        }
+    }
+
+    return mmq_x_best;
+}
+
+template <ggml_type type>
+void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const int    id     = ggml_cuda_get_device();
+    const int    cc     = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo  = ggml_cuda_info().devices[id].smpbo;
+    const int warp_size = ggml_cuda_info().devices[id].warp_size;
+    const int nsm       = ggml_cuda_info().devices[id].nsm;
+    const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
+
+    const int mmq_y = get_mmq_y_host(cc);
+
+    int mmq_x_best = get_mmq_x_best<type>(args, mmq_y, cc, warp_size, nwarps, smpbo, nsm, /*avoid_k_split =*/ false);
+
+    // Splitting K makes the partial sums of every tile travel through memory twice, which for few
+    // wide tiles costs more than the x data that a narrower tile has to load again.
+    if (mmq_splits_k(args, mmq_x_best, mmq_y, cc, nsm)) {
+        const int mmq_x_no_split = get_mmq_x_best<type>(args, mmq_y, cc, warp_size, nwarps, smpbo, nsm, /*avoid_k_split =*/ true);
+
+        if (mmq_x_no_split != 0) {
+            mmq_x_best = mmq_x_no_split;
         }
     }
 
