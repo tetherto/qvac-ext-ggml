@@ -8392,6 +8392,7 @@ void ggml_compute_forward_snake(
 #    pragma GCC push_options
 #    pragma GCC optimize("fp-contract=off")
 #elif defined(_MSC_VER)
+#    pragma float_control(push)
 #    pragma fp_contract(off)
 #endif
 
@@ -8470,7 +8471,7 @@ void ggml_compute_forward_lstm_cell(
 #if defined(__GNUC__) && !defined(__clang__)
 #    pragma GCC pop_options
 #elif defined(_MSC_VER)
-#    pragma fp_contract(on)
+#    pragma float_control(pop)
 #endif
 
 // ggml_compute_forward_tdt_step
