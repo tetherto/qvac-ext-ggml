@@ -3364,45 +3364,66 @@ struct test_norm : public test_case {
     }
 };
 
-// GGML_OP_NORM + GGML_OP_MUL + GGML_OP_ADD
+// GGML_OP_NORM + GGML_OP_MUL + optional GGML_OP_ADD
 struct test_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     float eps;
     const bool broadcast;
+    const bool with_add;       // whether the bias add follows the multiply
+    const bool transposed_w;   // gives the weight non-contiguous rows, which must prevent fusion
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "NORM_MUL_ADD";
+        return with_add ? "NORM_MUL_ADD" : "NORM_MUL";
     }
 
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, eps, broadcast);
+        return VARS_TO_STR6(type, ne, eps, broadcast, with_add, transposed_w);
     }
 
     test_norm_mul_add(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {128, 2, 1, 1},
             float eps = 1e-5f,
-            bool broadcast = false)
-        : type(type), ne(ne), eps(eps), broadcast(broadcast) {}
+            bool broadcast = false,
+            bool with_add = true,
+            bool transposed_w = false)
+        : type(type), ne(ne), eps(eps), broadcast(broadcast), with_add(with_add), transposed_w(transposed_w) {}
+
+    ggml_tensor * make_weight(ggml_context * ctx) {
+        if (!transposed_w) {
+            ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(w);
+            ggml_set_name(w, "w");
+            return w;
+        }
+
+        std::array<int64_t, 4> ne_t = {ne[1], ne[0], ne[2], ne[3]};
+        ggml_tensor * wt = ggml_new_tensor(ctx, type, 4, ne_t.data());
+        ggml_set_param(wt);
+        ggml_set_name(wt, "wt");
+        return ggml_transpose(ctx, wt);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         std::array<int64_t, 4> broadcast_dims = {ne[0], ne[1] * 2, ne[2] * 2, ne[3] * 2};
 
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, broadcast ? broadcast_dims.data() : ne.data());
-        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = make_weight(ctx);
         ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_param(a); ggml_set_param(w); ggml_set_param(b);
-        ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
+        ggml_set_param(a); ggml_set_param(b);
+        ggml_set_name(a, "a"); ggml_set_name(b, "b");
 
         // Use a, w and b early to avoid OP_NONE in graph
         a = ggml_add(ctx, ggml_add(ctx, a, w), b);
 
         ggml_tensor * n = ggml_norm(ctx, a, eps);
-        ggml_tensor * m = ggml_mul(ctx, n, w);
-        ggml_tensor * out = ggml_add(ctx, m, b);
+        ggml_tensor * out = ggml_mul(ctx, n, w);
+        if (with_add) {
+            out = ggml_add(ctx, out, b);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -8520,6 +8541,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
+    }
+
+    // norm fusion over the row widths used by conformer encoders, on both sides of the block size switch
+    for (uint32_t n : { 640, 1024, 4096 }) {
+        for (bool broadcast : { false, true }) {
+            test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, 1e-5f, broadcast, true));
+            test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, 1e-5f, broadcast, false));
+        }
+        test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, 1e-5f, false, true, true));
+        test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, 1e-5f, false, false, true));
     }
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
