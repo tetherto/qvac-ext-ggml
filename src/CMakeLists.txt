@@ -498,6 +498,12 @@ if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
     foreach (target ggml-base ggml)
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
-        target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        # A static core linked into MODULE backends must not advertise itself
+        # as a DLL: on Windows GGML_SHARED turns GGML_API into
+        # __declspec(dllimport) inside the backend's translation units, and
+        # their __imp_ references cannot be satisfied by the static archive.
+        if (BUILD_SHARED_LIBS OR NOT WIN32)
+            target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        endif()
     endforeach()
 endif()
