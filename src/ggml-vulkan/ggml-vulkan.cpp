@@ -619,6 +619,9 @@ static constexpr uint32_t IM2COL_1D_TILE_IC      = 16;
 static constexpr uint32_t IM2COL_1D_TILE_THREADS = 512;
 static constexpr uint32_t IM2COL_1D_SMEM_FLOATS  = 6144;
 
+// argmax reduces one row per workgroup; cap the lane count so short rows keep a shallow tree
+static constexpr uint32_t ARGMAX_MAX_BLOCK_SIZE = 1024;
+
 static constexpr uint32_t CPY_TRANSPOSE_LARGE_TILE_I00  = 64;
 static constexpr uint32_t CPY_TRANSPOSE_LARGE_TILE_I01  = 128;
 static constexpr uint32_t CPY_TRANSPOSE_LARGE_THREADS   = 512;
@@ -5073,7 +5076,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    // one workgroup reduces a whole row, so wide rows (vocabulary logits) want every lane the device allows
+    const uint32_t argmax_block_size = std::min(ARGMAX_MAX_BLOCK_SIZE, 1u << device->max_workgroup_size_log2);
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { argmax_block_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_small_f32, "sum_rows_small_f32", sum_rows_small_f32_len, sum_rows_small_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {512, 1, 1}, {}, 1);
