@@ -809,6 +809,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
+    vk_pipeline pipeline_norm_mul_f32;
+    vk_pipeline pipeline_norm_mul_add_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
@@ -1442,6 +1444,15 @@ struct vk_op_mul_pair_push_constants {
     uint32_t nb30; uint32_t nb31; uint32_t nb32; uint32_t nb33;
 };
 static_assert(sizeof(vk_op_mul_pair_push_constants) <= 128, "vk_op_mul_pair_push_constants must fit the guaranteed 128-byte push constant limit");
+
+// Fused norm+mul(+add): src0 shape, then the broadcast weight and bias descriptions.
+struct vk_op_norm_fused_push_constants {
+    uint32_t ne00; uint32_t ne01; uint32_t ne02; uint32_t nrows;
+    uint32_t ne10; uint32_t ne11; uint32_t ne12; uint32_t ne13; uint32_t nb10; uint32_t nb11; uint32_t nb12; uint32_t nb13;
+    uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23; uint32_t nb20; uint32_t nb21; uint32_t nb22; uint32_t nb23;
+    float param1;
+};
+static_assert(sizeof(vk_op_norm_fused_push_constants) <= 128, "vk_op_norm_fused_push_constants must fit the guaranteed 128-byte push constant limit");
 // update multi_add.comp if this changes
 static_assert(MAX_PARAMETER_COUNT == 12);
 static_assert(sizeof(vk_op_multi_add_push_constants) <= 256);
@@ -4796,6 +4807,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_norm_mul_f32, "norm_mul_f32", norm_fused_f32_len, norm_fused_f32_data, "main", 4, sizeof(vk_op_norm_fused_push_constants), {1, 1, 1}, {0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_norm_mul_add_f32, "norm_mul_add_f32", norm_fused_f32_len, norm_fused_f32_data, "main", 4, sizeof(vk_op_norm_fused_push_constants), {1, 1, 1}, {1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
@@ -10266,7 +10279,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_NORM:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_norm_f32;
+            switch (ctx->num_additional_fused_ops) {
+                case 0:  return ctx->device->pipeline_norm_f32;
+                case 1:  return ctx->device->pipeline_norm_mul_f32;
+                case 2:  return ctx->device->pipeline_norm_mul_add_f32;
+                default: return nullptr;
+            }
         }
         return nullptr;
     case GGML_OP_GROUP_NORM:
@@ -12161,8 +12179,51 @@ static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx,
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SILU_BACK, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
-static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    float * op_params = (float *)dst->op_params;
+// the tensor the fused MUL scales the normalized rows by
+static const ggml_tensor * ggml_vk_norm_fused_weight(const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    return mul->src[0] == norm ? mul->src[1] : mul->src[0];
+}
+
+// the tensor the fused ADD offsets the scaled rows by
+static const ggml_tensor * ggml_vk_norm_fused_bias(const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+    return add->src[0] == mul ? add->src[1] : add->src[0];
+}
+
+static void ggml_vk_norm_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * norm  = cgraph->nodes[node_idx];
+    const ggml_tensor * src0  = norm->src[0];
+    const ggml_tensor * gamma = ggml_vk_norm_fused_weight(cgraph, node_idx);
+    const bool with_add = ctx->num_additional_fused_ops == 2;
+    // the shader never reads the bias when the ADD is absent, but the binding still needs a buffer
+    const ggml_tensor * beta = with_add ? ggml_vk_norm_fused_bias(cgraph, node_idx) : gamma;
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    const uint32_t gamma_type_size = ggml_type_size(gamma->type);
+    const uint32_t beta_type_size = ggml_type_size(beta->type);
+
+    ggml_vk_op_f32<vk_op_norm_fused_push_constants>(ctx, subctx, src0, gamma, beta, nullptr, dst, GGML_OP_NORM, {
+        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)ggml_nrows(src0),
+        (uint32_t)gamma->ne[0], (uint32_t)gamma->ne[1], (uint32_t)gamma->ne[2], (uint32_t)gamma->ne[3],
+        (uint32_t)(gamma->nb[0] / gamma_type_size), (uint32_t)(gamma->nb[1] / gamma_type_size), (uint32_t)(gamma->nb[2] / gamma_type_size), (uint32_t)(gamma->nb[3] / gamma_type_size),
+        (uint32_t)beta->ne[0], (uint32_t)beta->ne[1], (uint32_t)beta->ne[2], (uint32_t)beta->ne[3],
+        (uint32_t)(beta->nb[0] / beta_type_size), (uint32_t)(beta->nb[1] / beta_type_size), (uint32_t)(beta->nb[2] / beta_type_size), (uint32_t)(beta->nb[3] / beta_type_size),
+        ((const float *)norm->op_params)[0],
+    });
+}
+
+static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->num_additional_fused_ops > 0) {
+        ggml_vk_norm_fused(ctx, subctx, cgraph, node_idx);
+        return;
+    }
+
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = dst->src[0];
+    const float * op_params = (const float *)dst->op_params;
 
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], 0.0f, 0.0f, 0.0f });
 }
@@ -14364,7 +14425,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_NORM:
-        ggml_vk_norm(ctx, compute_ctx, src0, node);
+        ggml_vk_norm(ctx, compute_ctx, cgraph, node_idx);
 
         break;
     case GGML_OP_GROUP_NORM:
@@ -15450,6 +15511,58 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
             return false;
         }
     }
+    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL) {
+        const ggml_tensor *norm = cgraph->nodes[node_idx];
+        const ggml_tensor *mul  = cgraph->nodes[node_idx + 1];
+        const ggml_tensor *add  = nullptr;
+
+        if (ops.size() == 3) {
+            if (ops.begin()[2] != GGML_OP_ADD) {
+                return false;
+            }
+            add = cgraph->nodes[node_idx + 2];
+        }
+
+        GGML_ASSERT(norm->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(norm->type == GGML_TYPE_F32);
+        // the fused norm shader only supports f32
+        if (mul->src[0]->type != GGML_TYPE_F32 ||
+            mul->src[1]->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
+                    add->src[1]->type != GGML_TYPE_F32 ||
+                    add->type != GGML_TYPE_F32)) {
+            return false;
+        }
+        // if norm is the B operand, then we don't handle broadcast
+        if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
+            return false;
+        }
+
+        const ggml_tensor *gamma = ggml_vk_norm_fused_weight(cgraph, node_idx);
+        const ggml_tensor *beta  = add ? ggml_vk_norm_fused_bias(cgraph, node_idx) : nullptr;
+
+        // the second operand must come from memory, not from the elided intermediate
+        if (gamma == norm || (beta && beta == mul)) {
+            return false;
+        }
+        // the shader indexes src0 and dst flat, and broadcasts the weights per row
+        if (!ggml_is_contiguous(norm->src[0]) ||
+            !ggml_is_contiguous(cgraph->nodes[node_idx + (int)ops.size() - 1]) ||
+            !ggml_is_contiguous_rows(gamma) || !ggml_can_repeat(gamma, norm)) {
+            return false;
+        }
+        if (beta && (!ggml_is_contiguous_rows(beta) || !ggml_can_repeat(beta, norm))) {
+            return false;
+        }
+        // the push constants carry no misalign offsets for the extra operands
+        if (get_misalign_bytes(ctx, gamma) != 0 || (beta && get_misalign_bytes(ctx, beta) != 0)) {
+            return false;
+        }
+    }
+
     auto const &mm_add_ok = [&](const ggml_tensor *mul, const ggml_tensor *add) {
         const ggml_tensor *bias = add->src[0] == mul ? add->src[1] : add->src[0];
 
@@ -16005,6 +16118,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // mean reduces rows to one element; keep the conservative overlap test
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "NORM_MUL_ADD";
+                // see RMS_NORM_MUL below: one workgroup per row, whole rows consumed before being overwritten
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL })) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "NORM_MUL";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "RMS_NORM_MUL";
