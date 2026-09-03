@@ -1055,6 +1055,9 @@ void process_shaders() {
     string_to_spv("channel_shuffle_f32", "channel_shuffle.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("affine_prelu_f32",    "affine_prelu.comp",    {{"A_TYPE", "float"}});
     string_to_spv("snake_f32",           "snake.comp",           {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("lstm_cell_f32",        "lstm_cell.comp",      {{"A_TYPE", "float"}});
+    string_to_spv("lstm_cell_masked_f32", "lstm_cell.comp",      {{"A_TYPE", "float"}, {"MASKED", "1"}});
+    string_to_spv("tdt_step_f32",         "tdt_step.comp",       {{"A_TYPE", "float"}});
     string_to_spv("col2im_1d_f32",       "col2im_1d.comp",       {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("col2im_1d_tiled_f32", "col2im_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("im2col_1d_tiled_f32",     "im2col_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"BDA", "0"}});

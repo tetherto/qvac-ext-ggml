@@ -1,0 +1,78 @@
+#version 450
+
+#include "types.glsl"
+
+// Greedy transducer step control, mirroring ggml_tdt_step_f32 in ggml-cpu/ops.cpp.
+// Every value is an integer held exactly in F32, so this is bit-exact with the CPU.
+
+#define TDT_STEP_IN_T      0
+#define TDT_STEP_IN_S      1
+#define TDT_STEP_IN_N      2
+#define TDT_STEP_OUT_T     0
+#define TDT_STEP_OUT_S     1
+#define TDT_STEP_OUT_N     2
+#define TDT_STEP_OUT_UPD   3
+#define TDT_STEP_OUT_HOLD  4
+#define TDT_STEP_OUT_FRAME 5
+
+layout (push_constant) uniform parameter
+{
+    uint n_dur;
+    int  blank_id;
+    int  max_symbols;
+    int  rnnt;
+    uint token_offset;      // buffer misalignment, in elements
+    uint dur_idx_offset;
+    uint state_offset;
+    uint dur_table_offset;
+    uint dst_offset;
+} p;
+
+layout (binding = 0) readonly  buffer TK {int   data_token[];};
+layout (binding = 1) readonly  buffer DI {int   data_dur_idx[];};
+layout (binding = 2) readonly  buffer ST {float data_state[];};
+layout (binding = 3) readonly  buffer DT {float data_dur_table[];};
+layout (binding = 4) writeonly buffer D  {float data_d[];};
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const float t = data_state[p.state_offset + TDT_STEP_IN_T];
+    const float s = data_state[p.state_offset + TDT_STEP_IN_S];
+    const float n = data_state[p.state_offset + TDT_STEP_IN_N];
+
+    float t_next = t;
+    float s_next = s;
+    float update = 0.0f;
+
+    if (t < n) {
+        const int   raw = data_dur_idx[p.dur_idx_offset];
+        const int   di  = raw < 0 ? 0 : (raw < int(p.n_dur) ? raw : int(p.n_dur) - 1);
+        const float dur = p.rnnt != 0 ? 0.0f : data_dur_table[p.dur_table_offset + uint(di)];
+        const float adv = p.rnnt != 0 ? 1.0f : (dur > 1.0f ? dur : 1.0f);
+
+        if (data_token[p.token_offset] == p.blank_id) {
+            t_next = t + adv;
+            s_next = 0.0f;
+        } else {
+            update = 1.0f;
+            s_next = s + 1.0f;
+            if ((p.rnnt == 0 && dur > 0.0f) || s_next >= float(p.max_symbols)) {
+                t_next = t + adv;
+                s_next = 0.0f;
+            }
+        }
+    }
+
+    float frame = t_next > n - 1.0f ? n - 1.0f : t_next;
+    if (frame < 0.0f) {
+        frame = 0.0f;
+    }
+
+    data_d[p.dst_offset + TDT_STEP_OUT_T]     = t_next;
+    data_d[p.dst_offset + TDT_STEP_OUT_S]     = s_next;
+    data_d[p.dst_offset + TDT_STEP_OUT_N]     = n;
+    data_d[p.dst_offset + TDT_STEP_OUT_UPD]   = update;
+    data_d[p.dst_offset + TDT_STEP_OUT_HOLD]  = 1.0f - update;
+    data_d[p.dst_offset + TDT_STEP_OUT_FRAME] = frame;
+}
