@@ -8402,7 +8402,7 @@ static float ggml_lstm_cell_sigmoid_f32(float x) {
 // One [h_new | c_new] pair per index of the flattened H*N grid. A column whose
 // mask entry is zero copies its previous pair instead of computing a fresh one.
 static void ggml_lstm_cell_band_f32(
-        const float * gates, const float * prev, const float * mask, float * dst,
+        const float * gates, const float * prev, const int32_t * mask, float * dst,
         int64_t H, int64_t prev_row, int64_t c_base, int64_t mask_stride,
         int64_t first, int64_t last) {
 #if defined(__clang__)
@@ -8415,7 +8415,7 @@ static void ggml_lstm_cell_band_f32(
         const float * p   = prev + n*prev_row;
         float       * out = dst  + n*GGML_LSTM_N_OUTS*H;
 
-        if (mask && mask[n*mask_stride] == 0.f) {
+        if (mask && mask[n*mask_stride] == 0) {
             out[GGML_LSTM_OUT_H*H + j] = p[j];
             out[GGML_LSTM_OUT_C*H + j] = p[c_base + j];
             continue;
@@ -8462,7 +8462,7 @@ void ggml_compute_forward_lstm_cell(
     const int64_t last  = MIN(first + per, total);
 
     ggml_lstm_cell_band_f32((const float *) gates->data, (const float *) prev->data,
-                            mask ? (const float *) mask->data : NULL, (float *) dst->data,
+                            mask ? (const int32_t *) mask->data : NULL, (float *) dst->data,
                             H, prev->ne[0], c_base,
                             (mask && ggml_nelements(mask) > 1) ? 1 : 0, first, last);
 }
@@ -8477,48 +8477,50 @@ void ggml_compute_forward_lstm_cell(
 
 // Reference greedy transducer step control. Every backend kernel mirrors this
 // line by line; see ggml_tdt_step in ggml.h for the semantics.
-static void ggml_tdt_step_f32(
+static void ggml_tdt_step_i32(
         int32_t tok, int32_t dur_idx,
-        const float * state, const float * dur_table, int64_t n_dur,
+        const int32_t * state, const int32_t * dur_table, int64_t n_dur,
         int32_t blank_id, int32_t max_symbols, int32_t rnnt,
-        float * dst) {
-    const float t = state[GGML_TDT_STEP_IN_T];
-    const float s = state[GGML_TDT_STEP_IN_S];
-    const float n = state[GGML_TDT_STEP_IN_N];
+        int32_t * dst) {
+    const int32_t t = state[GGML_TDT_STEP_IN_T];
+    const int32_t s = state[GGML_TDT_STEP_IN_S];
+    const int32_t n = state[GGML_TDT_STEP_IN_N];
 
-    float t_next = t;
-    float s_next = s;
-    float update = 0.0f;
+    int32_t t_next = t;
+    int32_t s_next = s;
+    int32_t update = 0;
 
     if (t < n) {
         const int64_t di  = dur_idx < 0 ? 0 : (dur_idx < n_dur ? dur_idx : n_dur - 1);
-        const float   dur = rnnt ? 0.0f : dur_table[di];
-        const float   adv = rnnt ? 1.0f : (dur > 1.0f ? dur : 1.0f);
+        const int32_t dur = rnnt ? 0 : dur_table[di];
+        const int32_t adv = rnnt ? 1 : (dur > 1 ? dur : 1);
 
         if (tok == blank_id) {
             t_next = t + adv;
-            s_next = 0.0f;
+            s_next = 0;
         } else {
-            update = 1.0f;
-            s_next = s + 1.0f;
-            if ((!rnnt && dur > 0.0f) || s_next >= (float) max_symbols) {
+            update = 1;
+            s_next = s + 1;
+            if ((!rnnt && dur > 0) || s_next >= max_symbols) {
                 t_next = t + adv;
-                s_next = 0.0f;
+                s_next = 0;
             }
         }
     }
 
-    float frame = t_next > n - 1.0f ? n - 1.0f : t_next;
-    if (frame < 0.0f) {
-        frame = 0.0f;
+    int32_t frame = t_next > n - 1 ? n - 1 : t_next;
+    if (frame < 0) {
+        frame = 0;
     }
 
     dst[GGML_TDT_STEP_OUT_T]      = t_next;
     dst[GGML_TDT_STEP_OUT_S]      = s_next;
     dst[GGML_TDT_STEP_OUT_N]      = n;
     dst[GGML_TDT_STEP_OUT_UPDATE] = update;
-    dst[GGML_TDT_STEP_OUT_HOLD]   = 1.0f - update;
+    dst[GGML_TDT_STEP_OUT_HOLD]   = 1 - update;
     dst[GGML_TDT_STEP_OUT_FRAME]  = frame;
+    dst[GGML_TDT_STEP_OUT_TOKEN]  = tok;
+    dst[GGML_TDT_STEP_OUT_DUR]    = dur_idx;
 }
 
 void ggml_compute_forward_tdt_step(
@@ -8535,19 +8537,19 @@ void ggml_compute_forward_tdt_step(
 
     GGML_ASSERT(token->type     == GGML_TYPE_I32);
     GGML_ASSERT(dur_idx->type   == GGML_TYPE_I32);
-    GGML_ASSERT(state->type     == GGML_TYPE_F32);
-    GGML_ASSERT(dur_table->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+    GGML_ASSERT(state->type     == GGML_TYPE_I32);
+    GGML_ASSERT(dur_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_I32);
     GGML_ASSERT(ggml_nelements(dst) == GGML_TDT_STEP_N_OUTS);
 
     int32_t op_params[3];
     memcpy(op_params, dst->op_params, sizeof(op_params));
 
-    ggml_tdt_step_f32(*(const int32_t *) token->data, *(const int32_t *) dur_idx->data,
-                      (const float *) state->data, (const float *) dur_table->data,
+    ggml_tdt_step_i32(*(const int32_t *) token->data, *(const int32_t *) dur_idx->data,
+                      (const int32_t *) state->data, (const int32_t *) dur_table->data,
                       ggml_nelements(dur_table),
                       op_params[0], op_params[1], op_params[2],
-                      (float *) dst->data);
+                      (int32_t *) dst->data);
 }
 
 // ggml_compute_forward_roll

@@ -916,7 +916,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_lstm_cell_f32;
     vk_pipeline pipeline_lstm_cell_masked_f32;
-    vk_pipeline pipeline_tdt_step_f32;
+    vk_pipeline pipeline_tdt_step_i32;
     vk_pipeline pipeline_col2im_1d_f32;
     vk_pipeline pipeline_col2im_1d_tiled_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -5204,7 +5204,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32, "snake_f32", snake_f32_len, snake_f32_data, "main", 4, sizeof(vk_op_snake_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_lstm_cell_f32, "lstm_cell_f32", lstm_cell_f32_len, lstm_cell_f32_data, "main", 3, sizeof(vk_op_lstm_cell_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_lstm_cell_masked_f32, "lstm_cell_masked_f32", lstm_cell_masked_f32_len, lstm_cell_masked_f32_data, "main", 4, sizeof(vk_op_lstm_cell_push_constants), {512, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_tdt_step_f32, "tdt_step_f32", tdt_step_f32_len, tdt_step_f32_data, "main", 5, sizeof(vk_op_tdt_step_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_tdt_step_i32, "tdt_step_i32", tdt_step_i32_len, tdt_step_i32_data, "main", 5, sizeof(vk_op_tdt_step_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32, "col2im_1d_f32", col2im_1d_f32_len, col2im_1d_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {512, 1, 1}, {}, 1);
     // Devices below the tile's thread or shared-memory needs keep the
     // one-thread-per-output pipeline for every shape.
@@ -10681,8 +10681,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_TDT_STEP:
-        if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_tdt_step_f32;
+        if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
+            return ctx->device->pipeline_tdt_step_i32;
         }
         return nullptr;
     case GGML_OP_COL2IM_1D:
@@ -17472,12 +17472,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    ggml_is_contiguous(op) &&
-                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_F32 &&
+                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 &&
                                     ggml_is_contiguous(op->src[2])));
         case GGML_OP_TDT_STEP:
             return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
-                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 && op->src[3]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_I32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
                    ggml_is_contiguous(op);
@@ -18398,6 +18398,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                              : ggml_lstm_cell(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_TDT_STEP) {
             tensor_clone = ggml_tdt_step(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
+                                         src_clone[4],
                                          ggml_get_op_params_i32(tensor, 0),
                                          ggml_get_op_params_i32(tensor, 1),
                                          ggml_get_op_params_i32(tensor, 2));

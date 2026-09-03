@@ -30,7 +30,7 @@ layout (push_constant) uniform parameter
 layout (binding = 0) readonly buffer G {float data_gates[];};
 layout (binding = 1) readonly buffer P {float data_prev[];};
 #ifdef MASKED
-layout (binding = 2) readonly  buffer M {float data_mask[];};
+layout (binding = 2) readonly  buffer M {int data_mask[];};
 layout (binding = 3) writeonly buffer D {float data_d[];};
 #else
 layout (binding = 2) writeonly buffer D {float data_d[];};
@@ -62,7 +62,7 @@ void main() {
 
 #ifdef MASKED
     // A held column is a bit-for-bit copy, so it stays exact for non-finite values.
-    if (data_mask[p.mask_offset + n * p.mask_stride] == 0.0f) {
+    if (data_mask[p.mask_offset + n * p.mask_stride] == 0) {
         data_d[obase + LSTM_OUT_H * p.H + j] = data_prev[pbase + j];
         data_d[obase + LSTM_OUT_C * p.H + j] = data_prev[pbase + p.c_base + j];
         return;

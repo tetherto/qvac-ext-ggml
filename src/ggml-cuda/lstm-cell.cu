@@ -6,7 +6,7 @@
 // unmasked and hc_prev [2H, N] masked, where a zero mask entry copies the
 // column's previous pair through untouched.
 static __global__ void lstm_cell_f32_kernel(
-        const float * gates, const float * prev, const float * mask, float * dst,
+        const float * gates, const float * prev, const int * mask, float * dst,
         const int64_t H, const int64_t prev_row, const int64_t c_base,
         const int64_t mask_stride, const int64_t total) {
     const int64_t k = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -20,7 +20,7 @@ static __global__ void lstm_cell_f32_kernel(
     const float * p   = prev + n*prev_row;
     float       * out = dst  + n*GGML_LSTM_N_OUTS*H;
 
-    if (mask && mask[n*mask_stride] == 0.0f) {
+    if (mask && mask[n*mask_stride] == 0) {
         out[GGML_LSTM_OUT_H*H + j] = p[j];
         out[GGML_LSTM_OUT_C*H + j] = p[c_base + j];
         return;
@@ -62,6 +62,6 @@ void ggml_cuda_op_lstm_cell(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t num_blocks = (total + CUDA_LSTM_CELL_BLOCK_SIZE - 1) / CUDA_LSTM_CELL_BLOCK_SIZE;
     lstm_cell_f32_kernel<<<num_blocks, CUDA_LSTM_CELL_BLOCK_SIZE, 0, ctx.stream()>>>(
         (const float *) gates->data, (const float *) prev->data,
-        mask ? (const float *) mask->data : nullptr, (float *) dst->data,
+        mask ? (const int *) mask->data : nullptr, (float *) dst->data,
         H, prev->ne[0], c_base, (mask && ggml_nelements(mask) > 1) ? 1 : 0, total);
 }

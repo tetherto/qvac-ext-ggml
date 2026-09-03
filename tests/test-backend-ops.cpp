@@ -3863,7 +3863,7 @@ struct test_lstm_cell : public test_case {
 struct test_lstm_cell_masked : public test_case {
     const int64_t h;        // hidden size
     const int64_t n;        // batch (columns)
-    const float mask_val;   // 0 holds the previous pair, non-zero takes the fresh one
+    const int32_t mask_val; // 0 holds the previous pair, non-zero takes the fresh one
     const bool broadcast;   // one mask entry for every column instead of one each
     const int64_t mask_off; // > 0: the mask is a view this many elements into a longer buffer
 
@@ -3871,7 +3871,7 @@ struct test_lstm_cell_masked : public test_case {
         return VARS_TO_STR5(h, n, mask_val, broadcast, mask_off);
     }
 
-    test_lstm_cell_masked(int64_t h = 32, int64_t n = 1, float mask_val = 1.0f, bool broadcast = false,
+    test_lstm_cell_masked(int64_t h = 32, int64_t n = 1, int32_t mask_val = 1, bool broadcast = false,
                           int64_t mask_off = 0)
         : h(h), n(n), mask_val(mask_val), broadcast(broadcast), mask_off(mask_off) {}
 
@@ -3879,12 +3879,12 @@ struct test_lstm_cell_masked : public test_case {
         const int64_t n_mask = broadcast ? 1 : n;
         ggml_tensor * gates   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4*h, n);
         ggml_tensor * hc_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*h, n);
-        ggml_tensor * mask    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mask_off + n_mask);
+        ggml_tensor * mask    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, mask_off + n_mask);
         ggml_set_name(gates,   "gates");
         ggml_set_name(hc_prev, "hc_prev");
         ggml_set_name(mask,    "mask");
         if (mask_off > 0) {
-            mask = ggml_view_1d(ctx, mask, n_mask, mask_off*sizeof(float));
+            mask = ggml_view_1d(ctx, mask, n_mask, mask_off*sizeof(int32_t));
         }
         return ggml_lstm_cell_masked(ctx, gates, hc_prev, mask);
     }
@@ -3894,9 +3894,9 @@ struct test_lstm_cell_masked : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (std::string(t->name) == "mask") {
-                std::vector<float> m((size_t) ggml_nelements(t), mask_val);
-                std::fill(m.begin(), m.begin() + mask_off, mask_val == 0.0f ? 1.0f : 0.0f);
-                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(float));
+                std::vector<int32_t> m((size_t) ggml_nelements(t), mask_val);
+                std::fill(m.begin(), m.begin() + mask_off, mask_val == 0 ? 1 : 0);
+                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -3914,46 +3914,61 @@ struct test_tdt_step : public test_case {
     const int blank_id;
     const int max_symbols;
     const int rnnt;
+    const int dst_row;  // control-buffer row the step writes, > 0 exercises the view offset
+
+    // Number of rows in the control buffer the step writes into.
+    static constexpr int64_t n_ctl_rows = 2;
+
+    // The value every control row holds before the step runs: a kernel that
+    // ignores the destination view offset leaves the target row at this.
+    static constexpr int32_t ctl_fill = -7;
 
     // Duration table of the released TDT models, plus the identity table the
     // engine passes when the GGUF carries no explicit durations.
-    static std::vector<float> durations(int rnnt) {
-        return rnnt ? std::vector<float>{ 0.0f } : std::vector<float>{ 0.0f, 1.0f, 2.0f, 3.0f, 4.0f };
+    static std::vector<int32_t> durations(int rnnt) {
+        return rnnt ? std::vector<int32_t>{ 0 } : std::vector<int32_t>{ 0, 1, 2, 3, 4 };
     }
 
     std::string vars() override {
-        return VARS_TO_STR8(tok, dur_idx, t, s, n_frames, blank_id, max_symbols, rnnt);
+        return VARS_TO_STR9(tok, dur_idx, t, s, n_frames, blank_id, max_symbols, rnnt, dst_row);
     }
 
     test_tdt_step(int tok = 0, int dur_idx = 0, int t = 0, int s = 0, int n_frames = 8,
-                  int blank_id = 1024, int max_symbols = 10, int rnnt = 0)
+                  int blank_id = 1024, int max_symbols = 10, int rnnt = 0, int dst_row = 1)
         : tok(tok), dur_idx(dur_idx), t(t), s(s), n_frames(n_frames),
-          blank_id(blank_id), max_symbols(max_symbols), rnnt(rnnt) {}
+          blank_id(blank_id), max_symbols(max_symbols), rnnt(rnnt), dst_row(dst_row) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_tensor * dur   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, GGML_TDT_STEP_N_INS);
-        ggml_tensor * table = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) durations(rnnt).size());
+        ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_TDT_STEP_N_INS);
+        ggml_tensor * table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) durations(rnnt).size());
+        ggml_tensor * ctl   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, GGML_TDT_STEP_N_OUTS, n_ctl_rows);
         ggml_set_name(token, "token");
         ggml_set_name(dur,   "dur_idx");
         ggml_set_name(state, "state");
         ggml_set_name(table, "dur_table");
-        return ggml_tdt_step(ctx, token, dur, state, table, blank_id, max_symbols, rnnt);
+        ggml_set_name(ctl,   "ctl");
+        ggml_tensor * dst = ggml_view_1d(ctx, ctl, GGML_TDT_STEP_N_OUTS,
+                                         (size_t) dst_row * GGML_TDT_STEP_N_OUTS * sizeof(int32_t));
+        return ggml_tdt_step(ctx, token, dur, state, table, dst, blank_id, max_symbols, rnnt);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        const std::vector<float> table = durations(rnnt);
-        const std::vector<float> state = { (float) t, (float) s, (float) n_frames };
+        const std::vector<int32_t> table = durations(rnnt);
+        const std::vector<int32_t> state = { t, s, n_frames };
+        const std::vector<int32_t> ctl((size_t) (n_ctl_rows*GGML_TDT_STEP_N_OUTS), ctl_fill);
         for (ggml_tensor * v = ggml_get_first_tensor(ctx); v != NULL; v = ggml_get_next_tensor(ctx, v)) {
             if (std::string(v->name) == "token") {
                 ggml_backend_tensor_set(v, &tok, 0, sizeof(int));
             } else if (std::string(v->name) == "dur_idx") {
                 ggml_backend_tensor_set(v, &dur_idx, 0, sizeof(int));
             } else if (std::string(v->name) == "state") {
-                ggml_backend_tensor_set(v, state.data(), 0, state.size()*sizeof(float));
+                ggml_backend_tensor_set(v, state.data(), 0, state.size()*sizeof(int32_t));
             } else if (std::string(v->name) == "dur_table") {
-                ggml_backend_tensor_set(v, table.data(), 0, table.size()*sizeof(float));
+                ggml_backend_tensor_set(v, table.data(), 0, table.size()*sizeof(int32_t));
+            } else if (std::string(v->name) == "ctl") {
+                ggml_backend_tensor_set(v, ctl.data(), 0, ctl.size()*sizeof(int32_t));
             }
         }
     }
@@ -8758,7 +8773,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // The TDT decoder passes the update flag as a view into its control tensor.
-    for (float mask_val : {0.0f, 1.0f}) {
+    for (int32_t mask_val : {0, 1}) {
         test_cases.emplace_back(new test_lstm_cell_masked(640, 1, mask_val, true, 3));
         test_cases.emplace_back(new test_lstm_cell_masked(32, 4, mask_val, false, 3));
     }
@@ -8774,6 +8789,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_tdt_step(1024, 0, 7, 0, 8));
     test_cases.emplace_back(new test_tdt_step(7,    0, 3, 0, 8, 1024, 10, 1));
     test_cases.emplace_back(new test_tdt_step(1024, 0, 3, 0, 8, 1024, 10, 1));
+    // the first row of the control buffer, so the destination view offset is zero
+    test_cases.emplace_back(new test_tdt_step(7,    2, 3, 0, 8, 1024, 10, 0, 0));
+    test_cases.emplace_back(new test_tdt_step(1024, 1, 0, 0, 8, 1024, 10, 0, 0));
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.

@@ -641,7 +641,7 @@ typedef struct {
     int32_t mask_stride; // 0 broadcasts a single mask entry over every column
 } ggml_metal_kargs_lstm_cell;
 
-// greedy transducer step control: one [GGML_TDT_STEP_N_OUTS] f32 result.
+// greedy transducer step control: one [GGML_TDT_STEP_N_OUTS] i32 result row.
 typedef struct {
     int32_t n_dur;       // entries in the duration table
     int32_t blank_id;
