@@ -8870,6 +8870,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    {
+        // Short-K GEMMs where the Vulkan backend's K-aware rule switches to the small tile: the
+        // relative-position attention term (8 heads, permuted position operand) and a 3x3
+        // convolution lowered through im2col.
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 751, 376, 128, {8, 1}, {1, 1}, {0, 2, 1, 3}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 96064, 256, 9, {1, 1}, {1, 1}));
+    }
 
 #if 1
     for (ggml_type type_a : base_types) {
