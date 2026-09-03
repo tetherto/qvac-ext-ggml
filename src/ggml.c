@@ -1091,9 +1091,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "AFFINE_PRELU",
     "COL2IM_1D",
     "SNAKE",
+    "LSTM_CELL",
+    "TDT_STEP",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "affine_prelu(x,aw,ab,slope)",
     "col2im_1d(x)",
     "snake(x,a,inv_b)",
+    "lstm_cell(gates,c)",
+    "tdt_step(tok,dur,state)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1254,9 +1258,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "SWIGLU_OAI",
     "GEGLU_ERF",
     "GEGLU_QUICK",
+    "SIGLU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
+static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -3092,6 +3097,27 @@ struct ggml_tensor * ggml_geglu_quick_split(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_GEGLU_QUICK, false);
+}
+
+// ggml_siglu
+
+struct ggml_tensor * ggml_siglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_glu_impl(ctx, a, NULL, GGML_GLU_OP_SIGLU, false);
+}
+
+struct ggml_tensor * ggml_siglu_swapped(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_glu_impl(ctx, a, NULL, GGML_GLU_OP_SIGLU, true);
+}
+
+struct ggml_tensor * ggml_siglu_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SIGLU, false);
 }
 
 struct ggml_tensor * ggml_swiglu_oai(
@@ -5605,6 +5631,93 @@ struct ggml_tensor * ggml_snake(
     result->src[0] = x;
     result->src[1] = a;
     result->src[2] = inv_b;
+
+    return result;
+}
+
+// ggml_lstm_cell
+
+static struct ggml_tensor * ggml_lstm_cell_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gates,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * mask,
+        int64_t               H) {
+    GGML_ASSERT(gates->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gates));
+    GGML_ASSERT(ggml_is_contiguous(prev));
+    GGML_ASSERT(gates->ne[0] == GGML_LSTM_N_GATES*H);
+    GGML_ASSERT(gates->ne[1] == prev->ne[1]);
+    GGML_ASSERT(gates->ne[2] == 1 && gates->ne[3] == 1);
+    GGML_ASSERT(prev->ne[2]  == 1 && prev->ne[3]  == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                                     GGML_LSTM_N_OUTS*H, prev->ne[1]);
+
+    result->op     = GGML_OP_LSTM_CELL;
+    result->src[0] = gates;
+    result->src[1] = prev;
+    result->src[2] = mask;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lstm_cell(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gates,
+        struct ggml_tensor  * c_prev) {
+    return ggml_lstm_cell_impl(ctx, gates, c_prev, NULL, c_prev->ne[0]);
+}
+
+struct ggml_tensor * ggml_lstm_cell_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gates,
+        struct ggml_tensor  * hc_prev,
+        struct ggml_tensor  * mask) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(mask));
+    GGML_ASSERT(hc_prev->ne[0] % GGML_LSTM_N_OUTS == 0);
+    GGML_ASSERT(ggml_nelements(mask) == hc_prev->ne[1] || ggml_nelements(mask) == 1);
+
+    return ggml_lstm_cell_impl(ctx, gates, hc_prev, mask, hc_prev->ne[0]/GGML_LSTM_N_OUTS);
+}
+
+// ggml_tdt_step
+
+struct ggml_tensor * ggml_tdt_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * token,
+        struct ggml_tensor  * dur_idx,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * dur_table,
+        int                   blank_id,
+        int                   max_symbols_per_step,
+        int                   rnnt) {
+    GGML_ASSERT(token->type     == GGML_TYPE_I32);
+    GGML_ASSERT(dur_idx->type   == GGML_TYPE_I32);
+    GGML_ASSERT(state->type     == GGML_TYPE_F32);
+    GGML_ASSERT(dur_table->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(token));
+    GGML_ASSERT(ggml_is_contiguous(dur_idx));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(dur_table));
+    GGML_ASSERT(ggml_nelements(token)   == 1);
+    GGML_ASSERT(ggml_nelements(dur_idx) == 1);
+    GGML_ASSERT(ggml_nelements(state)   == GGML_TDT_STEP_N_INS);
+    GGML_ASSERT(ggml_nelements(dur_table) >= 1);
+    GGML_ASSERT(max_symbols_per_step > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, GGML_TDT_STEP_N_OUTS);
+
+    const int32_t params[] = { blank_id, max_symbols_per_step, rnnt };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_TDT_STEP;
+    result->src[0] = token;
+    result->src[1] = dur_idx;
+    result->src[2] = state;
+    result->src[3] = dur_table;
 
     return result;
 }

@@ -145,6 +145,15 @@
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
 
+// kernel parameters for the cpy fast paths
+//
+// N_CPY_ROW: elements copied per thread when the src rows are contiguous
+// SZ_CPY_TRANSPOSE / N_CPY_TRANSPOSE_ROWS: tile side and tile rows per thread pass of the transpose
+
+#define N_CPY_ROW             8
+#define SZ_CPY_TRANSPOSE      32
+#define N_CPY_TRANSPOSE_ROWS  8
+
 // kernel argument structs
 //
 // - element counters (e.g. ne00) typically use int32_t to reduce register usage
@@ -621,6 +630,25 @@ typedef struct {
     int32_t C; // channels (one a / inv_b per channel)
 } ggml_metal_kargs_snake;
 
+// fused LSTM cell: gates [4H, N] pre-activations (i | f | g | o along ne0),
+// previous state [H, N] (c_prev) or [2H, N] (h | c, masked form), result [2H, N]
+// with h_new above c_new.
+typedef struct {
+    int32_t H;           // hidden size
+    int32_t N;           // batch (columns)
+    int32_t prev_row;    // elements per column of the previous state: H, or 2H when masked
+    int32_t c_base;      // where c starts inside a previous-state column
+    int32_t mask_stride; // 0 broadcasts a single mask entry over every column
+} ggml_metal_kargs_lstm_cell;
+
+// greedy transducer step control: one [GGML_TDT_STEP_N_OUTS] f32 result.
+typedef struct {
+    int32_t n_dur;       // entries in the duration table
+    int32_t blank_id;
+    int32_t max_symbols; // symbols allowed at one encoder frame
+    int32_t rnnt;        // 1 = no duration head, advance one frame
+} ggml_metal_kargs_tdt_step;
+
 typedef struct {
     int32_t  IC;
     int32_t  IH;
@@ -633,6 +661,24 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
 } ggml_metal_kargs_conv_transpose_2d;
+
+typedef struct {
+    int32_t IW;
+    int32_t IH;
+    int32_t OW;
+    int32_t OH;
+    int32_t KW;
+    int32_t KH;
+    int32_t C;
+    int32_t N;
+    int32_t s0;
+    int32_t s1;
+    int32_t p0;
+    int32_t p1;
+    int32_t d0;
+    int32_t d1;
+    int32_t cwhn; // 1: input/output/kernel are channel-contiguous (CWHN), 0: WHCN
+} ggml_metal_kargs_conv_2d_dw;
 
 typedef struct {
     uint64_t nb00;

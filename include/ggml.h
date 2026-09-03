@@ -624,7 +624,37 @@ extern "C" {
         // (ACE-Step Oobleck VAE).
         GGML_OP_SNAKE,
 
+        // Fused LSTM cell (Parakeet TDT decoder): the four gate activations plus
+        // the new cell and hidden state as one op.
+        GGML_OP_LSTM_CELL,
+
+        // Greedy transducer (RNN-T / TDT) step control: turns one decoded
+        // (token, duration index) pair into the next loop counters and the
+        // 0/1 mask that says whether the step's predictor update is kept.
+        GGML_OP_TDT_STEP,
+
         GGML_OP_COUNT,
+    };
+
+    // GGML_OP_TDT_STEP loop counters along ne0 of the F32 state vector. The
+    // result repeats this layout in its first GGML_TDT_STEP_N_INS slots, so a
+    // view of the result feeds the next step directly.
+    enum ggml_tdt_step_in {
+        GGML_TDT_STEP_IN_T  = 0,  // encoder frame the step reads
+        GGML_TDT_STEP_IN_S  = 1,  // symbols already emitted at that frame
+        GGML_TDT_STEP_IN_N  = 2,  // frames in the window
+        GGML_TDT_STEP_N_INS = 3,
+    };
+
+    // GGML_OP_TDT_STEP result layout along ne0, all integer-valued F32.
+    enum ggml_tdt_step_out {
+        GGML_TDT_STEP_OUT_T      = GGML_TDT_STEP_IN_T,
+        GGML_TDT_STEP_OUT_S      = GGML_TDT_STEP_IN_S,
+        GGML_TDT_STEP_OUT_N      = GGML_TDT_STEP_IN_N,
+        GGML_TDT_STEP_OUT_UPDATE = 3,  // 1.0 when the step's predictor update is kept
+        GGML_TDT_STEP_OUT_HOLD   = 4,  // 1.0 - update
+        GGML_TDT_STEP_OUT_FRAME  = 5,  // next frame index, clamped to [0, n_frames)
+        GGML_TDT_STEP_N_OUTS     = 6,
     };
 
     enum ggml_unary_op {
@@ -661,6 +691,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SIGLU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1357,6 +1388,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // unlike the other gated ops, the sigmoid is applied to the gate: out = a*sigmoid(b)
+    GGML_API struct ggml_tensor * ggml_siglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_siglu_swapped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     // A: n columns, r rows,
     // B: n columns, r rows,
     GGML_API struct ggml_tensor * ggml_glu_split(
@@ -1386,6 +1426,11 @@ extern "C" {
             struct ggml_tensor  * b);
 
     GGML_API struct ggml_tensor * ggml_geglu_quick_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_siglu_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
@@ -2535,6 +2580,41 @@ extern "C" {
             struct ggml_tensor  * x,      // [T, C]
             struct ggml_tensor  * a,      // per-channel scale inside sin(), F32
             struct ggml_tensor  * inv_b); // per-channel output scale, F32
+
+    // fused LSTM cell: c_new = sigmoid(f)*c_prev + sigmoid(i)*tanh(g),
+    // h_new = sigmoid(o)*tanh(c_new).  Result rows [0, H) are h_new, [H, 2H) are c_new.
+    GGML_API struct ggml_tensor * ggml_lstm_cell(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
+            struct ggml_tensor  * c_prev); // [H, N] previous cell state, F32
+
+    // Same cell over a packed [h | c] previous state, selected per column: a column
+    // whose mask entry is non-zero takes the fresh pair, the rest copy hc_prev bit
+    // for bit (a select, so a held column is exact even for non-finite values).
+    GGML_API struct ggml_tensor * ggml_lstm_cell_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gates,   // [4H, N] pre-activations, i | f | g | o along ne0, F32
+            struct ggml_tensor  * hc_prev, // [2H, N] previous h | c, F32
+            struct ggml_tensor  * mask);   // [N] or [1] F32
+
+    // one greedy transducer step, run entirely on the backend so K steps can be
+    // unrolled into a single graph. With t = state[T], s = state[S], n = state[N]
+    // and dur = dur_table[dur_idx]:
+    //   t >= n            -> update = 0, counters unchanged (the step is a no-op)
+    //   token == blank_id -> update = 0, t += rnnt ? 1 : max(1, dur), s = 0
+    //   otherwise         -> update = 1, s += 1, and when (!rnnt && dur > 0) or
+    //                        s >= max_symbols_per_step: t += rnnt ? 1 : max(1, dur), s = 0
+    // rnnt != 0 ignores dur_idx / dur_table and advances t by one frame.
+    // All values are integers held exactly in F32.
+    GGML_API struct ggml_tensor * ggml_tdt_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * token,      // I32 [1] argmax over the vocabulary
+            struct ggml_tensor  * dur_idx,    // I32 [1] argmax over the duration head
+            struct ggml_tensor  * state,      // F32 [GGML_TDT_STEP_N_INS] loop counters
+            struct ggml_tensor  * dur_table,  // F32 [D] frame advance per duration index
+            int                   blank_id,
+            int                   max_symbols_per_step,
+            int                   rnnt);
 
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.

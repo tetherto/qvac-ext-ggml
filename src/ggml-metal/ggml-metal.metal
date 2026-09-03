@@ -1555,6 +1555,28 @@ kernel void kernel_geglu_quick_f32(
     }
 }
 
+kernel void kernel_siglu_f32(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint tgpig[[threadgroup_position_in_grid]],
+        uint tpitg[[thread_position_in_threadgroup]],
+        uint   ntg[[threads_per_threadgroup]]) {
+    device const float * src0_row = (device const float *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+    device const float * src1_row = (device const float *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+    device       float * dst_row  = (device       float *) ((device       char *) dst  + tgpig*args.nb1);
+
+    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
+        const float x0 = src0_row[i0];
+        const float x1 = src1_row[i0];
+
+        const float sigmoid = 1.0f / (1.0f + exp(-x1));
+
+        dst_row[i0] = x0*sigmoid;
+    }
+}
+
 kernel void kernel_op_sum_f32(
         constant ggml_metal_kargs_sum & args,
         device const float * src0,
@@ -5097,6 +5119,171 @@ kernel void kernel_snake_f32(
     }
 }
 
+// Gate chunks along ne0 of the LSTM pre-activation tensor (PyTorch/NeMo order), and the
+// result chunks along ne0.  Mirrors enum ggml_lstm_gate / ggml_lstm_out in ggml-impl.h.
+constant uint LSTM_GATE_INPUT  = 0;
+constant uint LSTM_GATE_FORGET = 1;
+constant uint LSTM_GATE_CELL   = 2;
+constant uint LSTM_GATE_OUTPUT = 3;
+constant uint LSTM_N_GATES     = 4;
+constant uint LSTM_OUT_H       = 0;
+constant uint LSTM_OUT_C       = 1;
+constant uint LSTM_N_OUTS      = 2;
+
+// One [h_new, c_new] pair from the gate column `g` and the element's previous cell
+// state. sigmoid / tanh are spelled exactly as the unary kernels spell them.
+static inline void lstm_cell_pair_f32(
+        device const float * g, float c_prev, uint H, uint j,
+        thread float & h_new, thread float & c_new) {
+    const float gi = 1 / (1 + exp(-g[LSTM_GATE_INPUT  * H + j]));
+    const float gf = 1 / (1 + exp(-g[LSTM_GATE_FORGET * H + j]));
+    const float gg = precise::tanh(g[LSTM_GATE_CELL   * H + j]);
+    const float go = 1 / (1 + exp(-g[LSTM_GATE_OUTPUT * H + j]));
+
+    // Metal compiles with fast math; the barrier stops the two products from
+    // contracting into an FMA, which the decomposed mul/mul/add graph cannot do.
+    {
+        #pragma clang fp contract(off)
+        c_new = gf * c_prev + gi * gg;
+    }
+
+    h_new = go * precise::tanh(c_new);
+}
+
+// Fused LSTM cell, one [h_new, c_new] pair per thread over a flat H*N grid-stride loop.
+kernel void kernel_lstm_cell_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,  // [4H, N]
+        device const float * c_prev, // [H, N]
+        device       float * dst,    // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, c_prev[n * prev_row + j], H, j,
+                           h_new, c_new);
+
+        device float * out = dst + n * LSTM_N_OUTS * H;
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+// Same cell over a packed [h | c] previous state: a column whose mask entry is zero
+// copies its previous pair instead of taking the fresh one.
+kernel void kernel_lstm_cell_masked_f32(
+        constant ggml_metal_kargs_lstm_cell & args,
+        device const float * gates,   // [4H, N]
+        device const float * hc_prev, // [2H, N]
+        device const float * mask,    // [N] or [1]
+        device       float * dst,     // [2H, N]
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+
+    const uint H        = (uint) args.H;
+    const uint prev_row = (uint) args.prev_row;
+    const uint c_base   = (uint) args.c_base;
+    const uint m_stride = (uint) args.mask_stride;
+    const uint total    = H * (uint) args.N;
+
+    const uint stride = ntg.x * tgpg.x;
+    for (uint k = tgpig.x * ntg.x + tpitg.x; k < total; k += stride) {
+        const uint n = k / H;
+        const uint j = k - n * H;
+
+        device const float * p   = hc_prev + n * prev_row;
+        device       float * out = dst     + n * LSTM_N_OUTS * H;
+
+        if (mask[n * m_stride] == 0.0f) {
+            out[LSTM_OUT_H * H + j] = p[j];
+            out[LSTM_OUT_C * H + j] = p[c_base + j];
+            continue;
+        }
+
+        float h_new;
+        float c_new;
+        lstm_cell_pair_f32(gates + n * LSTM_N_GATES * H, p[c_base + j], H, j, h_new, c_new);
+
+        out[LSTM_OUT_H * H + j] = h_new;
+        out[LSTM_OUT_C * H + j] = c_new;
+    }
+}
+
+
+// Result slots along ne0.  Mirrors enum ggml_tdt_step_in / ggml_tdt_step_out in ggml.h.
+constant uint TDT_STEP_IN_T      = 0;
+constant uint TDT_STEP_IN_S      = 1;
+constant uint TDT_STEP_IN_N      = 2;
+constant uint TDT_STEP_OUT_T     = 0;
+constant uint TDT_STEP_OUT_S     = 1;
+constant uint TDT_STEP_OUT_N     = 2;
+constant uint TDT_STEP_OUT_UPD   = 3;
+constant uint TDT_STEP_OUT_HOLD  = 4;
+constant uint TDT_STEP_OUT_FRAME = 5;
+
+// Greedy transducer step control, mirroring ggml_tdt_step_f32 in ggml-cpu/ops.cpp.
+kernel void kernel_tdt_step_f32(
+        constant ggml_metal_kargs_tdt_step & args,
+        device const int   * token,
+        device const int   * dur_idx,
+        device const float * state,
+        device const float * dur_table,
+        device       float * dst) {
+    const float t = state[TDT_STEP_IN_T];
+    const float s = state[TDT_STEP_IN_S];
+    const float n = state[TDT_STEP_IN_N];
+
+    float t_next = t;
+    float s_next = s;
+    float update = 0.0f;
+
+    if (t < n) {
+        const int   raw = dur_idx[0];
+        const int   di  = raw < 0 ? 0 : (raw < args.n_dur ? raw : args.n_dur - 1);
+        const float dur = args.rnnt ? 0.0f : dur_table[di];
+        const float adv = args.rnnt ? 1.0f : (dur > 1.0f ? dur : 1.0f);
+
+        if (token[0] == args.blank_id) {
+            t_next = t + adv;
+            s_next = 0.0f;
+        } else {
+            update = 1.0f;
+            s_next = s + 1.0f;
+            if ((args.rnnt == 0 && dur > 0.0f) || s_next >= (float) args.max_symbols) {
+                t_next = t + adv;
+                s_next = 0.0f;
+            }
+        }
+    }
+
+    float frame = t_next > n - 1.0f ? n - 1.0f : t_next;
+    if (frame < 0.0f) {
+        frame = 0.0f;
+    }
+
+    dst[TDT_STEP_OUT_T]     = t_next;
+    dst[TDT_STEP_OUT_S]     = s_next;
+    dst[TDT_STEP_OUT_N]     = n;
+    dst[TDT_STEP_OUT_UPD]   = update;
+    dst[TDT_STEP_OUT_HOLD]  = 1.0f - update;
+    dst[TDT_STEP_OUT_FRAME] = frame;
+}
+
 
 typedef void (conv_transpose_2d_t)(
         constant ggml_metal_kargs_conv_transpose_2d & args,
@@ -5187,6 +5374,92 @@ kernel void kernel_conv_transpose_2d<half>(
     uint3   tgpig[[threadgroup_position_in_grid]],
     uint3   tpitg[[thread_position_in_threadgroup]],
     uint3     ntg[[threads_per_threadgroup]]);
+
+// depthwise 2-D convolution (GGML_OP_CONV_2D_DW), one output element per thread with a
+// grid-stride loop. Mirrors ggml-cpu: WHCN kernel index c*KH*KW + ky*KW + kx, CWHN kernel index
+// (ky*KW + kx)*C + c, and the input/output strides follow the same two layouts.
+template <typename T>
+kernel void kernel_conv_2d_dw(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const T     * knl,
+        device const float * src,
+        device       float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int C  = args.C;
+    const int OW = args.OW;
+    const int OH = args.OH;
+    const int IW = args.IW;
+    const int IH = args.IH;
+    const int KW = args.KW;
+    const int KH = args.KH;
+
+    const uint total  = (uint) args.N * (uint) C * (uint) OH * (uint) OW;
+    const uint stride = ntg.x * tgpg.x;
+
+    for (uint gid = tgpig.x * ntg.x + tpitg.x; gid < total; gid += stride) {
+        int n, c, oy, ox;
+        if (args.cwhn) {
+            c  = gid % C;
+            ox = (gid / C) % OW;
+            oy = (gid / (C * OW)) % OH;
+            n  = gid / (C * OW * OH);
+        } else {
+            ox = gid % OW;
+            oy = (gid / OW) % OH;
+            c  = (gid / (OW * OH)) % C;
+            n  = gid / (OW * OH * C);
+        }
+
+        const int ky0 = max(0,  (args.p1 - oy * args.s1 + args.d1 - 1) / args.d1);
+        const int ky1 = min(KH, (IH + args.p1 - oy * args.s1 + args.d1 - 1) / args.d1);
+        const int kx0 = max(0,  (args.p0 - ox * args.s0 + args.d0 - 1) / args.d0);
+        const int kx1 = min(KW, (IW + args.p0 - ox * args.s0 + args.d0 - 1) / args.d0);
+
+        device const float * src_n = src + (size_t) n * C * IW * IH;
+
+        float acc = 0.0f;
+        for (int ky = ky0; ky < ky1; ++ky) {
+            const int iy = oy * args.s1 + ky * args.d1 - args.p1;
+            for (int kx = kx0; kx < kx1; ++kx) {
+                const int ix = ox * args.s0 + kx * args.d0 - args.p0;
+                const float v = args.cwhn ? src_n[((size_t) iy * IW + ix) * C + c]
+                                          : src_n[(size_t) c * IW * IH + (size_t) iy * IW + ix];
+                const float w = args.cwhn ? (float) knl[(ky * KW + kx) * C + c]
+                                          : (float) knl[c * KH * KW + ky * KW + kx];
+                acc += v * w;
+            }
+        }
+
+        const size_t o = args.cwhn ? (size_t) n * C * OW * OH + ((size_t) oy * OW + ox) * C + c
+                                   : (size_t) n * C * OW * OH + (size_t) c * OW * OH + (size_t) oy * OW + ox;
+        dst[o] = acc;
+    }
+}
+
+template [[host_name("kernel_conv_2d_dw_f32_f32")]]
+kernel void kernel_conv_2d_dw<float>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const float * knl,
+        device const float * src,
+        device       float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
+
+template [[host_name("kernel_conv_2d_dw_f16_f32")]]
+kernel void kernel_conv_2d_dw<half>(
+        constant ggml_metal_kargs_conv_2d_dw & args,
+        device const half  * knl,
+        device const float * src,
+        device       float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3  tgpg[[threadgroups_per_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]);
 
 constant bool FC_upscale_aa [[function_constant(FC_UPSCALE + 0)]];
 
@@ -7856,6 +8129,120 @@ template [[host_name("kernel_cpy_f16_f16")]]   kernel kernel_cpy_t kernel_cpy_t_
 template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  float>;
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
 #endif
+
+template<typename T0, typename T1>
+kernel void kernel_cpy_rows_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int ne00 = args.ne00;
+    const int ne01 = args.ne01;
+    const int nk0  = args.nk0;
+
+    const int i03 = tgpig[2];
+    const int i02 = tgpig[1];
+    const int i01 = ntg[1] == 1 ? (int) tgpig[0]%ne01 : (int) tgpig[0]*ntg[1] + tiitg/ntg[0];
+    const int iw0 = ntg[1] == 1 ? (int) tgpig[0]/ne01 : 0;
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    device const T0 * src_row = (device const T0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device       T1 * dst_row = (device       T1 *)(dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+
+    const int i0 = iw0*ntg[0] + tiitg%ntg[0];
+
+    for (short k = 0; k < N_CPY_ROW; ++k) {
+        const int i00 = i0 + k*nk0;
+
+        if (i00 < ne00) {
+            dst_row[i00] = (T1) src_row[i00];
+        }
+    }
+}
+
+typedef decltype(kernel_cpy_rows_t_t<float, float>) kernel_cpy_rows_t;
+
+template [[host_name("kernel_cpy_rows_f32_f32")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<float, float>;
+template [[host_name("kernel_cpy_rows_f32_f16")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<float, half>;
+template [[host_name("kernel_cpy_rows_f16_f32")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<half,  float>;
+template [[host_name("kernel_cpy_rows_f16_f16")]] kernel kernel_cpy_rows_t kernel_cpy_rows_t_t<half,  half>;
+
+// the src rows run along ne01, so read the tile along ne01 and write it back along ne00 - both coalesced
+template<typename T0, typename T1>
+static void cpy_transpose_load(
+        constant ggml_metal_kargs_cpy & args,
+        device const char * src_base,
+        threadgroup T1 (&tile)[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1],
+        int i00_0,
+        int i01_0,
+        ushort2 tpitg) {
+    for (ushort k = 0; k < SZ_CPY_TRANSPOSE; k += N_CPY_TRANSPOSE_ROWS) {
+        const int i00 = i00_0 + tpitg.y + k;
+        const int i01 = i01_0 + tpitg.x;
+
+        if (i00 < args.ne00 && i01 < args.ne01) {
+            device const T0 * src = (device const T0 *)(src_base + i00*args.nb00 + i01*args.nb01);
+
+            tile[tpitg.y + k][tpitg.x] = (T1) *src;
+        }
+    }
+}
+
+template<typename T1>
+static void cpy_transpose_store(
+        constant ggml_metal_kargs_cpy & args,
+        device char * dst_base,
+        threadgroup const T1 (&tile)[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1],
+        int i00_0,
+        int i01_0,
+        ushort2 tpitg) {
+    for (ushort k = 0; k < SZ_CPY_TRANSPOSE; k += N_CPY_TRANSPOSE_ROWS) {
+        const int i00 = i00_0 + tpitg.x;
+        const int i01 = i01_0 + tpitg.y + k;
+
+        if (i00 < args.ne00 && i01 < args.ne01) {
+            device T1 * dst_row = (device T1 *)(dst_base + i01*args.nb1);
+
+            dst_row[i00] = tile[tpitg.x][tpitg.y + k];
+        }
+    }
+}
+
+template<typename T0, typename T1>
+kernel void kernel_cpy_transpose_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    threadgroup T1 tile[SZ_CPY_TRANSPOSE][SZ_CPY_TRANSPOSE + 1];
+
+    const int ne02 = args.ne02;
+
+    const int i03 = (int) tgpig[2]/ne02;
+    const int i02 = (int) tgpig[2]%ne02;
+
+    const int i00_0 = (int) tgpig[0]*SZ_CPY_TRANSPOSE;
+    const int i01_0 = (int) tgpig[1]*SZ_CPY_TRANSPOSE;
+
+    cpy_transpose_load<T0, T1>(args, src0 + i03*args.nb03 + i02*args.nb02, tile, i00_0, i01_0, tpitg.xy);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    cpy_transpose_store<T1>(args, dst + i03*args.nb3 + i02*args.nb2, tile, i00_0, i01_0, tpitg.xy);
+}
+
+typedef decltype(kernel_cpy_transpose_t_t<float, float>) kernel_cpy_transpose_t;
+
+template [[host_name("kernel_cpy_transpose_f32_f32")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<float, float>;
+template [[host_name("kernel_cpy_transpose_f32_f16")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<float, half>;
+template [[host_name("kernel_cpy_transpose_f16_f32")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<half,  float>;
+template [[host_name("kernel_cpy_transpose_f16_f16")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose_t_t<half,  half>;
 
 template<short QK,
          typename block_q,

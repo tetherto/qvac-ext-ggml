@@ -3644,6 +3644,149 @@ static void ggml_compute_forward_geglu_quick(
     }
 }
 
+// ggml_compute_forward_siglu
+
+static void ggml_compute_forward_siglu_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    char * src0_d = (char *) src0->data;
+    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t src0_o = src0->nb[1];
+    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        float * src0_p = (float *) (src0_d + i1*src0_o);
+        float * src1_p = (float *) (src1_d + i1*src1_o);
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        ggml_vec_siglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+
+#ifndef NDEBUG
+        for (int k = 0; k < nc; k++) {
+            const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+            GGML_UNUSED(x);
+            assert(!isnan(x));
+            assert(!isinf(x));
+        }
+#endif // NDEBUG
+    }
+}
+
+static void ggml_compute_forward_siglu_f16(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    char * src0_d = (char *) src0->data;
+    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t src0_o = src0->nb[1];
+    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1*src0_o);
+        ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1*src1_o);
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        ggml_vec_siglu_f16(nc, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+
+#ifndef NDEBUG
+        for (int k = 0; k < nc; k++) {
+            const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+            const float v = GGML_FP16_TO_FP32(x);
+            GGML_UNUSED(v);
+            assert(!isnan(v));
+            assert(!isinf(v));
+        }
+#endif // NDEBUG
+    }
+}
+
+static void ggml_compute_forward_siglu(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_siglu_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_siglu_f16(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_norm
 
 static void ggml_compute_forward_norm_f32(
@@ -8241,6 +8384,172 @@ void ggml_compute_forward_snake(
     }
 }
 
+// ggml_compute_forward_lstm_cell
+
+// The two products feeding c_new must not contract into an FMA: the decomposed
+// mul/mul/add graph rounds each product, and the fused op has to match it exactly.
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC push_options
+#    pragma GCC optimize("fp-contract=off")
+#elif defined(_MSC_VER)
+#    pragma fp_contract(off)
+#endif
+
+static float ggml_lstm_cell_sigmoid_f32(float x) {
+    return 1.f / (1.f + expf(-x));
+}
+
+// One [h_new | c_new] pair per index of the flattened H*N grid. A column whose
+// mask entry is zero copies its previous pair instead of computing a fresh one.
+static void ggml_lstm_cell_band_f32(
+        const float * gates, const float * prev, const float * mask, float * dst,
+        int64_t H, int64_t prev_row, int64_t c_base, int64_t mask_stride,
+        int64_t first, int64_t last) {
+#if defined(__clang__)
+    #pragma clang fp contract(off)
+#endif
+    for (int64_t k = first; k < last; k++) {
+        const int64_t n = k / H;
+        const int64_t j = k - n*H;
+
+        const float * p   = prev + n*prev_row;
+        float       * out = dst  + n*GGML_LSTM_N_OUTS*H;
+
+        if (mask && mask[n*mask_stride] == 0.f) {
+            out[GGML_LSTM_OUT_H*H + j] = p[j];
+            out[GGML_LSTM_OUT_C*H + j] = p[c_base + j];
+            continue;
+        }
+
+        const float * g = gates + n*GGML_LSTM_N_GATES*H;
+
+        const float gi = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_INPUT *H + j]);
+        const float gf = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_FORGET*H + j]);
+        const float gg =                      tanhf(g[GGML_LSTM_GATE_CELL  *H + j]);
+        const float go = ggml_lstm_cell_sigmoid_f32(g[GGML_LSTM_GATE_OUTPUT*H + j]);
+
+        const float c_new = gf*p[c_base + j] + gi*gg;
+
+        out[GGML_LSTM_OUT_H*H + j] = go*tanhf(c_new);
+        out[GGML_LSTM_OUT_C*H + j] = c_new;
+    }
+}
+
+void ggml_compute_forward_lstm_cell(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * gates = dst->src[0];
+    const ggml_tensor * prev  = dst->src[1];
+    const ggml_tensor * mask  = dst->src[2];
+
+    GGML_ASSERT(gates->type == GGML_TYPE_F32);
+    GGML_ASSERT(prev->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gates));
+    GGML_ASSERT(ggml_is_contiguous(prev));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    // Unmasked: prev is c_prev [H, N]. Masked: prev is hc_prev [2H, N] and c
+    // starts half a row in.
+    const int64_t H      = dst->ne[0]/GGML_LSTM_N_OUTS;
+    const int64_t c_base = mask ? H : 0;
+    const int64_t total  = H*prev->ne[1];
+
+    // Threads own disjoint bands of the flattened H*N grid.
+    const int64_t per   = (total + params->nth - 1) / params->nth;
+    const int64_t first = per*params->ith;
+    const int64_t last  = MIN(first + per, total);
+
+    ggml_lstm_cell_band_f32((const float *) gates->data, (const float *) prev->data,
+                            mask ? (const float *) mask->data : NULL, (float *) dst->data,
+                            H, prev->ne[0], c_base,
+                            (mask && ggml_nelements(mask) > 1) ? 1 : 0, first, last);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC pop_options
+#elif defined(_MSC_VER)
+#    pragma fp_contract(on)
+#endif
+
+// ggml_compute_forward_tdt_step
+
+// Reference greedy transducer step control. Every backend kernel mirrors this
+// line by line; see ggml_tdt_step in ggml.h for the semantics.
+static void ggml_tdt_step_f32(
+        int32_t tok, int32_t dur_idx,
+        const float * state, const float * dur_table, int64_t n_dur,
+        int32_t blank_id, int32_t max_symbols, int32_t rnnt,
+        float * dst) {
+    const float t = state[GGML_TDT_STEP_IN_T];
+    const float s = state[GGML_TDT_STEP_IN_S];
+    const float n = state[GGML_TDT_STEP_IN_N];
+
+    float t_next = t;
+    float s_next = s;
+    float update = 0.0f;
+
+    if (t < n) {
+        const int64_t di  = dur_idx < 0 ? 0 : (dur_idx < n_dur ? dur_idx : n_dur - 1);
+        const float   dur = rnnt ? 0.0f : dur_table[di];
+        const float   adv = rnnt ? 1.0f : (dur > 1.0f ? dur : 1.0f);
+
+        if (tok == blank_id) {
+            t_next = t + adv;
+            s_next = 0.0f;
+        } else {
+            update = 1.0f;
+            s_next = s + 1.0f;
+            if ((!rnnt && dur > 0.0f) || s_next >= (float) max_symbols) {
+                t_next = t + adv;
+                s_next = 0.0f;
+            }
+        }
+    }
+
+    float frame = t_next > n - 1.0f ? n - 1.0f : t_next;
+    if (frame < 0.0f) {
+        frame = 0.0f;
+    }
+
+    dst[GGML_TDT_STEP_OUT_T]      = t_next;
+    dst[GGML_TDT_STEP_OUT_S]      = s_next;
+    dst[GGML_TDT_STEP_OUT_N]      = n;
+    dst[GGML_TDT_STEP_OUT_UPDATE] = update;
+    dst[GGML_TDT_STEP_OUT_HOLD]   = 1.0f - update;
+    dst[GGML_TDT_STEP_OUT_FRAME]  = frame;
+}
+
+void ggml_compute_forward_tdt_step(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * token     = dst->src[0];
+    const ggml_tensor * dur_idx   = dst->src[1];
+    const ggml_tensor * state     = dst->src[2];
+    const ggml_tensor * dur_table = dst->src[3];
+
+    GGML_ASSERT(token->type     == GGML_TYPE_I32);
+    GGML_ASSERT(dur_idx->type   == GGML_TYPE_I32);
+    GGML_ASSERT(state->type     == GGML_TYPE_F32);
+    GGML_ASSERT(dur_table->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(dst) == GGML_TDT_STEP_N_OUTS);
+
+    int32_t op_params[3];
+    memcpy(op_params, dst->op_params, sizeof(op_params));
+
+    ggml_tdt_step_f32(*(const int32_t *) token->data, *(const int32_t *) dur_idx->data,
+                      (const float *) state->data, (const float *) dur_table->data,
+                      ggml_nelements(dur_table),
+                      op_params[0], op_params[1], op_params[2],
+                      (float *) dst->data);
+}
+
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {
@@ -10342,6 +10651,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_GEGLU_QUICK:
             {
                 ggml_compute_forward_geglu_quick(params, dst);
+            } break;
+        case GGML_GLU_OP_SIGLU:
+            {
+                ggml_compute_forward_siglu(params, dst);
             } break;
         default:
             {

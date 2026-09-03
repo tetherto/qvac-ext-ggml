@@ -40,6 +40,8 @@
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
+#include "ggml-cuda/lstm-cell.cuh"
+#include "ggml-cuda/tdt-step.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
@@ -2844,6 +2846,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_GLU_OP_GEGLU_QUICK:
                     ggml_cuda_op_geglu_quick(ctx, dst);
                     break;
+                case GGML_GLU_OP_SIGLU:
+                    ggml_cuda_op_siglu(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -2967,6 +2972,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SNAKE:
             ggml_cuda_op_snake(ctx, dst);
+            break;
+        case GGML_OP_LSTM_CELL:
+            ggml_cuda_op_lstm_cell(ctx, dst);
+            break;
+        case GGML_OP_TDT_STEP:
+            ggml_cuda_op_tdt_step(ctx, dst);
             break;
         case GGML_OP_POOL_2D:
             ggml_cuda_op_pool2d(ctx, dst);
@@ -3589,19 +3600,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
-        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
-        const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
-        const ggml_tensor *add      = nullptr;
+    const bool is_norm_mul = (ops.size() == 2 || ops.size() == 3) && ops.begin()[1] == GGML_OP_MUL &&
+                             (ops.begin()[0] == GGML_OP_RMS_NORM || ops.begin()[0] == GGML_OP_NORM);
+
+    if (is_norm_mul) {
+        const ggml_tensor *norm = cgraph->nodes[node_idx];
+        const ggml_tensor *mul  = cgraph->nodes[node_idx+1];
+        const ggml_tensor *add  = nullptr;
 
         if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
             add = cgraph->nodes[node_idx+2];
         }
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+        GGML_ASSERT(norm->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(norm->type == GGML_TYPE_F32);
 
-        //rms norm only supports F32
+        //the fused norm kernels only support F32
         if (mul->src[0]->type != GGML_TYPE_F32 ||
             mul->src[1]->type != GGML_TYPE_F32 ||
             mul->type != GGML_TYPE_F32) {
@@ -3614,12 +3628,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        //if rms norm is the B operand, then we don't handle broadcast
-        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+        //if the norm is the B operand, then we don't handle broadcast
+        if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
             return false;
         }
 
-        //rms_norm kernel assumes contiguous rows
+        //the norm kernels assume contiguous rows
         if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
             return false;
         }
@@ -4070,6 +4084,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
 
@@ -4976,6 +5000,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SIGLU:
                     return ggml_is_contiguous_1(op->src[0]);
                 default:
                     return false;
@@ -5206,6 +5231,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_LSTM_CELL:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) &&
+                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_F32 &&
+                                    ggml_is_contiguous(op->src[2])));
+        case GGML_OP_TDT_STEP:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_SILU_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
             break;
