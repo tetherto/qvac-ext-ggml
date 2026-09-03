@@ -719,6 +719,10 @@ struct vk_device_struct {
     bool mul_mat_id_m[GGML_TYPE_COUNT];
     bool mul_mat_id_s[GGML_TYPE_COUNT];
 
+    // Set with the AMD coopmat warptiles below: their medium tile is only ~10% slower
+    // per output element than the large one, so tile choice can follow padding waste.
+    bool mul_mat_pad_aware_tile {};
+
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
@@ -3625,10 +3629,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
         } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
-            // This is intentionally using tx_m values, slight performance increase
-            l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-            l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            // This is intentionally using tx_m values, slight performance increase.
+            // Each subgroup takes a slice of BM and the whole of BN, so the shared B
+            // tile is read once per subgroup instead of once per (row, column) pair.
+            l_warptile = { subgroup_size_8 * 4, 128, 128, 16, 32, 128, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            l_warptile_mmq = l_warptile_mmq_int = { subgroup_size_8 * 4, 128, 128, 32, 32, 128, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
+            m_warptile = { subgroup_size_8 * 2, 64, 64, 16, 32, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            m_warptile_mmq = m_warptile_mmq_int = { subgroup_size_8 * 2, 64, 64, 32, 32, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            device->mul_mat_pad_aware_tile = true;
         } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support && device->architecture == INTEL_XE2) {
             // Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
@@ -7801,6 +7810,12 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     return split_k;
 }
 
+// Output elements a tile has to compute, including the padding its tile size forces.
+static uint64_t ggml_vk_padded_tile_work(uint32_t m, uint32_t n, const vk_pipeline& pipeline) {
+    return (uint64_t) CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0] *
+           (uint64_t) CEIL_DIV(n, pipeline->wg_denoms[1]) * pipeline->wg_denoms[1];
+}
+
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
@@ -7863,6 +7878,18 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     // throttle occupancy on wide-K GEMMs; `_m` cuts the LavaSR enhancer GEMM ~10% e2e.
     if (ctx->device->vendor_id == VK_VENDOR_ID_SAMSUNG && has_m) {
         return aligned ? mmp->a_m : mmp->m;
+    }
+    // Where the medium tile is nearly as efficient per element as the large one, the
+    // large tile only wins while it does not pad much more work. Measured crossover on
+    // Radeon 8060S: the medium tile wins at a 1.2x padding ratio and loses at 1.14x.
+    if (ctx->device->mul_mat_pad_aware_tile && has_l && has_m && mmp->l && mmp->m) {
+        constexpr uint64_t medium_tile_pad_num = 6;
+        constexpr uint64_t medium_tile_pad_den = 5;
+        const uint64_t work_l = ggml_vk_padded_tile_work(m, n, mmp->l);
+        const uint64_t work_m = ggml_vk_padded_tile_work(m, n, mmp->m);
+        if (work_l * medium_tile_pad_den >= work_m * medium_tile_pad_num) {
+            return aligned ? mmp->a_m : mmp->m;
+        }
     }
     return aligned ? mmp->a_l : mmp->l;
 

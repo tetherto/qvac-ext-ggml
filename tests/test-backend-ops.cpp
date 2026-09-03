@@ -8861,6 +8861,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 #endif
+    {
+        // Batch sizes whose padding to a 128-wide tile wastes over a fifth of the work, where the
+        // Vulkan backend's padding-aware rule switches the GEMM to the medium tile.
+        for (int n : {138, 275}) {
+            for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, n, 1024, {1, 1}, {1, 1}));
+            }
+        }
+    }
 
 #if 1
     for (ggml_type type_a : base_types) {
