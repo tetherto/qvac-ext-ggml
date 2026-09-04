@@ -6,13 +6,15 @@ on:
   pull_request:
     branches: [ master ]
 
-# One run per (workflow, PR/branch). The previous group fell back to
-# github.run_id whenever head_ref was empty — i.e. on every push and
-# workflow_dispatch — which made the group unique per run, so those runs never
-# cancelled. Keying on the PR number (or the ref, off-PR) puts successive
-# pushes and dispatches for the same branch in one group.
+# Dedupe per PR and per branch: a re-push or re-dispatch supersedes the
+# in-flight run. The previous group fell back to github.run_id whenever
+# head_ref was empty — i.e. on every push and workflow_dispatch — which made
+# the group unique per run, so those runs never cancelled.
+#
+# master is deliberately left on the run_id behaviour: pushes to the default
+# branch must not cancel each other, or a merged commit ends with no CI verdict.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:
