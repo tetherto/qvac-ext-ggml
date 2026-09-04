@@ -11,6 +11,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
+  lint-runner-names:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+      - name: Validate runner-name catalog (in sync + no hardcoded labels)
+        run: node .github/scripts/validate-runner-names.mjs
+      - name: Unit tests
+        run: node --test .github/scripts/test/runner-names.test.mjs
+
   build:
     strategy:
       matrix:
@@ -64,8 +81,8 @@ jobs:
 
 # TODO: simplify the following workflows using a matrix
   ggml-ci-x64-cpu-low-perf:
-    runs-on: ubuntu-22.04
-
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2204 }}
     steps:
       - name: Clone
         id: checkout
@@ -89,8 +106,8 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-low-perf:
-    runs-on: ubuntu-22.04-arm
-
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2204_arm }}
     steps:
       - name: Clone
         id: checkout
@@ -114,8 +131,8 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-x64-cpu-high-perf:
-    runs-on: ubuntu-22.04
-
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2204 }}
     steps:
       - name: Clone
         id: checkout
@@ -139,8 +156,8 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-high-perf:
-    runs-on: ubuntu-22.04-arm
-
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2204_arm }}
     steps:
       - name: Clone
         id: checkout
@@ -164,8 +181,8 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_NO_SVE=1 GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-high-perf-sve:
-    runs-on: ubuntu-22.04-arm
-
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.ubuntu_2204_arm }}
     steps:
       - name: Clone
         id: checkout
@@ -189,8 +206,8 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-x64-nvidia-cuda:
-    runs-on: [self-hosted, Linux, X64, NVIDIA]
-
+    needs: runner_names
+    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
     steps:
       - name: Clone
         id: checkout
@@ -203,8 +220,8 @@ jobs:
           GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
 
   ggml-ci-x64-nvidia-vulkan-cm:
-    runs-on: [self-hosted, Linux, X64, NVIDIA]
-
+    needs: runner_names
+    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
     steps:
       - name: Clone
         id: checkout
@@ -217,8 +234,8 @@ jobs:
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
 
   ggml-ci-x64-nvidia-vulkan-cm2:
-    runs-on: [self-hosted, Linux, X64, NVIDIA, COOPMAT2]
-
+    needs: runner_names
+    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia_coopmat2) }}
     steps:
       - name: Clone
         id: checkout
@@ -245,8 +262,8 @@ jobs:
   #        bash ./ci/run.sh ~/results/ggml /mnt/ggml
 
   ggml-ci-mac-metal:
-    runs-on: [self-hosted, macOS, ARM64]
-
+    needs: runner_names
+    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps:
       - name: Clone
         id: checkout
@@ -258,8 +275,8 @@ jobs:
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   ggml-ci-mac-vulkan:
-    runs-on: [self-hosted, macOS, ARM64]
-
+    needs: runner_names
+    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps:
       - name: Clone
         id: checkout
@@ -270,3 +287,4 @@ jobs:
         run: |
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
+
