@@ -5188,7 +5188,7 @@ kernel void kernel_lstm_cell_masked_f32(
         constant ggml_metal_kargs_lstm_cell & args,
         device const float * gates,   // [4H, N]
         device const float * hc_prev, // [2H, N]
-        device const float * mask,    // [N] or [1]
+        device const int   * mask,    // [N] or [1]
         device       float * dst,     // [2H, N]
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3  tgpg[[threadgroups_per_grid]],
@@ -5209,7 +5209,7 @@ kernel void kernel_lstm_cell_masked_f32(
         device const float * p   = hc_prev + n * prev_row;
         device       float * out = dst     + n * LSTM_N_OUTS * H;
 
-        if (mask[n * m_stride] == 0.0f) {
+        if (mask[n * m_stride] == 0) {
             out[LSTM_OUT_H * H + j] = p[j];
             out[LSTM_OUT_C * H + j] = p[c_base + j];
             continue;
@@ -5235,53 +5235,57 @@ constant uint TDT_STEP_OUT_N     = 2;
 constant uint TDT_STEP_OUT_UPD   = 3;
 constant uint TDT_STEP_OUT_HOLD  = 4;
 constant uint TDT_STEP_OUT_FRAME = 5;
+constant uint TDT_STEP_OUT_TOKEN = 6;
+constant uint TDT_STEP_OUT_DUR   = 7;
 
-// Greedy transducer step control, mirroring ggml_tdt_step_f32 in ggml-cpu/ops.cpp.
-kernel void kernel_tdt_step_f32(
+// Greedy transducer step control, mirroring ggml_tdt_step_i32 in ggml-cpu/ops.cpp.
+kernel void kernel_tdt_step_i32(
         constant ggml_metal_kargs_tdt_step & args,
-        device const int   * token,
-        device const int   * dur_idx,
-        device const float * state,
-        device const float * dur_table,
-        device       float * dst) {
-    const float t = state[TDT_STEP_IN_T];
-    const float s = state[TDT_STEP_IN_S];
-    const float n = state[TDT_STEP_IN_N];
+        device const int * token,
+        device const int * dur_idx,
+        device const int * state,
+        device const int * dur_table,
+        device       int * dst) {
+    const int t = state[TDT_STEP_IN_T];
+    const int s = state[TDT_STEP_IN_S];
+    const int n = state[TDT_STEP_IN_N];
 
-    float t_next = t;
-    float s_next = s;
-    float update = 0.0f;
+    int t_next = t;
+    int s_next = s;
+    int update = 0;
 
     if (t < n) {
-        const int   raw = dur_idx[0];
-        const int   di  = raw < 0 ? 0 : (raw < args.n_dur ? raw : args.n_dur - 1);
-        const float dur = args.rnnt ? 0.0f : dur_table[di];
-        const float adv = args.rnnt ? 1.0f : (dur > 1.0f ? dur : 1.0f);
+        const int raw = dur_idx[0];
+        const int di  = raw < 0 ? 0 : (raw < args.n_dur ? raw : args.n_dur - 1);
+        const int dur = args.rnnt ? 0 : dur_table[di];
+        const int adv = args.rnnt ? 1 : (dur > 1 ? dur : 1);
 
         if (token[0] == args.blank_id) {
             t_next = t + adv;
-            s_next = 0.0f;
+            s_next = 0;
         } else {
-            update = 1.0f;
-            s_next = s + 1.0f;
-            if ((args.rnnt == 0 && dur > 0.0f) || s_next >= (float) args.max_symbols) {
+            update = 1;
+            s_next = s + 1;
+            if ((args.rnnt == 0 && dur > 0) || s_next >= args.max_symbols) {
                 t_next = t + adv;
-                s_next = 0.0f;
+                s_next = 0;
             }
         }
     }
 
-    float frame = t_next > n - 1.0f ? n - 1.0f : t_next;
-    if (frame < 0.0f) {
-        frame = 0.0f;
+    int frame = t_next > n - 1 ? n - 1 : t_next;
+    if (frame < 0) {
+        frame = 0;
     }
 
     dst[TDT_STEP_OUT_T]     = t_next;
     dst[TDT_STEP_OUT_S]     = s_next;
     dst[TDT_STEP_OUT_N]     = n;
     dst[TDT_STEP_OUT_UPD]   = update;
-    dst[TDT_STEP_OUT_HOLD]  = 1.0f - update;
+    dst[TDT_STEP_OUT_HOLD]  = 1 - update;
     dst[TDT_STEP_OUT_FRAME] = frame;
+    dst[TDT_STEP_OUT_TOKEN] = token[0];
+    dst[TDT_STEP_OUT_DUR]   = dur_idx[0];
 }
 
 

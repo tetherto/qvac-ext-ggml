@@ -1842,7 +1842,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lstm_cell(ggml_m
     GGML_ASSERT(op->type         == GGML_TYPE_F32);
     if (op->src[2]) {
         GGML_ASSERT(ggml_is_contiguous(op->src[2]));
-        GGML_ASSERT(op->src[2]->type == GGML_TYPE_F32);
+        GGML_ASSERT(op->src[2]->type == GGML_TYPE_I32);
     }
 
     char base[256];
@@ -1868,9 +1868,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tdt_step(ggml_me
 
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_I32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_I32);
-    GGML_ASSERT(op->src[2]->type == GGML_TYPE_F32);
-    GGML_ASSERT(op->src[3]->type == GGML_TYPE_F32);
-    GGML_ASSERT(op->type         == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[2]->type == GGML_TYPE_I32);
+    GGML_ASSERT(op->src[3]->type == GGML_TYPE_I32);
+    GGML_ASSERT(op->type         == GGML_TYPE_I32);
 
     char base[256];
     char name[256];

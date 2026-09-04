@@ -619,6 +619,9 @@ static constexpr uint32_t IM2COL_1D_TILE_IC      = 16;
 static constexpr uint32_t IM2COL_1D_TILE_THREADS = 512;
 static constexpr uint32_t IM2COL_1D_SMEM_FLOATS  = 6144;
 
+// argmax reduces one row per workgroup; cap the lane count so short rows keep a shallow tree
+static constexpr uint32_t ARGMAX_MAX_BLOCK_SIZE = 1024;
+
 static constexpr uint32_t CPY_TRANSPOSE_LARGE_TILE_I00  = 64;
 static constexpr uint32_t CPY_TRANSPOSE_LARGE_TILE_I01  = 128;
 static constexpr uint32_t CPY_TRANSPOSE_LARGE_THREADS   = 512;
@@ -716,6 +719,10 @@ struct vk_device_struct {
     bool mul_mat_id_m[GGML_TYPE_COUNT];
     bool mul_mat_id_s[GGML_TYPE_COUNT];
 
+    // Set with the AMD coopmat warptiles below: their medium tile is only ~10% slower
+    // per output element than the large one, so tile choice can follow padding waste.
+    bool mul_mat_pad_aware_tile {};
+
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
@@ -809,6 +816,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
+    vk_pipeline pipeline_norm_mul_f32;
+    vk_pipeline pipeline_norm_mul_add_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
@@ -905,6 +914,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_channel_shuffle_f32;
     vk_pipeline pipeline_affine_prelu_f32;
     vk_pipeline pipeline_snake_f32;
+    vk_pipeline pipeline_lstm_cell_f32;
+    vk_pipeline pipeline_lstm_cell_masked_f32;
+    vk_pipeline pipeline_tdt_step_i32;
     vk_pipeline pipeline_col2im_1d_f32;
     vk_pipeline pipeline_col2im_1d_tiled_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1439,6 +1451,15 @@ struct vk_op_mul_pair_push_constants {
     uint32_t nb30; uint32_t nb31; uint32_t nb32; uint32_t nb33;
 };
 static_assert(sizeof(vk_op_mul_pair_push_constants) <= 128, "vk_op_mul_pair_push_constants must fit the guaranteed 128-byte push constant limit");
+
+// Fused norm+mul(+add): src0 shape, then the broadcast weight and bias descriptions.
+struct vk_op_norm_fused_push_constants {
+    uint32_t ne00; uint32_t ne01; uint32_t ne02; uint32_t nrows;
+    uint32_t ne10; uint32_t ne11; uint32_t ne12; uint32_t ne13; uint32_t nb10; uint32_t nb11; uint32_t nb12; uint32_t nb13;
+    uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23; uint32_t nb20; uint32_t nb21; uint32_t nb22; uint32_t nb23;
+    float param1;
+};
+static_assert(sizeof(vk_op_norm_fused_push_constants) <= 128, "vk_op_norm_fused_push_constants must fit the guaranteed 128-byte push constant limit");
 // update multi_add.comp if this changes
 static_assert(MAX_PARAMETER_COUNT == 12);
 static_assert(sizeof(vk_op_multi_add_push_constants) <= 256);
@@ -1683,6 +1704,17 @@ struct vk_op_affine_prelu_push_constants {
 
 struct vk_op_snake_push_constants {
     uint32_t ne, T;
+};
+
+struct vk_op_lstm_cell_push_constants {
+    uint32_t H, N, prev_row, c_base, mask_stride;
+    uint32_t gates_offset, prev_offset, mask_offset, dst_offset;
+};
+
+struct vk_op_tdt_step_push_constants {
+    uint32_t n_dur;
+    int32_t  blank_id, max_symbols, rnnt;
+    uint32_t token_offset, dur_idx_offset, state_offset, dur_table_offset, dst_offset;
 };
 
 struct vk_op_col2im_1d_push_constants {
@@ -3597,10 +3629,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
         } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && device->driver_id != vk::DriverId::eAmdProprietary) {
-            // This is intentionally using tx_m values, slight performance increase
-            l_warptile = { 256, 128, 128, 16, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-            l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            // This is intentionally using tx_m values, slight performance increase.
+            // Each subgroup takes a slice of BM and the whole of BN, so the shared B
+            // tile is read once per subgroup instead of once per (row, column) pair.
+            l_warptile = { subgroup_size_8 * 4, 128, 128, 16, 32, 128, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            l_warptile_mmq = l_warptile_mmq_int = { subgroup_size_8 * 4, 128, 128, 32, 32, 128, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
+            m_warptile = { subgroup_size_8 * 2, 64, 64, 16, 32, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            m_warptile_mmq = m_warptile_mmq_int = { subgroup_size_8 * 2, 64, 64, 32, 32, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+            device->mul_mat_pad_aware_tile = true;
         } else if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support && device->architecture == INTEL_XE2) {
             // Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
@@ -4782,6 +4819,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_norm_mul_f32, "norm_mul_f32", norm_fused_f32_len, norm_fused_f32_data, "main", 4, sizeof(vk_op_norm_fused_push_constants), {1, 1, 1}, {0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_norm_mul_add_f32, "norm_mul_add_f32", norm_fused_f32_len, norm_fused_f32_data, "main", 4, sizeof(vk_op_norm_fused_push_constants), {1, 1, 1}, {1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
@@ -5046,7 +5085,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    // one workgroup reduces a whole row, so wide rows (vocabulary logits) want every lane the device allows
+    const uint32_t argmax_block_size = std::min(ARGMAX_MAX_BLOCK_SIZE, 1u << device->max_workgroup_size_log2);
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { argmax_block_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_small_f32, "sum_rows_small_f32", sum_rows_small_f32_len, sum_rows_small_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {512, 1, 1}, {}, 1);
@@ -5161,6 +5202,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_channel_shuffle_f32, "channel_shuffle_f32", channel_shuffle_f32_len, channel_shuffle_f32_data, "main", 2, sizeof(vk_op_channel_shuffle_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32, "snake_f32", snake_f32_len, snake_f32_data, "main", 4, sizeof(vk_op_snake_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_lstm_cell_f32, "lstm_cell_f32", lstm_cell_f32_len, lstm_cell_f32_data, "main", 3, sizeof(vk_op_lstm_cell_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_lstm_cell_masked_f32, "lstm_cell_masked_f32", lstm_cell_masked_f32_len, lstm_cell_masked_f32_data, "main", 4, sizeof(vk_op_lstm_cell_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_tdt_step_i32, "tdt_step_i32", tdt_step_i32_len, tdt_step_i32_data, "main", 5, sizeof(vk_op_tdt_step_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32, "col2im_1d_f32", col2im_1d_f32_len, col2im_1d_f32_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {512, 1, 1}, {}, 1);
     // Devices below the tile's thread or shared-memory needs keep the
     // one-thread-per-output pipeline for every shape.
@@ -5549,9 +5593,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
-        // UMA reads host-visible memory at full speed, so device-local-first only buys a staging
-        // copy. Set here rather than beside the env read above: uma is not known until now.
-        if (device->uma) {
+        // Host-visible buffers are the faster default on UMA devices except AMD APUs, whose GPU
+        // reads them slower than device-local memory. Set here: uma is not known above.
+        if (device->uma && device->vendor_id != VK_VENDOR_ID_AMD) {
             device->prefer_host_memory = true;
         }
         if (sm_builtins) {
@@ -7766,8 +7810,14 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
     return split_k;
 }
 
-static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
-    VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+// Output elements a tile has to compute, including the padding its tile size forces.
+static uint64_t ggml_vk_padded_tile_work(uint32_t m, uint32_t n, const vk_pipeline& pipeline) {
+    return (uint64_t) CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0] *
+           (uint64_t) CEIL_DIV(n, pipeline->wg_denoms[1]) * pipeline->wg_denoms[1];
+}
+
+static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, uint32_t k, bool aligned, ggml_type src0_type, ggml_type src1_type) {
+    VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << k << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
     // A scalar family on a coopmat2 device (the GGML_PREC_F32 quantized path) is tiled
     // like the scalar shaders it holds, so the coopmat2 crossovers below do not apply
@@ -7829,14 +7879,36 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if (ctx->device->vendor_id == VK_VENDOR_ID_SAMSUNG && has_m) {
         return aligned ? mmp->a_m : mmp->m;
     }
+    // A GEMM with few K iterations cannot amortise the large tile's staging and
+    // epilogue cost, and its fat workgroups leave shader cores idle. Measured on a
+    // Radeon 8060S with the parakeet relative-position term (m=751, n=376, k=128,
+    // 8 heads): the small tile is 1.7x the large one's throughput at k=128 and 2.0x
+    // at k=32, the advantage is gone by k=512, and it cuts the 90 s encoder ~5%.
+    constexpr uint32_t small_tile_max_k = 128;
+    if (ctx->device->mul_mat_pad_aware_tile && has_s && mmp->s && k <= small_tile_max_k) {
+        return aligned ? mmp->a_s : mmp->s;
+    }
+
+    // Where the medium tile is nearly as efficient per element as the large one, the
+    // large tile only wins while it does not pad much more work. Measured crossover on
+    // Radeon 8060S: the medium tile wins at a 1.2x padding ratio and loses at 1.14x.
+    if (ctx->device->mul_mat_pad_aware_tile && has_l && has_m && mmp->l && mmp->m) {
+        constexpr uint64_t medium_tile_pad_num = 6;
+        constexpr uint64_t medium_tile_pad_den = 5;
+        const uint64_t work_l = ggml_vk_padded_tile_work(m, n, mmp->l);
+        const uint64_t work_m = ggml_vk_padded_tile_work(m, n, mmp->m);
+        if (work_l * medium_tile_pad_den >= work_m * medium_tile_pad_num) {
+            return aligned ? mmp->a_m : mmp->m;
+        }
+    }
     return aligned ? mmp->a_l : mmp->l;
 
     GGML_UNUSED(src1_type);
 }
 
-static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, ggml_type src0_type, ggml_type src1_type) {
-    VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline_align(" << m << ", " << n << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
-    return ggml_vk_guess_matmul_pipeline(ctx, mmp, m, n, true, src0_type, src1_type)->align;
+static uint32_t ggml_vk_guess_matmul_pipeline_align(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, int m, int n, int k, ggml_type src0_type, ggml_type src1_type) {
+    VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline_align(" << m << ", " << n << ", " << k << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+    return ggml_vk_guess_matmul_pipeline(ctx, mmp, m, n, k, true, src0_type, src1_type)->align;
 }
 
 static void ggml_vk_matmul(
@@ -8276,10 +8348,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // Not implemented
     GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, qx_needs_dequant ? f16_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type)));
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, ne10, qx_needs_dequant ? f16_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type)));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type));
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, ne10, aligned, qx_needs_dequant ? f16_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type));
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -10249,7 +10321,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_NORM:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_norm_f32;
+            switch (ctx->num_additional_fused_ops) {
+                case 0:  return ctx->device->pipeline_norm_f32;
+                case 1:  return ctx->device->pipeline_norm_mul_f32;
+                case 2:  return ctx->device->pipeline_norm_mul_add_f32;
+                default: return nullptr;
+            }
         }
         return nullptr;
     case GGML_OP_GROUP_NORM:
@@ -10597,6 +10674,17 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_snake_f32;
         }
         return nullptr;
+    case GGML_OP_LSTM_CELL:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return src2 != nullptr ? ctx->device->pipeline_lstm_cell_masked_f32
+                                   : ctx->device->pipeline_lstm_cell_f32;
+        }
+        return nullptr;
+    case GGML_OP_TDT_STEP:
+        if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
+            return ctx->device->pipeline_tdt_step_i32;
+        }
+        return nullptr;
     case GGML_OP_COL2IM_1D:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->device->pipeline_col2im_1d_tiled_f32 != nullptr && ggml_vk_col2im_1d_use_tiled(ctx, dst)) {
@@ -10788,6 +10876,27 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     GGML_UNUSED(src1);
     GGML_UNUSED(src2);
     GGML_UNUSED(src3);
+}
+
+static uint32_t get_misalign_elements(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
+    return t ? get_misalign_bytes(ctx, t) / ggml_type_size(t->type) : 0;
+}
+
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_lstm_cell_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.gates_offset = get_misalign_elements(ctx, src0);
+    p.prev_offset  = get_misalign_elements(ctx, src1);
+    p.mask_offset  = get_misalign_elements(ctx, src2);
+    p.dst_offset   = get_misalign_elements(ctx, dst);
+
+    GGML_UNUSED(src3);
+}
+
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_tdt_step_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.token_offset     = get_misalign_elements(ctx, src0);
+    p.dur_idx_offset   = get_misalign_elements(ctx, src1);
+    p.state_offset     = get_misalign_elements(ctx, src2);
+    p.dur_table_offset = get_misalign_elements(ctx, src3);
+    p.dst_offset       = get_misalign_elements(ctx, dst);
 }
 
 template<typename PC>
@@ -11133,6 +11242,22 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             const uint32_t n_s = dst->ne[2];
             elements = { nr, n_t, n_s };
         }
+        break;
+    case GGML_OP_LSTM_CELL:
+        {
+            // one thread per [h_new, c_new] pair over the flat H*N grid
+            const uint32_t ne = (uint32_t)(dst->ne[0]/GGML_LSTM_N_OUTS * dst->ne[1]);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+        }
+        break;
+    case GGML_OP_TDT_STEP:
+        elements = { 1, 1, 1 };
         break;
     case GGML_OP_GRU:
         {
@@ -11721,6 +11846,40 @@ static void ggml_vk_snake(ggml_backend_vk_context * ctx, vk_context& subctx, ggm
     });
 }
 
+static void ggml_vk_lstm_cell(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * gates = dst->src[0];  // [4H, N]
+    const ggml_tensor * prev  = dst->src[1];  // c_prev [H, N], or hc_prev [2H, N] when masked
+    const ggml_tensor * mask  = dst->src[2];  // [N] or [1], null when unmasked
+
+    // Unmasked: prev is c_prev [H, N]. Masked: prev is hc_prev [2H, N] and c
+    // starts half a row in.
+    const uint32_t H = (uint32_t)(dst->ne[0]/GGML_LSTM_N_OUTS);
+
+    ggml_vk_op_f32<vk_op_lstm_cell_push_constants>(ctx, subctx, gates, prev, mask, nullptr, dst, GGML_OP_LSTM_CELL, {
+        H,
+        (uint32_t)prev->ne[1],
+        (uint32_t)prev->ne[0],
+        mask ? H : 0,
+        (mask && ggml_nelements(mask) > 1) ? 1u : 0u,
+        0, 0, 0, 0,  // buffer offsets, filled in by init_pushconst_tensor_offsets
+    });
+}
+
+static void ggml_vk_tdt_step(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * token     = dst->src[0];
+    const ggml_tensor * dur_idx   = dst->src[1];
+    const ggml_tensor * state     = dst->src[2];
+    const ggml_tensor * dur_table = dst->src[3];
+
+    ggml_vk_op_f32<vk_op_tdt_step_push_constants>(ctx, subctx, token, dur_idx, state, dur_table, dst, GGML_OP_TDT_STEP, {
+        (uint32_t)ggml_nelements(dur_table),
+        ggml_get_op_params_i32(dst, 0),
+        ggml_get_op_params_i32(dst, 1),
+        ggml_get_op_params_i32(dst, 2),
+        0, 0, 0, 0, 0,  // buffer offsets, filled in by init_pushconst_tensor_offsets
+    });
+}
+
 static void ggml_vk_col2im_1d(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];  // columns [K*OC, T_in]
 
@@ -12062,8 +12221,51 @@ static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx,
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SILU_BACK, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
-static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    float * op_params = (float *)dst->op_params;
+// the tensor the fused MUL scales the normalized rows by
+static const ggml_tensor * ggml_vk_norm_fused_weight(const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    return mul->src[0] == norm ? mul->src[1] : mul->src[0];
+}
+
+// the tensor the fused ADD offsets the scaled rows by
+static const ggml_tensor * ggml_vk_norm_fused_bias(const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+    return add->src[0] == mul ? add->src[1] : add->src[0];
+}
+
+static void ggml_vk_norm_fused(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * norm  = cgraph->nodes[node_idx];
+    const ggml_tensor * src0  = norm->src[0];
+    const ggml_tensor * gamma = ggml_vk_norm_fused_weight(cgraph, node_idx);
+    const bool with_add = ctx->num_additional_fused_ops == 2;
+    // the shader never reads the bias when the ADD is absent, but the binding still needs a buffer
+    const ggml_tensor * beta = with_add ? ggml_vk_norm_fused_bias(cgraph, node_idx) : gamma;
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    const uint32_t gamma_type_size = ggml_type_size(gamma->type);
+    const uint32_t beta_type_size = ggml_type_size(beta->type);
+
+    ggml_vk_op_f32<vk_op_norm_fused_push_constants>(ctx, subctx, src0, gamma, beta, nullptr, dst, GGML_OP_NORM, {
+        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)ggml_nrows(src0),
+        (uint32_t)gamma->ne[0], (uint32_t)gamma->ne[1], (uint32_t)gamma->ne[2], (uint32_t)gamma->ne[3],
+        (uint32_t)(gamma->nb[0] / gamma_type_size), (uint32_t)(gamma->nb[1] / gamma_type_size), (uint32_t)(gamma->nb[2] / gamma_type_size), (uint32_t)(gamma->nb[3] / gamma_type_size),
+        (uint32_t)beta->ne[0], (uint32_t)beta->ne[1], (uint32_t)beta->ne[2], (uint32_t)beta->ne[3],
+        (uint32_t)(beta->nb[0] / beta_type_size), (uint32_t)(beta->nb[1] / beta_type_size), (uint32_t)(beta->nb[2] / beta_type_size), (uint32_t)(beta->nb[3] / beta_type_size),
+        ((const float *)norm->op_params)[0],
+    });
+}
+
+static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->num_additional_fused_ops > 0) {
+        ggml_vk_norm_fused(ctx, subctx, cgraph, node_idx);
+        return;
+    }
+
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = dst->src[0];
+    const float * op_params = (const float *)dst->op_params;
 
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], 0.0f, 0.0f, 0.0f });
 }
@@ -14265,7 +14467,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_NORM:
-        ggml_vk_norm(ctx, compute_ctx, src0, node);
+        ggml_vk_norm(ctx, compute_ctx, cgraph, node_idx);
 
         break;
     case GGML_OP_GROUP_NORM:
@@ -14487,6 +14689,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_SNAKE:
         ggml_vk_snake(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_LSTM_CELL:
+        ggml_vk_lstm_cell(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_TDT_STEP:
+        ggml_vk_tdt_step(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_COL2IM_1D:
@@ -15341,6 +15553,58 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
             return false;
         }
     }
+    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL) {
+        const ggml_tensor *norm = cgraph->nodes[node_idx];
+        const ggml_tensor *mul  = cgraph->nodes[node_idx + 1];
+        const ggml_tensor *add  = nullptr;
+
+        if (ops.size() == 3) {
+            if (ops.begin()[2] != GGML_OP_ADD) {
+                return false;
+            }
+            add = cgraph->nodes[node_idx + 2];
+        }
+
+        GGML_ASSERT(norm->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(norm->type == GGML_TYPE_F32);
+        // the fused norm shader only supports f32
+        if (mul->src[0]->type != GGML_TYPE_F32 ||
+            mul->src[1]->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
+                    add->src[1]->type != GGML_TYPE_F32 ||
+                    add->type != GGML_TYPE_F32)) {
+            return false;
+        }
+        // if norm is the B operand, then we don't handle broadcast
+        if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
+            return false;
+        }
+
+        const ggml_tensor *gamma = ggml_vk_norm_fused_weight(cgraph, node_idx);
+        const ggml_tensor *beta  = add ? ggml_vk_norm_fused_bias(cgraph, node_idx) : nullptr;
+
+        // the second operand must come from memory, not from the elided intermediate
+        if (gamma == norm || (beta && beta == mul)) {
+            return false;
+        }
+        // the shader indexes src0 and dst flat, and broadcasts the weights per row
+        if (!ggml_is_contiguous(norm->src[0]) ||
+            !ggml_is_contiguous(cgraph->nodes[node_idx + (int)ops.size() - 1]) ||
+            !ggml_is_contiguous_rows(gamma) || !ggml_can_repeat(gamma, norm)) {
+            return false;
+        }
+        if (beta && (!ggml_is_contiguous_rows(beta) || !ggml_can_repeat(beta, norm))) {
+            return false;
+        }
+        // the push constants carry no misalign offsets for the extra operands
+        if (get_misalign_bytes(ctx, gamma) != 0 || (beta && get_misalign_bytes(ctx, beta) != 0)) {
+            return false;
+        }
+    }
+
     auto const &mm_add_ok = [&](const ggml_tensor *mul, const ggml_tensor *add) {
         const ggml_tensor *bias = add->src[0] == mul ? add->src[1] : add->src[0];
 
@@ -15896,6 +16160,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // mean reduces rows to one element; keep the conservative overlap test
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "NORM_MUL_ADD";
+                // see RMS_NORM_MUL below: one workgroup per row, whole rows consumed before being overwritten
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL })) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "NORM_MUL";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "RMS_NORM_MUL";
@@ -17191,6 +17467,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_LSTM_CELL:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) &&
+                   (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 &&
+                                    ggml_is_contiguous(op->src[2])));
+        case GGML_OP_TDT_STEP:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                   op->src[2]->type == GGML_TYPE_I32 && op->src[3]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_COL2IM_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
@@ -18102,6 +18392,16 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_affine_prelu(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_SNAKE) {
             tensor_clone = ggml_snake(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+        } else if (tensor->op == GGML_OP_LSTM_CELL) {
+            tensor_clone = tensor->src[2]
+                             ? ggml_lstm_cell_masked(ggml_ctx, src_clone[0], src_clone[1], src_clone[2])
+                             : ggml_lstm_cell(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_TDT_STEP) {
+            tensor_clone = ggml_tdt_step(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
+                                         src_clone[4],
+                                         ggml_get_op_params_i32(tensor, 0),
+                                         ggml_get_op_params_i32(tensor, 1),
+                                         ggml_get_op_params_i32(tensor, 2));
         } else if (tensor->op == GGML_OP_COL2IM_1D) {
             const int32_t s0 = ggml_get_op_params_i32(tensor, 0);
             const int32_t oc = ggml_get_op_params_i32(tensor, 1);
