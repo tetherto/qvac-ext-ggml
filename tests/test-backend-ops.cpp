@@ -3364,6 +3364,36 @@ struct test_norm : public test_case {
     }
 };
 
+// GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL
+struct test_supertonic_layer_norm_channel : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const bool ct; // [C, T] layout instead of [T, C]
+    const float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR4(L, C, ct, eps);
+    }
+
+    test_supertonic_layer_norm_channel(int64_t L = 139, int64_t C = 512, bool ct = false, float eps = 1e-6f)
+        : L(L), C(C), ct(ct), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, L) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(a, "a");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(g, "g");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ct ? ggml_supertonic_layer_norm_channel_ct(ctx, a, g, b, eps)
+                               : ggml_supertonic_layer_norm_channel(ctx, a, g, b, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_NORM + GGML_OP_MUL + optional GGML_OP_ADD
 struct test_norm_mul_add : public test_case {
     const ggml_type type;
@@ -8644,6 +8674,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+        }
+    }
+    // Supertonic ConvNeXt shapes: the [T, C] kernel raced on its shared reduction slot for T >= 139.
+    for (bool ct : { false, true }) {
+        for (int64_t L : { 45, 139, 234, 1024 }) {
+            test_cases.emplace_back(new test_supertonic_layer_norm_channel(L, 512, ct));
         }
     }
 

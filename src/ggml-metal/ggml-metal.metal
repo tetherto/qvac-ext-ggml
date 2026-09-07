@@ -6039,6 +6039,8 @@ kernel void kernel_supertonic_layer_norm_channel_f32(
         my_sq += d * d;
     }
     my_sq = simd_sum(my_sq);
+    // Every simdgroup must have read the mean from shared[0] before it is reused below.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tiisg == 0) {
         shared[sgitg] = my_sq;
     }
