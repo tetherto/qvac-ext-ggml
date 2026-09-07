@@ -2177,6 +2177,110 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+struct ggml_metal_mm_epilogue {
+    int n_fuse = 1;
+    int mode = GGML_METAL_MM_EPI_NONE;
+    ggml_metal_buffer_id bias     = {};
+    ggml_metal_buffer_id gamma    = {};
+    ggml_metal_buffer_id residual = {};
+};
+
+static bool ggml_metal_mm_epilogue_enabled() {
+    static const bool enabled = getenv("GGML_METAL_FUSION_MM_EPILOGUE_DISABLE") == nullptr;
+    return enabled;
+}
+
+// A contiguous f32 vector with one entry per matmul output row, whatever its leading-1 shape.
+static bool ggml_metal_mm_epilogue_row_vec_ok(const ggml_tensor * v, const ggml_tensor * mm) {
+    return v && v->type == GGML_TYPE_F32 && ggml_is_contiguous(v) &&
+           ggml_nelements(v) == mm->ne[0] && v->ne[0] == mm->ne[0];
+}
+
+static bool ggml_metal_mm_epilogue_mat_ok(const ggml_tensor * r, const ggml_tensor * mm) {
+    return r && r->type == GGML_TYPE_F32 && ggml_is_contiguous(r) && ggml_are_same_shape(r, mm);
+}
+
+static bool ggml_metal_mm_epilogue_ct_layout(const ggml_tensor * op) {
+    return ggml_get_op_params_i32(op, 0) == 1;
+}
+
+// True when the two tensors occupy overlapping ranges of the same Metal buffer.
+static bool ggml_metal_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const ggml_metal_buffer_id ba = ggml_metal_get_buffer_id(a);
+    const ggml_metal_buffer_id bb = ggml_metal_get_buffer_id(b);
+    if (ba.metal != bb.metal) {
+        return false;
+    }
+    return ba.offs < bb.offs + ggml_nbytes(b) && bb.offs < ba.offs + ggml_nbytes(a);
+}
+
+// The fused kernel keeps reading both matmul operands while it stores the epilogue result, so the
+// result may not share memory with either of them (gallocr can place an add in place over its input).
+static bool ggml_metal_mm_epilogue_dst_ok(const ggml_tensor * mm, const ggml_tensor * dst) {
+    return !ggml_metal_tensors_overlap(dst, mm->src[0]) && !ggml_metal_tensors_overlap(dst, mm->src[1]);
+}
+
+// Match MUL_MAT followed by a fusable epilogue (bias add, bias plus residual adds, bias_gelu or
+// pw2_residual in the [C, T] layout) and describe it; leaves res untouched when nothing matches.
+static void ggml_metal_mm_epilogue_match(ggml_metal_op_t ctx, int idx, ggml_metal_mm_epilogue & res) {
+    const ggml_tensor * mm = ctx->node(idx);
+
+    const ggml_op ops_gelu[2] = { GGML_OP_MUL_MAT, GGML_OP_SUPERTONIC_BIAS_GELU };
+    if (ctx->can_fuse(idx, ops_gelu, 2)) {
+        const ggml_tensor * f1 = ctx->node(idx + 1);
+        if (f1->src[0] == mm && ggml_metal_mm_epilogue_ct_layout(f1) &&
+            ggml_metal_mm_epilogue_row_vec_ok(f1->src[1], mm) && ggml_metal_mm_epilogue_dst_ok(mm, f1)) {
+            res.n_fuse = 2;
+            res.mode   = GGML_METAL_MM_EPI_BIAS_GELU;
+            res.bias   = ggml_metal_get_buffer_id(f1->src[1]);
+            return;
+        }
+    }
+
+    const ggml_op ops_pw2[2] = { GGML_OP_MUL_MAT, GGML_OP_SUPERTONIC_PW2_RESIDUAL };
+    if (ctx->can_fuse(idx, ops_pw2, 2)) {
+        const ggml_tensor * f1 = ctx->node(idx + 1);
+        if (f1->src[0] == mm && ggml_metal_mm_epilogue_ct_layout(f1) &&
+            ggml_metal_mm_epilogue_row_vec_ok(f1->src[1], mm) &&
+            ggml_metal_mm_epilogue_row_vec_ok(f1->src[2], mm) &&
+            ggml_metal_mm_epilogue_mat_ok(f1->src[3], mm) && ggml_metal_mm_epilogue_dst_ok(mm, f1)) {
+            res.n_fuse   = 2;
+            res.mode     = GGML_METAL_MM_EPI_PW2_RESIDUAL;
+            res.bias     = ggml_metal_get_buffer_id(f1->src[1]);
+            res.gamma    = ggml_metal_get_buffer_id(f1->src[2]);
+            res.residual = ggml_metal_get_buffer_id(f1->src[3]);
+            return;
+        }
+    }
+
+    const ggml_op ops_add2[3] = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD };
+    if (ctx->can_fuse(idx, ops_add2, 3)) {
+        const ggml_tensor * f1 = ctx->node(idx + 1);
+        const ggml_tensor * f2 = ctx->node(idx + 2);
+        const ggml_tensor * r  = f2->src[0] == f1 ? f2->src[1] : f2->src[0];
+        if (f1->src[0] == mm && ggml_metal_mm_epilogue_row_vec_ok(f1->src[1], mm) &&
+            (f2->src[0] == f1 || f2->src[1] == f1) && ggml_metal_mm_epilogue_mat_ok(r, mm) &&
+            ggml_metal_mm_epilogue_dst_ok(mm, f2)) {
+            res.n_fuse   = 3;
+            res.mode     = GGML_METAL_MM_EPI_BIAS_RESIDUAL;
+            res.bias     = ggml_metal_get_buffer_id(f1->src[1]);
+            res.residual = ggml_metal_get_buffer_id(r);
+            return;
+        }
+    }
+
+    const ggml_op ops_add[2] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+    if (ctx->can_fuse(idx, ops_add, 2)) {
+        const ggml_tensor * f1 = ctx->node(idx + 1);
+        if (f1->src[0] == mm && ggml_metal_mm_epilogue_row_vec_ok(f1->src[1], mm) &&
+            ggml_metal_mm_epilogue_dst_ok(mm, f1)) {
+            res.n_fuse = 2;
+            res.mode   = GGML_METAL_MM_EPI_BIAS;
+            res.bias   = ggml_metal_get_buffer_id(f1->src[1]);
+        }
+    }
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2322,7 +2426,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        ggml_metal_mm_epilogue epi;
+        if (ctx->use_fusion && ggml_metal_mm_epilogue_enabled()) {
+            ggml_metal_mm_epilogue_match(ctx, idx, epi);
+        }
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, epi.mode);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -2341,11 +2450,17 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.r3   =*/ r3,
         };
 
+        const ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+        const ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(ctx->node(idx + epi.n_fuse - 1));
+
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0,                                 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]),     2);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,                                  3);
+        ggml_metal_encoder_set_buffer  (enc, epi.bias.metal     ? epi.bias     : bid_src0, 4);
+        ggml_metal_encoder_set_buffer  (enc, epi.gamma.metal    ? epi.gamma    : bid_src0, 5);
+        ggml_metal_encoder_set_buffer  (enc, epi.residual.metal ? epi.residual : bid_src0, 6);
 
         const size_t smem = pipeline.smem;
 
@@ -2356,6 +2471,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nsg = pipeline.nsg;
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+
+        return epi.n_fuse;
     } else {
         // Look ahead: can we fuse a following ADD(bias) (optionally followed
         // by another ADD(residual)) into this mat-vec kernel?  Saves one or

@@ -92,6 +92,13 @@
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   500
 #define FC_MUL_MV                      600
 #define FC_MUL_MM                      700
+
+// mul_mm epilogue applied at the tile store, selected by function constant FC_MUL_MM + 2.
+#define GGML_METAL_MM_EPI_NONE          0
+#define GGML_METAL_MM_EPI_BIAS          1
+#define GGML_METAL_MM_EPI_BIAS_RESIDUAL 2
+#define GGML_METAL_MM_EPI_BIAS_GELU     3
+#define GGML_METAL_MM_EPI_PW2_RESIDUAL  4
 #define FC_ROPE                        800
 #define FC_SSM_CONV                    900
 #define FC_SOLVE_TRI                   1000

@@ -10249,6 +10249,33 @@ kernel void kernel_diag_f32(
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
+constant int  FC_mul_mm_epi    [[function_constant(FC_MUL_MM + 2)]];
+
+// Fused epilogue for dst element (m, n) with value v; off is its flat index including the batch offset.
+// The expressions match the standalone add, bias_gelu and pw2_residual kernels exactly.
+static inline float mul_mm_epilogue(
+        float v,
+        int m,
+        uint64_t off,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual) {
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE) {
+        return v;
+    }
+    const float b = ((device const float *) bias)[m];
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS) {
+        return v + b;
+    }
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS_RESIDUAL) {
+        return (v + b) + ((device const float *) residual)[off];
+    }
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS_GELU) {
+        const float x = v + b;
+        return 0.5f * x * (1.0f + erf_approx<float>(x * SQRT_2_INV));
+    }
+    return ((device const float *) residual)[off] + (v + b) * ((device const float *) gamma)[m];
+}
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -10262,6 +10289,9 @@ kernel void kernel_mul_mm_tensor(
         device const char * srcA,
         device const char * srcB,
         device       char * dst,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiitg [[thread_index_in_threadgroup]],
@@ -10377,8 +10407,27 @@ kernel void kernel_mul_mm_tensor(
     // cT.store handles bounds checking via tD's extents (M, N)
     device float * dstBatch = (device float *)dst + im * N * M;
 
-    auto tD = tensor(dstBatch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
-    cT.store(tD.slice(ra, rb));
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE) {
+        auto tD = tensor(dstBatch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
+        cT.store(tD.slice(ra, rb));
+        return;
+    }
+
+    // Fused epilogue: visit this thread's tile elements and store them with bounds checks.
+    const uint64_t batch_off = (uint64_t) im * N * M;
+    using ct_index_t = typename decltype(cT)::thread_index_type;
+    FOR_UNROLL (ct_index_t i = 0; i < cT.get_capacity(); ++i) {
+        if (!cT.is_valid_element(i)) {
+            continue;
+        }
+        const auto ids = cT.get_multidimensional_index(i);
+        const int m = ra + ids[0];
+        const int n = rb + ids[1];
+        if (m < M && n < N) {
+            const uint64_t off = (uint64_t) n * M + m;
+            dstBatch[off] = mul_mm_epilogue(cT[i], m, batch_off + off, bias, gamma, residual);
+        }
+    }
 }
 
 #endif // GGML_METAL_HAS_TENSOR
@@ -10396,6 +10445,9 @@ kernel void kernel_mul_mm_simd(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -10558,7 +10610,7 @@ kernel void kernel_mul_mm_simd(
         }
     }
 
-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE && (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1))) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
@@ -10579,7 +10631,20 @@ kernel void kernel_mul_mm_simd(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sgitg == 0) {
+        if (FC_mul_mm_epi != GGML_METAL_MM_EPI_NONE) {
+            // every thread applies the epilogue to a slice of the staged tile
+            constexpr int NUM_THREADS = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+            threadgroup const float * tile = (threadgroup const float *) shmem;
+            const uint64_t batch_off = (uint64_t) im*args.ne1*args.ne0;
+            for (int e = tiitg; e < nr1*NR0; e += NUM_THREADS) {
+                const int j = e / NR0;
+                const int i = e % NR0;
+                if (i < nr0) {
+                    const uint64_t off = batch_off + (uint64_t) (r1 + j)*args.ne0 + r0 + i;
+                    ((device float *) dst)[off] = mul_mm_epilogue(tile[e], r0 + i, off, bias, gamma, residual);
+                }
+            }
+        } else if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
                 device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
                 device float4 * D4 = (device float4 *) D;

@@ -3394,6 +3394,67 @@ struct test_supertonic_layer_norm_channel : public test_case {
     }
 };
 
+// MUL_MAT followed by an epilogue the Metal backend fuses into its mat-mat kernels
+struct test_supertonic_mm_epilogue : public test_case {
+    // BIAS_RESIDUAL_INPLACE stores the result over the matmul input, which the fusion must refuse.
+    enum epilogue { BIAS = 1, BIAS_RESIDUAL, BIAS_GELU, PW2_RESIDUAL, BIAS_RESIDUAL_INPLACE };
+
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int mode;
+    const bool prec_f32;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, m, n, k, mode, prec_f32);
+    }
+
+    double max_nmse_err() override {
+        return prec_f32 ? 1e-9 : 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_supertonic_mm_epilogue(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode, bool prec_f32 = false)
+        : type_a(type_a), m(m), n(n), k(k), mode(mode), prec_f32(prec_f32) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+        if (prec_f32) {
+            ggml_mul_mat_set_prec(mm, GGML_PREC_F32);
+        }
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * out = nullptr;
+        if (mode == BIAS) {
+            out = ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1));
+        } else if (mode == BIAS_RESIDUAL) {
+            ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+            ggml_set_name(residual, "residual");
+            out = ggml_add(ctx, ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1)), residual);
+        } else if (mode == BIAS_RESIDUAL_INPLACE) {
+            GGML_ASSERT(m == k);
+            out = ggml_add_inplace(ctx, b, ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1)));
+        } else if (mode == BIAS_GELU) {
+            out = ggml_supertonic_bias_gelu_ct(ctx, mm, bias);
+        } else {
+            ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_set_name(gamma, "gamma");
+            ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+            ggml_set_name(residual, "residual");
+            out = ggml_supertonic_pw2_residual_ct(ctx, mm, bias, gamma, residual);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SUPERTONIC_DEPTHWISE_1D
 struct test_supertonic_depthwise_1d : public test_case {
     const int64_t L;
@@ -8731,6 +8792,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_supertonic_depthwise_1d(4096, 512, 7, 1, true, true));
     test_cases.emplace_back(new test_supertonic_depthwise_1d(278, 512, 7, 27, true, false, 139));
     test_cases.emplace_back(new test_supertonic_depthwise_1d(90, 512, 5, 8, true, false, 45));
+    // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
+    for (int mode : { 1, 2, 3, 4 }) {
+        for (auto shape : { std::array<int64_t, 3>{512, 139, 512}, std::array<int64_t, 3>{2048, 90, 512}, std::array<int64_t, 3>{512, 468, 2048}, std::array<int64_t, 3>{144, 278, 512}, std::array<int64_t, 3>{100, 37, 96} }) {
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32,  shape[0], shape[1], shape[2], mode, true));
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32,  shape[0], shape[1], shape[2], mode));
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F16,  shape[0], shape[1], shape[2], mode));
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_Q8_0, shape[0], shape[1], shape[2], mode));
+        }
+        test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F16, 100, 37, 100, mode));
+    }
+    for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_supertonic_mm_epilogue(type_a, 512, 139, 512, test_supertonic_mm_epilogue::BIAS_RESIDUAL_INPLACE));
+    }
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));

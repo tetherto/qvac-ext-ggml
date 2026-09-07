@@ -700,7 +700,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op, int epilogue) {
     char base[256];
     char name[256];
 
@@ -734,14 +734,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), prec_f32 ? "_prec" : "");
-    snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
+    snprintf(name, 256, "%s_bci=%d_bco=%d_epi=%d", base, bc_inp, bc_out, epilogue);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
-        ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
-        ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
+        ggml_metal_cv_set_bool (cv, bc_inp,   FC_MUL_MM + 0);
+        ggml_metal_cv_set_bool (cv, bc_out,   FC_MUL_MM + 1);
+        ggml_metal_cv_set_int32(cv, epilogue, FC_MUL_MM + 2);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -762,7 +763,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         // same allocation to stage a 64x32 f32 output tile, so it needs 8192 bytes of its own.
         const size_t smem_ab = (64 + 32) * 32 * sz_operand;
 
-        res.smem = std::max<size_t>(smem_ab, bc_out ? 8192 : 0);
+        // the ragged-output and fused-epilogue paths stage the 64x32 f32 tile in threadgroup memory
+        const bool stage_tile = bc_out || epilogue != GGML_METAL_MM_EPI_NONE;
+        res.smem = std::max<size_t>(smem_ab, stage_tile ? 8192 : 0);
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
