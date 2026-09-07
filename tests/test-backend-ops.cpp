@@ -3364,6 +3364,190 @@ struct test_norm : public test_case {
     }
 };
 
+// GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL
+struct test_supertonic_layer_norm_channel : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const bool ct; // [C, T] layout instead of [T, C]
+    const float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR4(L, C, ct, eps);
+    }
+
+    test_supertonic_layer_norm_channel(int64_t L = 139, int64_t C = 512, bool ct = false, float eps = 1e-6f)
+        : L(L), C(C), ct(ct), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, L) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(a, "a");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(g, "g");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ct ? ggml_supertonic_layer_norm_channel_ct(ctx, a, g, b, eps)
+                               : ggml_supertonic_layer_norm_channel(ctx, a, g, b, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// MUL_MAT followed by an epilogue the Metal backend fuses into its mat-mat kernels
+struct test_supertonic_mm_epilogue : public test_case {
+    // BIAS_RESIDUAL_INPLACE stores the result over the matmul input, which the fusion must refuse.
+    enum epilogue { BIAS = 1, BIAS_RESIDUAL, BIAS_GELU, PW2_RESIDUAL, BIAS_RESIDUAL_INPLACE };
+
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int mode;
+    const bool prec_f32;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, m, n, k, mode, prec_f32);
+    }
+
+    double max_nmse_err() override {
+        return prec_f32 ? 1e-9 : 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_supertonic_mm_epilogue(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode, bool prec_f32 = false)
+        : type_a(type_a), m(m), n(n), k(k), mode(mode), prec_f32(prec_f32) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+        if (prec_f32) {
+            ggml_mul_mat_set_prec(mm, GGML_PREC_F32);
+        }
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * out = nullptr;
+        if (mode == BIAS) {
+            out = ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1));
+        } else if (mode == BIAS_RESIDUAL) {
+            ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+            ggml_set_name(residual, "residual");
+            out = ggml_add(ctx, ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1)), residual);
+        } else if (mode == BIAS_RESIDUAL_INPLACE) {
+            GGML_ASSERT(m == k);
+            out = ggml_add_inplace(ctx, b, ggml_add(ctx, mm, ggml_reshape_2d(ctx, bias, m, 1)));
+        } else if (mode == BIAS_GELU) {
+            out = ggml_supertonic_bias_gelu_ct(ctx, mm, bias);
+        } else {
+            ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_set_name(gamma, "gamma");
+            ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+            ggml_set_name(residual, "residual");
+            out = ggml_supertonic_pw2_residual_ct(ctx, mm, bias, gamma, residual);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_SUPERTONIC_DEPTHWISE_1D
+struct test_supertonic_depthwise_1d : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t K;
+    const int dilation;
+    const bool ct;      // [C, T] layout instead of [T, C]
+    const bool causal;  // causal-left taps ([C, T] only)
+    const int seg_len;  // clamp inside seg_len windows ([C, T] only)
+
+    std::string vars() override {
+        return VARS_TO_STR7(L, C, K, dilation, ct, causal, seg_len);
+    }
+
+    test_supertonic_depthwise_1d(int64_t L = 139, int64_t C = 512, int64_t K = 7, int dilation = 3,
+                                 bool ct = true, bool causal = false, int seg_len = 0)
+        : L(L), C(C), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, L) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out;
+        if (seg_len > 0) {
+            out = ggml_supertonic_depthwise_1d_ct_segmented(ctx, a, w, b, dilation, seg_len);
+        } else if (causal) {
+            out = ggml_supertonic_depthwise_1d_causal_ct(ctx, a, w, b, dilation);
+        } else if (ct) {
+            out = ggml_supertonic_depthwise_1d_ct(ctx, a, w, b, dilation);
+        } else {
+            out = ggml_supertonic_depthwise_1d(ctx, a, w, b, dilation);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// SUPERTONIC_DEPTHWISE_1D followed by SUPERTONIC_LAYER_NORM_CHANNEL, which Metal runs as one dispatch
+struct test_supertonic_depthwise_layer_norm : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t K;
+    const int dilation;
+    const bool ct;
+    const bool causal;
+    const int seg_len;
+
+    std::string vars() override {
+        return VARS_TO_STR7(L, C, K, dilation, ct, causal, seg_len);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_supertonic_depthwise_layer_norm(int64_t L, int64_t C, int64_t K, int dilation,
+                                         bool ct = true, bool causal = false, int seg_len = 0)
+        : L(L), C(C), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, L) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(g, "g");
+        ggml_tensor * beta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * dw;
+        if (seg_len > 0) {
+            dw = ggml_supertonic_depthwise_1d_ct_segmented(ctx, a, w, b, dilation, seg_len);
+        } else if (causal) {
+            dw = ggml_supertonic_depthwise_1d_causal_ct(ctx, a, w, b, dilation);
+        } else if (ct) {
+            dw = ggml_supertonic_depthwise_1d_ct(ctx, a, w, b, dilation);
+        } else {
+            dw = ggml_supertonic_depthwise_1d(ctx, a, w, b, dilation);
+        }
+        const float eps = 1e-6f;
+        ggml_tensor * out = ct ? ggml_supertonic_layer_norm_channel_ct(ctx, dw, g, beta, eps)
+                               : ggml_supertonic_layer_norm_channel(ctx, dw, g, beta, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_NORM + GGML_OP_MUL + optional GGML_OP_ADD
 struct test_norm_mul_add : public test_case {
     const ggml_type type;
@@ -8646,6 +8830,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
     }
+    // Supertonic ConvNeXt shapes: the [T, C] kernel raced on its shared reduction slot for T >= 139.
+    for (bool ct : { false, true }) {
+        for (int64_t L : { 45, 139, 234, 1024 }) {
+            test_cases.emplace_back(new test_supertonic_layer_norm_channel(L, 512, ct));
+        }
+    }
+    for (int64_t K : { 3, 5, 7 }) {
+        test_cases.emplace_back(new test_supertonic_depthwise_1d(139, 512, K, 3, true));
+        test_cases.emplace_back(new test_supertonic_depthwise_1d(139, 512, K, 2, false));
+    }
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(4096, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(278, 512, 7, 27, true, false, 139));
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(90, 512, 5, 8, true, false, 45));
+    // Metal fuses the depthwise taps into the following channel layer norm; the last shape exceeds
+    // its per-thread register budget and must fall back to two dispatches.
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(90, 512, 7, 1, true, false, 45));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(278, 512, 7, 3, true, false, 139));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(468, 512, 7, 9, true, false, 234));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(2808, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(53, 256, 5, 2, false));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(54, 64, 5, 1, false));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2048, 3, 1, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2304, 3, 1, true));
+    // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
+    for (int mode : { 1, 2, 3, 4 }) {
+        for (auto shape : { std::array<int64_t, 3>{512, 139, 512}, std::array<int64_t, 3>{2048, 90, 512}, std::array<int64_t, 3>{512, 468, 2048}, std::array<int64_t, 3>{144, 278, 512}, std::array<int64_t, 3>{100, 37, 96} }) {
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32,  shape[0], shape[1], shape[2], mode, true));
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32,  shape[0], shape[1], shape[2], mode));
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F16,  shape[0], shape[1], shape[2], mode));
+            test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_Q8_0, shape[0], shape[1], shape[2], mode));
+        }
+        test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F16, 100, 37, 100, mode));
+    }
+    for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        test_cases.emplace_back(new test_supertonic_mm_epilogue(type_a, 512, 139, 512, test_supertonic_mm_epilogue::BIAS_RESIDUAL_INPLACE));
+    }
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
@@ -9048,6 +9268,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
+
+    // K not a multiple of 32
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  65, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  80, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 32,  80, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 32,  80, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32, 588, {1, 1}, {1, 1})); // 14*14*3, e.g. conv_2d im2col
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  80, {4, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 45, 144, {1, 1}, {1, 1})); // supertonic proj_in
+
+    // mat-mat N tiles: the backend picks the narrow tile when it issues fewer padded columns than the
+    // wide one, so both widths need exact, ragged and just-past-a-boundary N.
+    for (int n : {90, 96, 97, 128, 192, 256, 278, 468}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  512, n, 512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 512, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 100, 278, 2048, {1, 1}, {1, 1})); // ragged M under the narrow N tile
 
 #if 0
     // test the mat-mat path for Metal

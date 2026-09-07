@@ -5886,6 +5886,43 @@ kernel void kernel_pad_reflect_1d_f32(
     }
 }
 
+// One tap of channel row x_c at time t: the source index clamps to [lo, hi).
+static inline float supertonic_depthwise_tap(device const float * x_c, device const float * w_c,
+                                             int t, int lo, int hi, int k, int dilation, int k_off,
+                                             int sxt, float sum) {
+    int s = t + (k + k_off) * dilation;
+    if (s < lo) s = lo; else if (s >= hi) s = hi - 1;
+    return fma(x_c[(size_t) s * sxt], w_c[k], sum);
+}
+
+// One depthwise output: bias plus the K taps accumulated as an explicit fma chain, so the
+// standalone kernel and the layer-norm fusion compute bit-identical values.
+static inline float supertonic_depthwise_tap_sum(device const float * x_c, device const float * w_c,
+                                                 int t, int lo, int hi, int K, int dilation, int k_off,
+                                                 int sxt, float bias_v) {
+    float sum = bias_v;
+    if (K == 7) {
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 3, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 4, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 5, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 6, dilation, k_off, sxt, sum);
+    } else if (K == 5) {
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 3, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 4, dilation, k_off, sxt, sum);
+    } else { // K == 3
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+    }
+    return sum;
+}
+
 // Supertonic fused depthwise-1D conv with edge-clamp padding + bias add.
 // Replaces the edge_clamp_pad_1d + im2col + mul_mat + add sequence the
 // stock depthwise_same_ggml graph fallback emits.  One threadgroup per
@@ -5930,48 +5967,105 @@ kernel void kernel_supertonic_depthwise_1d_f32(
     // the last tap at k = K-1 lands at t and earlier taps look strictly
     // left.
     const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
+    const int seg_len = args.seg_len;
 
     for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
-        float sum = bias_v;
-        // Compile-time peeled inner loop for K in {3, 5, 7}.  K=3/5 is the
-        // vector_estimator's symmetric ConvNeXt; K=7 is the vocoder's causal
-        // ConvNeXt.  Right-clamp `s >= L` is required for the symmetric path
-        // only — in causal mode all taps satisfy s ≤ t < L by construction.
-        if (K == 7) {
-            int s0 = t + (0 + k_off)*dilation; if (s0 < 0) s0 = 0; else if (s0 >= L) s0 = L - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < 0) s1 = 0; else if (s1 >= L) s1 = L - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < 0) s2 = 0; else if (s2 >= L) s2 = L - 1;
-            int s3 = t + (3 + k_off)*dilation; if (s3 < 0) s3 = 0; else if (s3 >= L) s3 = L - 1;
-            int s4 = t + (4 + k_off)*dilation; if (s4 < 0) s4 = 0; else if (s4 >= L) s4 = L - 1;
-            int s5 = t + (5 + k_off)*dilation; if (s5 < 0) s5 = 0; else if (s5 >= L) s5 = L - 1;
-            int s6 = t + (6 + k_off)*dilation; if (s6 < 0) s6 = 0; else if (s6 >= L) s6 = L - 1;
-            sum += x_c[(size_t) s0 * sxt] * w_c[0]
-                 + x_c[(size_t) s1 * sxt] * w_c[1]
-                 + x_c[(size_t) s2 * sxt] * w_c[2]
-                 + x_c[(size_t) s3 * sxt] * w_c[3]
-                 + x_c[(size_t) s4 * sxt] * w_c[4]
-                 + x_c[(size_t) s5 * sxt] * w_c[5]
-                 + x_c[(size_t) s6 * sxt] * w_c[6];
-        } else if (K == 5) {
-            int s0 = t + (0 + k_off)*dilation; if (s0 < 0) s0 = 0; else if (s0 >= L) s0 = L - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < 0) s1 = 0; else if (s1 >= L) s1 = L - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < 0) s2 = 0; else if (s2 >= L) s2 = L - 1;
-            int s3 = t + (3 + k_off)*dilation; if (s3 < 0) s3 = 0; else if (s3 >= L) s3 = L - 1;
-            int s4 = t + (4 + k_off)*dilation; if (s4 < 0) s4 = 0; else if (s4 >= L) s4 = L - 1;
-            sum += x_c[(size_t) s0 * sxt] * w_c[0]
-                 + x_c[(size_t) s1 * sxt] * w_c[1]
-                 + x_c[(size_t) s2 * sxt] * w_c[2]
-                 + x_c[(size_t) s3 * sxt] * w_c[3]
-                 + x_c[(size_t) s4 * sxt] * w_c[4];
-        } else { // K == 3
-            int s0 = t + (0 + k_off)*dilation; if (s0 < 0) s0 = 0; else if (s0 >= L) s0 = L - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < 0) s1 = 0; else if (s1 >= L) s1 = L - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < 0) s2 = 0; else if (s2 >= L) s2 = L - 1;
-            sum += x_c[(size_t) s0 * sxt] * w_c[0]
-                 + x_c[(size_t) s1 * sxt] * w_c[1]
-                 + x_c[(size_t) s2 * sxt] * w_c[2];
+        const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+        const int hi = seg_len > 0 ? lo + seg_len : L;
+        y_c[(size_t) t * syt] = supertonic_depthwise_tap_sum(x_c, w_c, t, lo, hi, K, dilation, k_off, sxt, bias_v);
+    }
+}
+
+// Depthwise taps and the channel layer norm in one dispatch: one threadgroup per timestep
+// keeps its channels' taps in registers and reduces exactly like the standalone kernel.
+kernel void kernel_supertonic_depthwise_1d_layer_norm_f32(
+    constant   ggml_metal_kargs_supertonic_depthwise_1d_layer_norm & args,
+    device  const float * x,
+    device  const float * w,
+    device  const float * bias,
+    device  const float * g,
+    device  const float * b,
+    device        float * y,
+    threadgroup    float * shared [[threadgroup(0)]],
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]],
+    uint  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int t = (int) tgpig.x;
+    if (t >= args.L) return;
+
+    const int L = args.L;
+    const int C = args.C;
+    const int K = args.K;
+    const int dilation = args.dilation;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const int k_off = (args.causal != 0) ? -(K - 1) : -(K / 2);
+    const int seg_len = args.seg_len;
+    const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+    const int hi = seg_len > 0 ? lo + seg_len : L;
+
+    float vals[GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD];
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float bias_v = (args.has_bias != 0) ? bias[c] : 0.0f;
+            vals[i] = supertonic_depthwise_tap_sum(x + (size_t) c * sxc, w + (size_t) c * K,
+                                                   t, lo, hi, K, dilation, k_off, sxt, bias_v);
         }
-        y_c[(size_t) t * syt] = sum;
+    }
+
+    float my_sum = 0.0f;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) my_sum += vals[i];
+    }
+    my_sum = simd_sum(my_sum);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = shared[0] / (float) C;
+
+    float my_sq = 0.0f;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float d = vals[i] - mean;
+            my_sq = fma(d, d, my_sq);
+        }
+    }
+    my_sq = simd_sum(my_sq);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_std = rsqrt(shared[0] / (float) C + args.eps);
+
+    device float * y_t = y + (size_t) t * syt;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float xv = vals[i];
+            y_t[(size_t) c * syc] = (xv - mean) * inv_std * g[c] + b[c];
+        }
     }
 }
 
@@ -6036,9 +6130,11 @@ kernel void kernel_supertonic_layer_norm_channel_f32(
     float my_sq = 0.0f;
     for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
         const float d = x_t[(size_t) c * sxc] - mean;
-        my_sq += d * d;
+        my_sq = fma(d, d, my_sq);
     }
     my_sq = simd_sum(my_sq);
+    // Every simdgroup must have read the mean from shared[0] before it is reused below.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tiisg == 0) {
         shared[sgitg] = my_sq;
     }
@@ -10246,24 +10342,54 @@ kernel void kernel_diag_f32(
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
+constant int  FC_mul_mm_epi    [[function_constant(FC_MUL_MM + 2)]];
+constant bool FC_mul_mm_narrow [[function_constant(FC_MUL_MM + 3)]];
+
+// Fused epilogue for dst element (m, n) with value v; off is its flat index including the batch offset.
+// The expressions match the standalone add, bias_gelu and pw2_residual kernels exactly.
+static inline float mul_mm_epilogue(
+        float v,
+        int m,
+        uint64_t off,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual) {
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE) {
+        return v;
+    }
+    const float b = ((device const float *) bias)[m];
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS) {
+        return v + b;
+    }
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS_RESIDUAL) {
+        return (v + b) + ((device const float *) residual)[off];
+    }
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_BIAS_GELU) {
+        const float x = v + b;
+        return 0.5f * x * (1.0f + erf_approx<float>(x * SQRT_2_INV));
+    }
+    return ((device const float *) residual)[off] + (v + b) * ((device const float *) gamma)[m];
+}
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
 template<
+    short BLOCK_X,
     typename SA, typename SA_4x4, typename SA_8x8,
     typename SB, typename SB_2x4, typename SB_8x8,
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
     typename T0, typename T0_4x4, typename T1, typename T1_2x4>
-kernel void kernel_mul_mm_tensor(
+static void mul_mm_tensor_tile(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * srcA,
         device const char * srcB,
         device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiitg [[thread_index_in_threadgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    (void) sgitg;
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg) {
 
     // Matrix dimensions: A(M,K) x B(K,N) -> C(M,N)
     const int K = args.ne00;
@@ -10279,7 +10405,7 @@ kernel void kernel_mul_mm_tensor(
     const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
     // Tile dimensions
-    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+    constexpr int NRB = SZ_SIMDGROUP * BLOCK_X * N_MM_SIMD_GROUP_X;
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
 
     // Tile offsets in output matrix
@@ -10302,13 +10428,15 @@ kernel void kernel_mul_mm_tensor(
     auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
 
     // Configure matmul operation
+    // K is dynamic_extent and clamped per iteration in PHASE 2: a static N_MM_NK_TOTAL
+    // K tile reads src1 out of bounds when K % N_MM_NK_TOTAL != 0 (upstream ggml 33c9ea5e).
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
-            NRB, NRA, N_MM_NK_TOTAL, false, true, true,
+            NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
     // Accumulate partial results over K dimension
     for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
@@ -10356,10 +10484,14 @@ kernel void kernel_mul_mm_tensor(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // === PHASE 2: Tensor matmul ===
-        auto mA = tA.slice(0, 0);
-        auto mB = tB.slice(loop_k, rb);
+        // Clamp the K extent of both operand views to the remaining valid K range so the
+        // dynamic-K op never reads past the K extent of src1 (or the staged A tile).
+        const int kExt = min(N_MM_NK_TOTAL, K - loop_k);
 
-        mm.run(mB, mA, cT);
+        auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, N_MM_NK_TOTAL}));
+        auto tBv = tensor(ptrB + loop_k + rb * strideB, dextents<int32_t, 2>(kExt, N - rb), array<int, 2>({1, strideB}));
+
+        mm.run(tBv, tAv, cT);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -10368,8 +10500,55 @@ kernel void kernel_mul_mm_tensor(
     // cT.store handles bounds checking via tD's extents (M, N)
     device float * dstBatch = (device float *)dst + im * N * M;
 
-    auto tD = tensor(dstBatch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
-    cT.store(tD.slice(ra, rb));
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE) {
+        auto tD = tensor(dstBatch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
+        cT.store(tD.slice(ra, rb));
+        return;
+    }
+
+    // Fused epilogue: visit this thread's tile elements and store them with bounds checks.
+    const uint64_t batch_off = (uint64_t) im * N * M;
+    using ct_index_t = typename decltype(cT)::thread_index_type;
+    FOR_UNROLL (ct_index_t i = 0; i < cT.get_capacity(); ++i) {
+        if (!cT.is_valid_element(i)) {
+            continue;
+        }
+        const auto ids = cT.get_multidimensional_index(i);
+        const int m = ra + ids[0];
+        const int n = rb + ids[1];
+        if (m < M && n < N) {
+            const uint64_t off = (uint64_t) n * M + m;
+            dstBatch[off] = mul_mm_epilogue(cT[i], m, batch_off + off, bias, gamma, residual);
+        }
+    }
+}
+
+template<
+    typename SA, typename SA_4x4, typename SA_8x8,
+    typename SB, typename SB_2x4, typename SB_8x8,
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+kernel void kernel_mul_mm_tensor(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * srcA,
+        device const char * srcB,
+        device       char * dst,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    if (FC_mul_mm_narrow) {
+        mul_mm_tensor_tile<N_MM_BLOCK_X_NARROW, SA, SA_4x4, SA_8x8, SB, SB_2x4, SB_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(
+                args, srcA, srcB, dst, bias, gamma, residual, shmem, tgpig, tiitg);
+    } else {
+        mul_mm_tensor_tile<N_MM_BLOCK_X, SA, SA_4x4, SA_8x8, SB, SB_2x4, SB_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(
+                args, srcA, srcB, dst, bias, gamma, residual, shmem, tgpig, tiitg);
+    }
 }
 
 #endif // GGML_METAL_HAS_TENSOR
@@ -10387,6 +10566,9 @@ kernel void kernel_mul_mm_simd(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -10549,7 +10731,7 @@ kernel void kernel_mul_mm_simd(
         }
     }
 
-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+    if (FC_mul_mm_epi == GGML_METAL_MM_EPI_NONE && (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1))) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
@@ -10570,7 +10752,20 @@ kernel void kernel_mul_mm_simd(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sgitg == 0) {
+        if (FC_mul_mm_epi != GGML_METAL_MM_EPI_NONE) {
+            // every thread applies the epilogue to a slice of the staged tile
+            constexpr int NUM_THREADS = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+            threadgroup const float * tile = (threadgroup const float *) shmem;
+            const uint64_t batch_off = (uint64_t) im*args.ne1*args.ne0;
+            for (int e = tiitg; e < nr1*NR0; e += NUM_THREADS) {
+                const int j = e / NR0;
+                const int i = e % NR0;
+                if (i < nr0) {
+                    const uint64_t off = batch_off + (uint64_t) (r1 + j)*args.ne0 + r0 + i;
+                    ((device float *) dst)[off] = mul_mm_epilogue(tile[e], r0 + i, off, bias, gamma, residual);
+                }
+            }
+        } else if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
                 device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
                 device float4 * D4 = (device float4 *) D;

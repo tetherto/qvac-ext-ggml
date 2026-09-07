@@ -9,7 +9,11 @@
 #define N_MM_NK 2
 #define N_MM_NK_TOTAL (SZ_SIMDGROUP * N_MM_NK)
 
+// Two mat-mat N-tile widths. The wide tile amortises the staged A tile over more output columns and
+// holds the higher peak; the narrow one issues fewer padded columns when N is not a multiple of the
+// wide tile. ggml_metal_library_get_pipeline_mul_mm picks per dispatch.
 #define N_MM_BLOCK_X 4
+#define N_MM_BLOCK_X_NARROW 3
 #define N_MM_BLOCK_Y 2
 #define N_MM_SIMD_GROUP_X 2
 #define N_MM_SIMD_GROUP_Y 2
@@ -92,6 +96,13 @@
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   500
 #define FC_MUL_MV                      600
 #define FC_MUL_MM                      700
+
+// mul_mm epilogue applied at the tile store, selected by function constant FC_MUL_MM + 2.
+#define GGML_METAL_MM_EPI_NONE          0
+#define GGML_METAL_MM_EPI_BIAS          1
+#define GGML_METAL_MM_EPI_BIAS_RESIDUAL 2
+#define GGML_METAL_MM_EPI_BIAS_GELU     3
+#define GGML_METAL_MM_EPI_PW2_RESIDUAL  4
 #define FC_ROPE                        800
 #define FC_SSM_CONV                    900
 #define FC_SOLVE_TRI                   1000
@@ -1112,6 +1123,7 @@ typedef struct {
     int32_t dilation;
     int32_t has_bias;
     int32_t causal;   // 0 = symmetric edge-clamp (vector_estimator), 1 = causal-left (vocoder)
+    int32_t seg_len;  // 0 = one segment of L, else clamp inside each seg_len window
     int32_t sxt;
     int32_t sxc;
     int32_t syt;
@@ -1129,6 +1141,25 @@ typedef struct {
     int32_t syt;  // y stride per time step (in elements)
     int32_t syc;  // y stride per channel  (in elements)
 } ggml_metal_kargs_supertonic_layer_norm_channel;
+
+// Channels one thread holds in registers between the depthwise taps and the layer-norm reduction.
+#define GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD 8
+#define GGML_METAL_SUPERTONIC_LAYER_NORM_MAX_SIMDGROUPS 8
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t K;
+    int32_t dilation;
+    int32_t has_bias;
+    int32_t causal;
+    int32_t seg_len;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+    float   eps;
+} ggml_metal_kargs_supertonic_depthwise_1d_layer_norm;
 
 typedef struct {
     int32_t L;

@@ -5204,7 +5204,8 @@ static struct ggml_tensor * ggml_supertonic_depthwise_1d_impl(
         struct ggml_tensor  * bias,
         int                   dilation,
         int                   layout,
-        int                   causal) {
+        int                   causal,
+        int                   seg_len) {
     GGML_ASSERT(a->type == GGML_TYPE_F32);
     GGML_ASSERT(w->type == GGML_TYPE_F32);
     GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_F32);
@@ -5221,13 +5222,15 @@ static struct ggml_tensor * ggml_supertonic_depthwise_1d_impl(
     GGML_ASSERT(K == 3 || K == 5 || K == 7);
     GGML_ASSERT(w->ne[1] == 1);
     const int64_t C_dim = (layout == 0) ? a->ne[1] : a->ne[0];
+    const int64_t L_dim = (layout == 0) ? a->ne[0] : a->ne[1];
     GGML_ASSERT(w->ne[2] == C_dim);
     GGML_ASSERT(bias == NULL || bias->ne[0] == C_dim);
+    GGML_ASSERT(seg_len >= 0 && (seg_len == 0 || L_dim % seg_len == 0));
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type,
             a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
 
-    int32_t params[4] = { K, dilation, layout, causal };
+    int32_t params[5] = { K, dilation, layout, causal, seg_len };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_SUPERTONIC_DEPTHWISE_1D;
@@ -5245,7 +5248,7 @@ struct ggml_tensor * ggml_supertonic_depthwise_1d(
         struct ggml_tensor  * bias,
         int                   dilation) {
     return ggml_supertonic_depthwise_1d_impl(ctx, a, w, bias, dilation,
-                                             /*layout=*/0, /*causal=*/0);
+                                             /*layout=*/0, /*causal=*/0, /*seg_len=*/0);
 }
 
 struct ggml_tensor * ggml_supertonic_depthwise_1d_ct(
@@ -5255,7 +5258,7 @@ struct ggml_tensor * ggml_supertonic_depthwise_1d_ct(
         struct ggml_tensor  * bias,
         int                   dilation) {
     return ggml_supertonic_depthwise_1d_impl(ctx, a, w, bias, dilation,
-                                             /*layout=*/1, /*causal=*/0);
+                                             /*layout=*/1, /*causal=*/0, /*seg_len=*/0);
 }
 
 struct ggml_tensor * ggml_supertonic_depthwise_1d_causal_ct(
@@ -5265,7 +5268,18 @@ struct ggml_tensor * ggml_supertonic_depthwise_1d_causal_ct(
         struct ggml_tensor  * bias,
         int                   dilation) {
     return ggml_supertonic_depthwise_1d_impl(ctx, a, w, bias, dilation,
-                                             /*layout=*/1, /*causal=*/1);
+                                             /*layout=*/1, /*causal=*/1, /*seg_len=*/0);
+}
+
+struct ggml_tensor * ggml_supertonic_depthwise_1d_ct_segmented(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * bias,
+        int                   dilation,
+        int                   seg_len) {
+    return ggml_supertonic_depthwise_1d_impl(ctx, a, w, bias, dilation,
+                                             /*layout=*/1, /*causal=*/0, seg_len);
 }
 
 // ggml_supertonic_layer_norm_channel

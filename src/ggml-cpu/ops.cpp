@@ -8031,6 +8031,7 @@ void ggml_compute_forward_supertonic_depthwise_1d(
     const int dilation = opts[1];
     const int32_t layout = opts[2];
     const int32_t causal = opts[3];
+    const int32_t seg_len = opts[4];
     const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
 
     int L, C, sxt, sxc, syt, syc;
@@ -8058,11 +8059,13 @@ void ggml_compute_forward_supertonic_depthwise_1d(
         const float bias_v = b_data ? b_data[c] : 0.0f;
         const float * w_c = w_data + (size_t) c * K;
         for (int t = 0; t < L; ++t) {
+            const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+            const int hi = seg_len > 0 ? lo + seg_len : L;
             float sum = bias_v;
             for (int k = 0; k < K; ++k) {
                 int s = t + (k + k_off) * dilation;
-                if (s < 0) s = 0;
-                else if (s >= L) s = L - 1;
+                if (s < lo) s = lo;
+                else if (s >= hi) s = hi - 1;
                 sum += x_data[(size_t) s * sxt + (size_t) c * sxc] * w_c[k];
             }
             y_data[(size_t) t * syt + (size_t) c * syc] = sum;
