@@ -5976,9 +5976,8 @@ kernel void kernel_supertonic_depthwise_1d_f32(
     }
 }
 
-// Depthwise taps followed by the channel layer norm in one dispatch: one threadgroup per
-// timestep computes its channels' taps into registers, then reduces exactly like the
-// standalone layer-norm kernel (same thread striping, same simdgroup reduction).
+// Depthwise taps and the channel layer norm in one dispatch: one threadgroup per timestep
+// keeps its channels' taps in registers and reduces exactly like the standalone kernel.
 kernel void kernel_supertonic_depthwise_1d_layer_norm_f32(
     constant   ggml_metal_kargs_supertonic_depthwise_1d_layer_norm & args,
     device  const float * x,

@@ -4735,15 +4735,17 @@ static bool ggml_metal_dw_ln_fusion_enabled() {
     return enabled;
 }
 
-// Scratch for the channel layer norm reduction: one float per simdgroup, at most 256 / 32 of them.
-static const size_t ggml_metal_supertonic_layer_norm_shared_bytes = 8 * sizeof(float);
+// Scratch for the channel layer norm reduction: one float per simdgroup.
+static const size_t ggml_metal_supertonic_layer_norm_shared_bytes = GGML_METAL_SUPERTONIC_LAYER_NORM_MAX_SIMDGROUPS * sizeof(float);
+static const int    ggml_metal_supertonic_layer_norm_max_threads  = GGML_METAL_SUPERTONIC_LAYER_NORM_MAX_SIMDGROUPS * 32;
 
 // Threads per timestep for the channel layer norm: a multiple of 32 covering C, capped at 256.
 static int ggml_metal_supertonic_layer_norm_nth(int C) {
+    const int max_threads = ggml_metal_supertonic_layer_norm_max_threads;
     int nth = 32;
-    while (nth < C && nth < 256) nth *= 2;
+    while (nth < C && nth < max_threads) nth *= 2;
     if (nth > C) nth = ((C + 31) / 32) * 32;
-    if (nth > 256) nth = 256;
+    if (nth > max_threads) nth = max_threads;
     if (nth < 32) nth = 32;
     return nth;
 }
@@ -4819,8 +4821,8 @@ int ggml_metal_op_supertonic_depthwise_1d(ggml_metal_op_t ctx, int idx) {
     const int32_t * opts = (const int32_t *) op->op_params;
     const int K        = opts[0];
     const int dilation = opts[1];
-    // opts[2]: layout flag (0 = [T, C] default, 1 = [C, T] for full B2).
-    // opts[3]: causal flag (0 = symmetric edge-clamp, 1 = causal-left pad).
+    // opts[2] layout (0 = [T, C], 1 = [C, T]), opts[3] causal (0 = edge clamp, 1 = left pad),
+    // opts[4] segment length along T (0 = the whole row).
     const int32_t layout = opts[2];
     const int32_t causal = opts[3];
     const int32_t seg_len = opts[4];

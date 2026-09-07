@@ -1140,6 +1140,7 @@ typedef struct {
 
 // Channels one thread holds in registers between the depthwise taps and the layer-norm reduction.
 #define GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD 8
+#define GGML_METAL_SUPERTONIC_LAYER_NORM_MAX_SIMDGROUPS 8
 
 typedef struct {
     int32_t L;
