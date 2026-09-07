@@ -9,7 +9,11 @@
 #define N_MM_NK 2
 #define N_MM_NK_TOTAL (SZ_SIMDGROUP * N_MM_NK)
 
+// Two mat-mat N-tile widths. The wide tile amortises the staged A tile over more output columns and
+// holds the higher peak; the narrow one issues fewer padded columns when N is not a multiple of the
+// wide tile. ggml_metal_library_get_pipeline_mul_mm picks per dispatch.
 #define N_MM_BLOCK_X 4
+#define N_MM_BLOCK_X_NARROW 3
 #define N_MM_BLOCK_Y 2
 #define N_MM_SIMD_GROUP_X 2
 #define N_MM_SIMD_GROUP_Y 2

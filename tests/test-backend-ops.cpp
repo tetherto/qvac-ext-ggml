@@ -9278,6 +9278,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  80, {4, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 45, 144, {1, 1}, {1, 1})); // supertonic proj_in
 
+    // mat-mat N tiles: the backend picks the narrow tile when it issues fewer padded columns than the
+    // wide one, so both widths need exact, ragged and just-past-a-boundary N.
+    for (int n : {90, 96, 97, 128, 192, 256, 278, 468}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  512, n, 512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 512, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 100, 278, 2048, {1, 1}, {1, 1})); // ragged M under the narrow N tile
+
 #if 0
     // test the mat-mat path for Metal
     for (int k = 1; k < 512; ++k) {

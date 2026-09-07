@@ -700,6 +700,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
+// Output columns a mat-mat tile width actually issues for N columns, padding included.
+static int64_t mul_mm_issued_cols(int64_t n, int tile) {
+    return (n + tile - 1) / tile * tile;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op, int epilogue) {
     char base[256];
     char name[256];
@@ -724,17 +729,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+    constexpr int NRB_NARROW = SZ_SIMDGROUP * N_MM_BLOCK_X_NARROW * N_MM_SIMD_GROUP_X;
 
     // The f32-operand variant is built from the simdgroup kernel on every device, so it keeps the
     // simdgroup tile geometry even where the tensor API supplies the default instantiations.
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor && !prec_f32;
 
+    // The narrow N tile only pays off when it issues strictly fewer output columns than the wide one;
+    // otherwise the wide tile wins on its higher peak and its cheaper A traffic per output column.
+    const bool narrow = has_tensor && mul_mm_issued_cols(op->ne[1], NRB_NARROW) < mul_mm_issued_cols(op->ne[1], NRB);
+
+    const int nrb = narrow ? NRB_NARROW : NRB;
+
     const bool bc_out = has_tensor
-        ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
+        ? (op->ne[0] % NRA != 0 || op->ne[1] % nrb != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), prec_f32 ? "_prec" : "");
-    snprintf(name, 256, "%s_bci=%d_bco=%d_epi=%d", base, bc_inp, bc_out, epilogue);
+    snprintf(name, 256, "%s_bci=%d_bco=%d_epi=%d_nrw=%d", base, bc_inp, bc_out, epilogue, narrow);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -743,6 +755,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_set_bool (cv, bc_inp,   FC_MUL_MM + 0);
         ggml_metal_cv_set_bool (cv, bc_out,   FC_MUL_MM + 1);
         ggml_metal_cv_set_int32(cv, epilogue, FC_MUL_MM + 2);
+        ggml_metal_cv_set_bool (cv, narrow,   FC_MUL_MM + 3);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -751,7 +764,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     if (has_tensor) {
         res.nr0 = NRA;
-        res.nr1 = NRB;
+        res.nr1 = nrb;
 
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sz_operand;
         res.smem = smem_a;

@@ -10343,6 +10343,7 @@ kernel void kernel_diag_f32(
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
 constant int  FC_mul_mm_epi    [[function_constant(FC_MUL_MM + 2)]];
+constant bool FC_mul_mm_narrow [[function_constant(FC_MUL_MM + 3)]];
 
 // Fused epilogue for dst element (m, n) with value v; off is its flat index including the batch offset.
 // The expressions match the standalone add, bias_gelu and pw2_residual kernels exactly.
@@ -10373,11 +10374,12 @@ static inline float mul_mm_epilogue(
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
 template<
+    short BLOCK_X,
     typename SA, typename SA_4x4, typename SA_8x8,
     typename SB, typename SB_2x4, typename SB_8x8,
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
     typename T0, typename T0_4x4, typename T1, typename T1_2x4>
-kernel void kernel_mul_mm_tensor(
+static void mul_mm_tensor_tile(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * srcA,
         device const char * srcB,
@@ -10385,11 +10387,9 @@ kernel void kernel_mul_mm_tensor(
         device const char * bias,
         device const char * gamma,
         device const char * residual,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiitg [[thread_index_in_threadgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    (void) sgitg;
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg) {
 
     // Matrix dimensions: A(M,K) x B(K,N) -> C(M,N)
     const int K = args.ne00;
@@ -10405,7 +10405,7 @@ kernel void kernel_mul_mm_tensor(
     const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
     // Tile dimensions
-    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
+    constexpr int NRB = SZ_SIMDGROUP * BLOCK_X * N_MM_SIMD_GROUP_X;
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
 
     // Tile offsets in output matrix
@@ -10436,7 +10436,7 @@ kernel void kernel_mul_mm_tensor(
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
     // Accumulate partial results over K dimension
     for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
@@ -10520,6 +10520,34 @@ kernel void kernel_mul_mm_tensor(
             const uint64_t off = (uint64_t) n * M + m;
             dstBatch[off] = mul_mm_epilogue(cT[i], m, batch_off + off, bias, gamma, residual);
         }
+    }
+}
+
+template<
+    typename SA, typename SA_4x4, typename SA_8x8,
+    typename SB, typename SB_2x4, typename SB_8x8,
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+kernel void kernel_mul_mm_tensor(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * srcA,
+        device const char * srcB,
+        device       char * dst,
+        device const char * bias,
+        device const char * gamma,
+        device const char * residual,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    if (FC_mul_mm_narrow) {
+        mul_mm_tensor_tile<N_MM_BLOCK_X_NARROW, SA, SA_4x4, SA_8x8, SB, SB_2x4, SB_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(
+                args, srcA, srcB, dst, bias, gamma, residual, shmem, tgpig, tiitg);
+    } else {
+        mul_mm_tensor_tile<N_MM_BLOCK_X, SA, SA_4x4, SA_8x8, SB, SB_2x4, SB_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(
+                args, srcA, srcB, dst, bias, gamma, residual, shmem, tgpig, tiitg);
     }
 }
 
