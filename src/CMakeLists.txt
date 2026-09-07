@@ -274,9 +274,13 @@ function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL AND NOT (GGML_CPU_STATIC AND ${backend} MATCHES "^ggml-cpu"))
         add_library(${backend} MODULE ${ARGN})
         # write the shared library to the output directory
+        set(_backend_output_name "qvac-diffusion-${backend}")
+        if ("${backend}" STREQUAL "ggml-cuda" AND DEFINED GGML_CUDA_MODULE_SUFFIX)
+            string(APPEND _backend_output_name "${GGML_CUDA_MODULE_SUFFIX}")
+        endif()
         set_target_properties(${backend} PROPERTIES
             LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-            OUTPUT_NAME "qvac-diffusion-${backend}")
+            OUTPUT_NAME "${_backend_output_name}")
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
         # Do not add dependency, the User will have to explicitely build and install
         # the available `ggml::ggml-*` backend targets. This is for better integration
@@ -542,7 +546,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
     target_compile_definitions(ggml-base PUBLIC _DARWIN_C_SOURCE)
 endif()
 
-if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+if (BUILD_SHARED_LIBS OR (GGML_BACKEND_DL AND NOT WIN32))
     foreach (target ggml-base ggml)
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)

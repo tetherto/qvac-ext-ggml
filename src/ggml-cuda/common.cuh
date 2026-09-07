@@ -171,6 +171,27 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 }
 #endif // __CUDA_ARCH_LIST__
 
+static bool ggml_cuda_compiled_code_available(const int cc) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return true;
+    }
+    return ggml_cuda_highest_compiled_arch(cc) > 0;
+}
+
+constexpr int ggml_cuda_arch_score_impl(const int loadable_devices, const int exact_devices) {
+    return loadable_devices == 0 ? 0 : loadable_devices * (GGML_CUDA_MAX_DEVICES + 1) + exact_devices;
+}
+
+static bool ggml_cuda_arch_is_exact(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == cc;
+}
+
+static_assert(ggml_cuda_arch_score_impl(2, 0) > ggml_cuda_arch_score_impl(1, 1),
+              "covering every device must beat a partial exact match");
+static_assert(ggml_cuda_arch_score_impl(1, 1) > ggml_cuda_arch_score_impl(1, 0),
+              "an exact arch must win when coverage is equal");
+static_assert(ggml_cuda_arch_score_impl(0, 0) == 0, "a module that covers no device must be rejected");
+
 // ---------------------------------------------------------------------------------------------------------
 
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses

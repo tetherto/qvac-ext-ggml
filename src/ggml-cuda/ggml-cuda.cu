@@ -91,6 +91,8 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+static __global__ void ggml_cuda_arch_probe() {}
+
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
@@ -111,6 +113,70 @@ static int ggml_cuda_get_physical_device(int device) {
     const ggml_cuda_device_info & info = ggml_cuda_info();
     GGML_ASSERT(device >= 0 && device < info.device_count);
     return info.devices[device].physical_device;
+}
+
+static bool ggml_cuda_device_code_loadable_uncached(const int physical_device, const bool log_failure) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(physical_device);
+    return true;
+#else
+    int               previous_device   = 0;
+    const cudaError_t get_device_result = cudaGetDevice(&previous_device);
+    if (get_device_result != cudaSuccess) {
+        if (log_failure) {
+            GGML_LOG_WARN("%s: cudaGetDevice failed: %s\n", __func__, cudaGetErrorString(get_device_result));
+        }
+        (void) cudaGetLastError();
+        return false;
+    }
+
+    const cudaError_t set_device_result = cudaSetDevice(physical_device);
+    if (set_device_result != cudaSuccess) {
+        if (log_failure) {
+            GGML_LOG_WARN("%s: cudaSetDevice(%d) failed: %s\n", __func__, physical_device,
+                          cudaGetErrorString(set_device_result));
+        }
+        (void) cudaGetLastError();
+        return false;
+    }
+
+    cudaFuncAttributes attributes;
+    const cudaError_t  probe_result = cudaFuncGetAttributes(&attributes, ggml_cuda_arch_probe);
+    if (probe_result != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    const cudaError_t restore_result = cudaSetDevice(previous_device);
+    if (restore_result != cudaSuccess) {
+        if (log_failure) {
+            GGML_LOG_WARN("%s: failed to restore CUDA device %d: %s\n", __func__, previous_device,
+                          cudaGetErrorString(restore_result));
+        }
+        (void) cudaGetLastError();
+    }
+    if (probe_result == cudaSuccess && restore_result == cudaSuccess) {
+        return true;
+    }
+
+    if (probe_result != cudaSuccess && log_failure) {
+        GGML_LOG_WARN("%s: CUDA code cannot load on physical device %d: %s\n", __func__, physical_device,
+                      cudaGetErrorString(probe_result));
+    }
+    return false;
+#endif
+}
+
+static bool ggml_cuda_device_code_loadable(const int physical_device, const bool log_failure = true) {
+    static std::mutex cache_mutex;
+    static int        cache[GGML_CUDA_MAX_DEVICES] = {};
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    if (cache[physical_device] == 0) {
+        cache[physical_device] = ggml_cuda_device_code_loadable_uncached(physical_device, log_failure) ? 1 : -1;
+    } else if (cache[physical_device] < 0 && log_failure) {
+        GGML_LOG_WARN("%s: CUDA code cannot load on physical device %d; using the cached probe result\n", __func__,
+                      physical_device);
+    }
+    return cache[physical_device] > 0;
 }
 
 // this is faster on Windows
@@ -930,11 +996,13 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .is_host          = */ NULL,
 };
 
+static ggml_backend_dev_t ggml_backend_cuda_reg_find_device(int device);
+
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (device >= ggml_backend_cuda_get_device_count()) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         return nullptr;
     }
 
@@ -944,13 +1012,22 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 
     if (!ggml_backend_cuda_buffer_type_initialized) {
         for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_cuda_reg_find_device(i);
+            if (dev == nullptr) {
+                continue;
+            }
             ggml_backend_cuda_buffer_types[i] = {
                 /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
-                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .device   = */ dev,
                 /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i)},
             };
         }
         ggml_backend_cuda_buffer_type_initialized = true;
+    }
+
+    if (ggml_backend_cuda_buffer_types[device].device == nullptr) {
+        GGML_LOG_ERROR("%s: device %d has no kernels compiled for its compute capability\n", __func__, device);
+        return nullptr;
     }
 
     return &ggml_backend_cuda_buffer_types[device];
@@ -1304,6 +1381,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+    if (ggml_backend_reg_dev_count(ggml_backend_cuda_reg()) == 0) {
+        return nullptr;
+    }
+
     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_cuda_host_buffer_type_name,
@@ -5334,9 +5415,27 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
 
             const ggml_cuda_device_info & info = ggml_cuda_info();
             const bool virtual_devices = info.device_count > info.physical_device_count;
+            bool                          physical_code_checked[GGML_CUDA_MAX_DEVICES]  = {};
+            bool                          physical_code_loadable[GGML_CUDA_MAX_DEVICES] = {};
 
             for (int i = 0; i < info.device_count; i++) {
                 const int physical_id = info.devices[i].physical_device;
+                const int cc          = info.devices[i].cc;
+
+                if (!physical_code_checked[physical_id]) {
+                    physical_code_checked[physical_id] = true;
+                    const bool compiled_code_available = ggml_cuda_compiled_code_available(cc);
+                    physical_code_loadable[physical_id] =
+                        compiled_code_available && ggml_cuda_device_code_loadable(physical_id);
+                    if (!compiled_code_available) {
+                        GGML_LOG_WARN("%s: skipping physical device %d (%s): no kernels compiled for compute capability %d.%d\n",
+                                      __func__, physical_id, ggml_cuda_device_description(i).c_str(), cc / 100,
+                                      (cc % 100) / 10);
+                    }
+                }
+                if (!physical_code_loadable[physical_id]) {
+                    continue;
+                }
 
                 ggml_backend_cuda_device_context * dev_ctx = new ggml_backend_cuda_device_context;
                 dev_ctx->device = i;
@@ -5376,9 +5475,25 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+static ggml_backend_dev_t ggml_backend_cuda_reg_find_device(int device) {
+    ggml_backend_cuda_reg_context * ctx = (ggml_backend_cuda_reg_context *) ggml_backend_cuda_reg()->context;
+    for (ggml_backend_dev_t dev : ctx->devices) {
+        if (((ggml_backend_cuda_device_context *) dev->context)->device == device) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
+        return nullptr;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_cuda_reg_find_device(device);
+    if (dev == nullptr) {
+        GGML_LOG_ERROR("%s: device %d has no kernels compiled for its compute capability\n", __func__, device);
         return nullptr;
     }
 
@@ -5391,11 +5506,72 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
         /* .iface   = */ ggml_backend_cuda_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+        /* .device  = */ dev,
         /* .context = */ ctx,
     };
 
     return cuda_backend;
 }
+
+#ifdef GGML_BACKEND_DL
+static int ggml_cuda_backend_score() {
+#    if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const ggml_cuda_device_info & info                                 = ggml_cuda_info();
+    bool                          physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+    int                           loadable_devices                     = 0;
+    int                           exact_devices                        = 0;
+
+    for (int i = 0; i < info.device_count; ++i) {
+        const int physical_id = info.devices[i].physical_device;
+        if (physical_seen[physical_id]) {
+            continue;
+        }
+        physical_seen[physical_id] = true;
+
+        const int cc = info.devices[i].cc;
+        if (ggml_cuda_compiled_code_available(cc) && ggml_cuda_device_code_loadable(physical_id, false)) {
+            ++loadable_devices;
+            exact_devices += ggml_cuda_arch_is_exact(cc) ? 1 : 0;
+        }
+    }
+#    else
+    int physical_device_count = 0;
+    if (cudaGetDeviceCount(&physical_device_count) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    if (physical_device_count > GGML_CUDA_MAX_DEVICES) {
+        return 0;
+    }
+
+    int scored_physical_device_count = physical_device_count;
+    const char * devices_env = getenv("GGML_CUDA_DEVICES");
+    if (devices_env != nullptr && physical_device_count > 0) {
+        const int requested = atoi(devices_env);
+        if (requested > 0) {
+            scored_physical_device_count = std::min(requested, physical_device_count);
+        }
+    }
+
+    int loadable_devices = 0;
+    int exact_devices    = 0;
+    for (int physical_id = 0; physical_id < scored_physical_device_count; ++physical_id) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, physical_id) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return 0;
+        }
+        const int cc = 100 * prop.major + 10 * prop.minor;
+        if (ggml_cuda_compiled_code_available(cc) && ggml_cuda_device_code_loadable(physical_id, false)) {
+            ++loadable_devices;
+            exact_devices += ggml_cuda_arch_is_exact(cc) ? 1 : 0;
+        }
+    }
+#    endif
+    return ggml_cuda_arch_score_impl(loadable_devices, exact_devices);
+}
+
+GGML_BACKEND_DL_SCORE_IMPL(ggml_cuda_backend_score)
+#endif
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
