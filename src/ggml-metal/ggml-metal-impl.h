@@ -1138,6 +1138,24 @@ typedef struct {
     int32_t syc;  // y stride per channel  (in elements)
 } ggml_metal_kargs_supertonic_layer_norm_channel;
 
+// Channels one thread holds in registers between the depthwise taps and the layer-norm reduction.
+#define GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD 8
+
+typedef struct {
+    int32_t L;
+    int32_t C;
+    int32_t K;
+    int32_t dilation;
+    int32_t has_bias;
+    int32_t causal;
+    int32_t seg_len;
+    int32_t sxt;
+    int32_t sxc;
+    int32_t syt;
+    int32_t syc;
+    float   eps;
+} ggml_metal_kargs_supertonic_depthwise_1d_layer_norm;
+
 typedef struct {
     int32_t L;
     int32_t C;

@@ -5886,6 +5886,43 @@ kernel void kernel_pad_reflect_1d_f32(
     }
 }
 
+// One tap of channel row x_c at time t: the source index clamps to [lo, hi).
+static inline float supertonic_depthwise_tap(device const float * x_c, device const float * w_c,
+                                             int t, int lo, int hi, int k, int dilation, int k_off,
+                                             int sxt, float sum) {
+    int s = t + (k + k_off) * dilation;
+    if (s < lo) s = lo; else if (s >= hi) s = hi - 1;
+    return fma(x_c[(size_t) s * sxt], w_c[k], sum);
+}
+
+// One depthwise output: bias plus the K taps accumulated as an explicit fma chain, so the
+// standalone kernel and the layer-norm fusion compute bit-identical values.
+static inline float supertonic_depthwise_tap_sum(device const float * x_c, device const float * w_c,
+                                                 int t, int lo, int hi, int K, int dilation, int k_off,
+                                                 int sxt, float bias_v) {
+    float sum = bias_v;
+    if (K == 7) {
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 3, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 4, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 5, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 6, dilation, k_off, sxt, sum);
+    } else if (K == 5) {
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 3, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 4, dilation, k_off, sxt, sum);
+    } else { // K == 3
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 0, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 1, dilation, k_off, sxt, sum);
+        sum = supertonic_depthwise_tap(x_c, w_c, t, lo, hi, 2, dilation, k_off, sxt, sum);
+    }
+    return sum;
+}
+
 // Supertonic fused depthwise-1D conv with edge-clamp padding + bias add.
 // Replaces the edge_clamp_pad_1d + im2col + mul_mat + add sequence the
 // stock depthwise_same_ggml graph fallback emits.  One threadgroup per
@@ -5935,44 +5972,101 @@ kernel void kernel_supertonic_depthwise_1d_f32(
     for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
         const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
         const int hi = seg_len > 0 ? lo + seg_len : L;
-        float sum = bias_v;
-        // Compile-time peeled inner loop for K in {3, 5, 7}; taps clamp to the
-        // segment [lo, hi) (the whole row unless seg_len is set).
-        if (K == 7) {
-            int s0 = t + (0 + k_off)*dilation; if (s0 < lo) s0 = lo; else if (s0 >= hi) s0 = hi - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < lo) s1 = lo; else if (s1 >= hi) s1 = hi - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < lo) s2 = lo; else if (s2 >= hi) s2 = hi - 1;
-            int s3 = t + (3 + k_off)*dilation; if (s3 < lo) s3 = lo; else if (s3 >= hi) s3 = hi - 1;
-            int s4 = t + (4 + k_off)*dilation; if (s4 < lo) s4 = lo; else if (s4 >= hi) s4 = hi - 1;
-            int s5 = t + (5 + k_off)*dilation; if (s5 < lo) s5 = lo; else if (s5 >= hi) s5 = hi - 1;
-            int s6 = t + (6 + k_off)*dilation; if (s6 < lo) s6 = lo; else if (s6 >= hi) s6 = hi - 1;
-            sum += x_c[(size_t) s0 * sxt] * w_c[0]
-                 + x_c[(size_t) s1 * sxt] * w_c[1]
-                 + x_c[(size_t) s2 * sxt] * w_c[2]
-                 + x_c[(size_t) s3 * sxt] * w_c[3]
-                 + x_c[(size_t) s4 * sxt] * w_c[4]
-                 + x_c[(size_t) s5 * sxt] * w_c[5]
-                 + x_c[(size_t) s6 * sxt] * w_c[6];
-        } else if (K == 5) {
-            int s0 = t + (0 + k_off)*dilation; if (s0 < lo) s0 = lo; else if (s0 >= hi) s0 = hi - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < lo) s1 = lo; else if (s1 >= hi) s1 = hi - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < lo) s2 = lo; else if (s2 >= hi) s2 = hi - 1;
-            int s3 = t + (3 + k_off)*dilation; if (s3 < lo) s3 = lo; else if (s3 >= hi) s3 = hi - 1;
-            int s4 = t + (4 + k_off)*dilation; if (s4 < lo) s4 = lo; else if (s4 >= hi) s4 = hi - 1;
-            sum += x_c[(size_t) s0 * sxt] * w_c[0]
-                 + x_c[(size_t) s1 * sxt] * w_c[1]
-                 + x_c[(size_t) s2 * sxt] * w_c[2]
-                 + x_c[(size_t) s3 * sxt] * w_c[3]
-                 + x_c[(size_t) s4 * sxt] * w_c[4];
-        } else { // K == 3
-            int s0 = t + (0 + k_off)*dilation; if (s0 < lo) s0 = lo; else if (s0 >= hi) s0 = hi - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < lo) s1 = lo; else if (s1 >= hi) s1 = hi - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < lo) s2 = lo; else if (s2 >= hi) s2 = hi - 1;
-            sum += x_c[(size_t) s0 * sxt] * w_c[0]
-                 + x_c[(size_t) s1 * sxt] * w_c[1]
-                 + x_c[(size_t) s2 * sxt] * w_c[2];
+        y_c[(size_t) t * syt] = supertonic_depthwise_tap_sum(x_c, w_c, t, lo, hi, K, dilation, k_off, sxt, bias_v);
+    }
+}
+
+// Depthwise taps followed by the channel layer norm in one dispatch: one threadgroup per
+// timestep computes its channels' taps into registers, then reduces exactly like the
+// standalone layer-norm kernel (same thread striping, same simdgroup reduction).
+kernel void kernel_supertonic_depthwise_1d_layer_norm_f32(
+    constant   ggml_metal_kargs_supertonic_depthwise_1d_layer_norm & args,
+    device  const float * x,
+    device  const float * w,
+    device  const float * bias,
+    device  const float * g,
+    device  const float * b,
+    device        float * y,
+    threadgroup    float * shared [[threadgroup(0)]],
+    uint3 tgpig[[threadgroup_position_in_grid]],
+    uint3 tpitg[[thread_position_in_threadgroup]],
+    uint3   ntg[[threads_per_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]],
+    uint  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int t = (int) tgpig.x;
+    if (t >= args.L) return;
+
+    const int L = args.L;
+    const int C = args.C;
+    const int K = args.K;
+    const int dilation = args.dilation;
+    const int sxt = args.sxt, sxc = args.sxc;
+    const int syt = args.syt, syc = args.syc;
+    const int k_off = (args.causal != 0) ? -(K - 1) : -(K / 2);
+    const int seg_len = args.seg_len;
+    const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+    const int hi = seg_len > 0 ? lo + seg_len : L;
+
+    float vals[GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD];
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float bias_v = (args.has_bias != 0) ? bias[c] : 0.0f;
+            vals[i] = supertonic_depthwise_tap_sum(x + (size_t) c * sxc, w + (size_t) c * K,
+                                                   t, lo, hi, K, dilation, k_off, sxt, bias_v);
         }
-        y_c[(size_t) t * syt] = sum;
+    }
+
+    float my_sum = 0.0f;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) my_sum += vals[i];
+    }
+    my_sum = simd_sum(my_sum);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float mean = shared[0] / (float) C;
+
+    float my_sq = 0.0f;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float d = vals[i] - mean;
+            my_sq = fma(d, d, my_sq);
+        }
+    }
+    my_sq = simd_sum(my_sq);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shared[sgitg] = my_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint n_sg = (ntg.x + 31) / 32;
+        float total = (tiisg < n_sg) ? shared[tiisg] : 0.0f;
+        total = simd_sum(total);
+        if (tiisg == 0) shared[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_std = rsqrt(shared[0] / (float) C + args.eps);
+
+    device float * y_t = y + (size_t) t * syt;
+    for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
+        const int c = (int) tpitg.x + i * (int) ntg.x;
+        if (c < C) {
+            const float xv = vals[i];
+            y_t[(size_t) c * syc] = (xv - mean) * inv_std * g[c] + b[c];
+        }
     }
 }
 
@@ -6037,7 +6131,7 @@ kernel void kernel_supertonic_layer_norm_channel_f32(
     float my_sq = 0.0f;
     for (int c = (int) tpitg.x; c < C; c += (int) ntg.x) {
         const float d = x_t[(size_t) c * sxc] - mean;
-        my_sq += d * d;
+        my_sq = fma(d, d, my_sq);
     }
     my_sq = simd_sum(my_sq);
     // Every simdgroup must have read the mean from shared[0] before it is reused below.

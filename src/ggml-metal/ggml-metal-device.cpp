@@ -2081,6 +2081,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_supertonic_depth
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_supertonic_depthwise_1d_layer_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_SUPERTONIC_DEPTHWISE_1D);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_supertonic_depthwise_1d_layer_norm_%s", ggml_type_name(op->src[0]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_supertonic_layer_norm_channel(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL);
 

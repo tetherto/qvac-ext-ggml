@@ -3497,6 +3497,57 @@ struct test_supertonic_depthwise_1d : public test_case {
     }
 };
 
+// SUPERTONIC_DEPTHWISE_1D followed by SUPERTONIC_LAYER_NORM_CHANNEL, which Metal runs as one dispatch
+struct test_supertonic_depthwise_layer_norm : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t K;
+    const int dilation;
+    const bool ct;
+    const bool causal;
+    const int seg_len;
+
+    std::string vars() override {
+        return VARS_TO_STR7(L, C, K, dilation, ct, causal, seg_len);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_supertonic_depthwise_layer_norm(int64_t L, int64_t C, int64_t K, int dilation,
+                                         bool ct = true, bool causal = false, int seg_len = 0)
+        : L(L), C(C), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, L) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(g, "g");
+        ggml_tensor * beta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * dw;
+        if (seg_len > 0) {
+            dw = ggml_supertonic_depthwise_1d_ct_segmented(ctx, a, w, b, dilation, seg_len);
+        } else if (causal) {
+            dw = ggml_supertonic_depthwise_1d_causal_ct(ctx, a, w, b, dilation);
+        } else if (ct) {
+            dw = ggml_supertonic_depthwise_1d_ct(ctx, a, w, b, dilation);
+        } else {
+            dw = ggml_supertonic_depthwise_1d(ctx, a, w, b, dilation);
+        }
+        const float eps = 1e-6f;
+        ggml_tensor * out = ct ? ggml_supertonic_layer_norm_channel_ct(ctx, dw, g, beta, eps)
+                               : ggml_supertonic_layer_norm_channel(ctx, dw, g, beta, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_NORM + GGML_OP_MUL + optional GGML_OP_ADD
 struct test_norm_mul_add : public test_case {
     const ggml_type type;
@@ -8792,6 +8843,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_supertonic_depthwise_1d(4096, 512, 7, 1, true, true));
     test_cases.emplace_back(new test_supertonic_depthwise_1d(278, 512, 7, 27, true, false, 139));
     test_cases.emplace_back(new test_supertonic_depthwise_1d(90, 512, 5, 8, true, false, 45));
+    // Metal fuses the depthwise taps into the following channel layer norm; the last shape exceeds
+    // its per-thread register budget and must fall back to two dispatches.
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(90, 512, 7, 1, true, false, 45));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(278, 512, 7, 3, true, false, 139));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(468, 512, 7, 9, true, false, 234));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(2808, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(53, 256, 5, 2, false));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(54, 64, 5, 1, false));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2048, 3, 1, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2304, 3, 1, true));
     // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
     for (int mode : { 1, 2, 3, 4 }) {
         for (auto shape : { std::array<int64_t, 3>{512, 139, 512}, std::array<int64_t, 3>{2048, 90, 512}, std::array<int64_t, 3>{512, 468, 2048}, std::array<int64_t, 3>{144, 278, 512}, std::array<int64_t, 3>{100, 37, 96} }) {

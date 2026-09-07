@@ -4717,6 +4717,85 @@ int ggml_metal_op_diag_mask_inf(ggml_metal_op_t ctx, int idx) {
 
     return 1;
 }
+
+static bool ggml_metal_dw_ln_fusion_enabled() {
+    static const bool enabled = getenv("GGML_METAL_FUSION_DW_LN_DISABLE") == nullptr;
+    return enabled;
+}
+
+// Scratch for the channel layer norm reduction: one float per simdgroup, at most 256 / 32 of them.
+static const size_t ggml_metal_supertonic_layer_norm_shared_bytes = 8 * sizeof(float);
+
+// Threads per timestep for the channel layer norm: a multiple of 32 covering C, capped at 256.
+static int ggml_metal_supertonic_layer_norm_nth(int C) {
+    int nth = 32;
+    while (nth < C && nth < 256) nth *= 2;
+    if (nth > C) nth = ((C + 31) / 32) * 32;
+    if (nth > 256) nth = 256;
+    if (nth < 32) nth = 32;
+    return nth;
+}
+
+// The layer norm consuming this depthwise output when both fit one dispatch: same layout, channels
+// within the per-thread registers, and a result that does not alias the input the kernel keeps reading.
+static const ggml_tensor * ggml_metal_dw_ln_match(ggml_metal_op_t ctx, int idx, int32_t layout, int C, int nth) {
+    const ggml_op ops[2] = { GGML_OP_SUPERTONIC_DEPTHWISE_1D, GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL };
+    if (!ctx->use_fusion || !ggml_metal_dw_ln_fusion_enabled() || !ctx->can_fuse(idx, ops, 2)) {
+        return nullptr;
+    }
+    const ggml_tensor * dw = ctx->node(idx);
+    const ggml_tensor * ln = ctx->node(idx + 1);
+    if (ln->src[0] != dw || ggml_get_op_params_i32(ln, 1) != layout) {
+        return nullptr;
+    }
+    if (C > nth * GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD || ggml_metal_tensors_overlap(ln, dw->src[0])) {
+        return nullptr;
+    }
+    return ln;
+}
+
+static int ggml_metal_op_supertonic_depthwise_1d_layer_norm(ggml_metal_op_t ctx, int idx, const ggml_tensor * ln,
+                                                            const ggml_metal_kargs_supertonic_depthwise_1d & dw, int nth) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    float eps;
+    memcpy(&eps, ln->op_params, sizeof(eps));
+
+    ggml_metal_kargs_supertonic_depthwise_1d_layer_norm args = {
+        /*.L        =*/ dw.L,
+        /*.C        =*/ dw.C,
+        /*.K        =*/ dw.K,
+        /*.dilation =*/ dw.dilation,
+        /*.has_bias =*/ dw.has_bias,
+        /*.causal   =*/ dw.causal,
+        /*.seg_len  =*/ dw.seg_len,
+        /*.sxt      =*/ dw.sxt,
+        /*.sxc      =*/ dw.sxc,
+        /*.syt      =*/ dw.syt,
+        /*.syc      =*/ dw.syc,
+        /*.eps      =*/ eps,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_supertonic_depthwise_1d_layer_norm(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // x
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // w
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2] ? op->src[2] : op->src[0]), 3); // bias
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ln->src[1]), 4); // g
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ln->src[2]), 5); // b
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ln),         6); // y
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, ggml_metal_supertonic_layer_norm_shared_bytes, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, dw.L, 1, 1, nth, 1, 1);
+
+    return 2;
+}
+
 int ggml_metal_op_supertonic_depthwise_1d(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -4756,6 +4835,11 @@ int ggml_metal_op_supertonic_depthwise_1d(ggml_metal_op_t ctx, int idx) {
         /*.syt      =*/ syt,
         /*.syc      =*/ syc,
     };
+
+    const int ln_nth = ggml_metal_supertonic_layer_norm_nth(C);
+    if (const ggml_tensor * ln = ggml_metal_dw_ln_match(ctx, idx, layout, C, ln_nth)) {
+        return ggml_metal_op_supertonic_depthwise_1d_layer_norm(ctx, idx, ln, args, ln_nth);
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_supertonic_depthwise_1d(lib, op);
 
@@ -4825,16 +4909,7 @@ int ggml_metal_op_supertonic_layer_norm_channel(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_supertonic_layer_norm_channel(lib, op);
 
-    // Threads-per-threadgroup: round up to a multiple of 32 (Apple GPU
-    // simdgroup size).  Cap at 256 to limit register pressure.
-    int nth = 32;
-    while (nth < C && nth < 256) nth *= 2;
-    if (nth > C) nth = ((C + 31) / 32) * 32;
-    if (nth > 256) nth = 256;
-    if (nth < 32) nth = 32;
-
-    // shared scratch: one float per simdgroup, max 8 simdgroups (256/32).
-    const size_t shared_bytes = 8 * sizeof(float);
+    const int nth = ggml_metal_supertonic_layer_norm_nth(C);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4842,7 +4917,7 @@ int ggml_metal_op_supertonic_layer_norm_channel(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // g
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // b
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4); // y
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, shared_bytes, 0);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, ggml_metal_supertonic_layer_norm_shared_bytes, 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, L, 1, 1, nth, 1, 1);
 
