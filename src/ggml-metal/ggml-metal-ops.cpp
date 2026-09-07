@@ -173,6 +173,17 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
+// A fused kernel reads and writes the buffers of every node it absorbs, which the check on the first
+// node never saw; barrier when any of the fused nodes conflicts with the in-flight ranges.
+static void ggml_metal_op_concurrency_check_fused(ggml_metal_op_t ctx, int idx, int n_fuse) {
+    for (int i = 1; i < n_fuse; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            return;
+        }
+    }
+}
+
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
 
@@ -2430,6 +2441,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         if (ctx->use_fusion && ggml_metal_mm_epilogue_enabled()) {
             ggml_metal_mm_epilogue_match(ctx, idx, epi);
         }
+        ggml_metal_op_concurrency_check_fused(ctx, idx, epi.n_fuse);
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, epi.mode);
 
@@ -4838,6 +4850,7 @@ int ggml_metal_op_supertonic_depthwise_1d(ggml_metal_op_t ctx, int idx) {
 
     const int ln_nth = ggml_metal_supertonic_layer_norm_nth(C);
     if (const ggml_tensor * ln = ggml_metal_dw_ln_match(ctx, idx, layout, C, ln_nth)) {
+        ggml_metal_op_concurrency_check_fused(ctx, idx, 2);
         return ggml_metal_op_supertonic_depthwise_1d_layer_norm(ctx, idx, ln, args, ln_nth);
     }
 
