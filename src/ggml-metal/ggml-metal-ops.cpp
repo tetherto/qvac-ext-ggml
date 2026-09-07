@@ -4615,6 +4615,7 @@ int ggml_metal_op_supertonic_depthwise_1d(ggml_metal_op_t ctx, int idx) {
     // opts[3]: causal flag (0 = symmetric edge-clamp, 1 = causal-left pad).
     const int32_t layout = opts[2];
     const int32_t causal = opts[3];
+    const int32_t seg_len = opts[4];
 
     int L, C, sxt, sxc, syt, syc;
     if (layout == 0) {
@@ -4632,6 +4633,7 @@ int ggml_metal_op_supertonic_depthwise_1d(ggml_metal_op_t ctx, int idx) {
         /*.dilation =*/ dilation,
         /*.has_bias =*/ (op->src[2] != nullptr) ? 1 : 0,
         /*.causal   =*/ causal,
+        /*.seg_len  =*/ seg_len,
         /*.sxt      =*/ sxt,
         /*.sxc      =*/ sxc,
         /*.syt      =*/ syt,

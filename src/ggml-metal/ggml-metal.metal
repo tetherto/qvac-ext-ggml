@@ -5930,21 +5930,22 @@ kernel void kernel_supertonic_depthwise_1d_f32(
     // the last tap at k = K-1 lands at t and earlier taps look strictly
     // left.
     const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
+    const int seg_len = args.seg_len;
 
     for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
+        const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+        const int hi = seg_len > 0 ? lo + seg_len : L;
         float sum = bias_v;
-        // Compile-time peeled inner loop for K in {3, 5, 7}.  K=3/5 is the
-        // vector_estimator's symmetric ConvNeXt; K=7 is the vocoder's causal
-        // ConvNeXt.  Right-clamp `s >= L` is required for the symmetric path
-        // only — in causal mode all taps satisfy s ≤ t < L by construction.
+        // Compile-time peeled inner loop for K in {3, 5, 7}; taps clamp to the
+        // segment [lo, hi) (the whole row unless seg_len is set).
         if (K == 7) {
-            int s0 = t + (0 + k_off)*dilation; if (s0 < 0) s0 = 0; else if (s0 >= L) s0 = L - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < 0) s1 = 0; else if (s1 >= L) s1 = L - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < 0) s2 = 0; else if (s2 >= L) s2 = L - 1;
-            int s3 = t + (3 + k_off)*dilation; if (s3 < 0) s3 = 0; else if (s3 >= L) s3 = L - 1;
-            int s4 = t + (4 + k_off)*dilation; if (s4 < 0) s4 = 0; else if (s4 >= L) s4 = L - 1;
-            int s5 = t + (5 + k_off)*dilation; if (s5 < 0) s5 = 0; else if (s5 >= L) s5 = L - 1;
-            int s6 = t + (6 + k_off)*dilation; if (s6 < 0) s6 = 0; else if (s6 >= L) s6 = L - 1;
+            int s0 = t + (0 + k_off)*dilation; if (s0 < lo) s0 = lo; else if (s0 >= hi) s0 = hi - 1;
+            int s1 = t + (1 + k_off)*dilation; if (s1 < lo) s1 = lo; else if (s1 >= hi) s1 = hi - 1;
+            int s2 = t + (2 + k_off)*dilation; if (s2 < lo) s2 = lo; else if (s2 >= hi) s2 = hi - 1;
+            int s3 = t + (3 + k_off)*dilation; if (s3 < lo) s3 = lo; else if (s3 >= hi) s3 = hi - 1;
+            int s4 = t + (4 + k_off)*dilation; if (s4 < lo) s4 = lo; else if (s4 >= hi) s4 = hi - 1;
+            int s5 = t + (5 + k_off)*dilation; if (s5 < lo) s5 = lo; else if (s5 >= hi) s5 = hi - 1;
+            int s6 = t + (6 + k_off)*dilation; if (s6 < lo) s6 = lo; else if (s6 >= hi) s6 = hi - 1;
             sum += x_c[(size_t) s0 * sxt] * w_c[0]
                  + x_c[(size_t) s1 * sxt] * w_c[1]
                  + x_c[(size_t) s2 * sxt] * w_c[2]
@@ -5953,20 +5954,20 @@ kernel void kernel_supertonic_depthwise_1d_f32(
                  + x_c[(size_t) s5 * sxt] * w_c[5]
                  + x_c[(size_t) s6 * sxt] * w_c[6];
         } else if (K == 5) {
-            int s0 = t + (0 + k_off)*dilation; if (s0 < 0) s0 = 0; else if (s0 >= L) s0 = L - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < 0) s1 = 0; else if (s1 >= L) s1 = L - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < 0) s2 = 0; else if (s2 >= L) s2 = L - 1;
-            int s3 = t + (3 + k_off)*dilation; if (s3 < 0) s3 = 0; else if (s3 >= L) s3 = L - 1;
-            int s4 = t + (4 + k_off)*dilation; if (s4 < 0) s4 = 0; else if (s4 >= L) s4 = L - 1;
+            int s0 = t + (0 + k_off)*dilation; if (s0 < lo) s0 = lo; else if (s0 >= hi) s0 = hi - 1;
+            int s1 = t + (1 + k_off)*dilation; if (s1 < lo) s1 = lo; else if (s1 >= hi) s1 = hi - 1;
+            int s2 = t + (2 + k_off)*dilation; if (s2 < lo) s2 = lo; else if (s2 >= hi) s2 = hi - 1;
+            int s3 = t + (3 + k_off)*dilation; if (s3 < lo) s3 = lo; else if (s3 >= hi) s3 = hi - 1;
+            int s4 = t + (4 + k_off)*dilation; if (s4 < lo) s4 = lo; else if (s4 >= hi) s4 = hi - 1;
             sum += x_c[(size_t) s0 * sxt] * w_c[0]
                  + x_c[(size_t) s1 * sxt] * w_c[1]
                  + x_c[(size_t) s2 * sxt] * w_c[2]
                  + x_c[(size_t) s3 * sxt] * w_c[3]
                  + x_c[(size_t) s4 * sxt] * w_c[4];
         } else { // K == 3
-            int s0 = t + (0 + k_off)*dilation; if (s0 < 0) s0 = 0; else if (s0 >= L) s0 = L - 1;
-            int s1 = t + (1 + k_off)*dilation; if (s1 < 0) s1 = 0; else if (s1 >= L) s1 = L - 1;
-            int s2 = t + (2 + k_off)*dilation; if (s2 < 0) s2 = 0; else if (s2 >= L) s2 = L - 1;
+            int s0 = t + (0 + k_off)*dilation; if (s0 < lo) s0 = lo; else if (s0 >= hi) s0 = hi - 1;
+            int s1 = t + (1 + k_off)*dilation; if (s1 < lo) s1 = lo; else if (s1 >= hi) s1 = hi - 1;
+            int s2 = t + (2 + k_off)*dilation; if (s2 < lo) s2 = lo; else if (s2 >= hi) s2 = hi - 1;
             sum += x_c[(size_t) s0 * sxt] * w_c[0]
                  + x_c[(size_t) s1 * sxt] * w_c[1]
                  + x_c[(size_t) s2 * sxt] * w_c[2];

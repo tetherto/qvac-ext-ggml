@@ -1112,6 +1112,7 @@ typedef struct {
     int32_t dilation;
     int32_t has_bias;
     int32_t causal;   // 0 = symmetric edge-clamp (vector_estimator), 1 = causal-left (vocoder)
+    int32_t seg_len;  // 0 = one segment of L, else clamp inside each seg_len window
     int32_t sxt;
     int32_t sxc;
     int32_t syt;

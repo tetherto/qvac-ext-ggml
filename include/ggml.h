@@ -2438,6 +2438,16 @@ extern "C" {
             struct ggml_tensor  * bias,
             int                   dilation);
 
+    // [C, T] variant over T / seg_len independent segments: the edge clamp
+    // never crosses a segment boundary (batched sequences share one tensor).
+    GGML_API struct ggml_tensor * ggml_supertonic_depthwise_1d_ct_segmented(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   dilation,
+            int                   seg_len);
+
     // Supertonic fused channel-axis layer norm.  Normalises across the
     // channel dim (ne[1]) of a [L, C, 1, 1] tensor and applies an affine
     // scale + shift, all in one Metal dispatch.  Replaces the

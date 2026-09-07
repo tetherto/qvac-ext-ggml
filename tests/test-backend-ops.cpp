@@ -3394,6 +3394,48 @@ struct test_supertonic_layer_norm_channel : public test_case {
     }
 };
 
+// GGML_OP_SUPERTONIC_DEPTHWISE_1D
+struct test_supertonic_depthwise_1d : public test_case {
+    const int64_t L;
+    const int64_t C;
+    const int64_t K;
+    const int dilation;
+    const bool ct;      // [C, T] layout instead of [T, C]
+    const bool causal;  // causal-left taps ([C, T] only)
+    const int seg_len;  // clamp inside seg_len windows ([C, T] only)
+
+    std::string vars() override {
+        return VARS_TO_STR7(L, C, K, dilation, ct, causal, seg_len);
+    }
+
+    test_supertonic_depthwise_1d(int64_t L = 139, int64_t C = 512, int64_t K = 7, int dilation = 3,
+                                 bool ct = true, bool causal = false, int seg_len = 0)
+        : L(L), C(C), K(K), dilation(dilation), ct(ct), causal(causal), seg_len(seg_len) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ct ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, L) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, L, C);
+        ggml_set_name(a, "a");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out;
+        if (seg_len > 0) {
+            out = ggml_supertonic_depthwise_1d_ct_segmented(ctx, a, w, b, dilation, seg_len);
+        } else if (causal) {
+            out = ggml_supertonic_depthwise_1d_causal_ct(ctx, a, w, b, dilation);
+        } else if (ct) {
+            out = ggml_supertonic_depthwise_1d_ct(ctx, a, w, b, dilation);
+        } else {
+            out = ggml_supertonic_depthwise_1d(ctx, a, w, b, dilation);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_NORM + GGML_OP_MUL + optional GGML_OP_ADD
 struct test_norm_mul_add : public test_case {
     const ggml_type type;
@@ -8682,6 +8724,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_supertonic_layer_norm_channel(L, 512, ct));
         }
     }
+    for (int64_t K : { 3, 5, 7 }) {
+        test_cases.emplace_back(new test_supertonic_depthwise_1d(139, 512, K, 3, true));
+        test_cases.emplace_back(new test_supertonic_depthwise_1d(139, 512, K, 2, false));
+    }
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(4096, 512, 7, 1, true, true));
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(278, 512, 7, 27, true, false, 139));
+    test_cases.emplace_back(new test_supertonic_depthwise_1d(90, 512, 5, 8, true, false, 45));
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
