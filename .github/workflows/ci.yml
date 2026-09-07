@@ -6,13 +6,20 @@ on:
   pull_request:
     branches: [ master ]
 
-# Dedupe per PR and per branch: a re-push or re-dispatch supersedes the
-# in-flight run. The previous group fell back to github.run_id whenever
-# head_ref was empty — i.e. on every push and workflow_dispatch — which made
-# the group unique per run, so those runs never cancelled.
+# Dedupe per PR: a re-push supersedes the in-flight run.
 #
-# master is deliberately left on the run_id behaviour: pushes to the default
-# branch must not cancel each other, or a merged commit ends with no CI verdict.
+#   pull_request   -> per PR   (supersedes)
+#   push to master -> per run  (run_id; never cancels, so a merged commit
+#                     always gets a verdict)
+#
+# Those are the only two reachable outcomes: `push` is filtered to master and
+# there is no workflow_dispatch trigger, so the `|| github.ref` tail is inert
+# here. It is kept so this block matches the fabric engine repos verbatim.
+#
+# Note this expression partitions runs exactly as the previous one did for both
+# reachable events — per-PR superseding already worked via head_ref, and master
+# pushes already fell through to run_id. It is adopted for fleet uniformity,
+# not to change behaviour in this repo.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
