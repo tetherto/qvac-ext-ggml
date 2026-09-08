@@ -8135,6 +8135,38 @@ void ggml_compute_forward_supertonic_layer_norm_channel(
 
 // ggml_compute_forward_supertonic_pw2_residual
 
+// [T, C]: timesteps are contiguous, so stripe over channels and hoist the
+// per-channel bias and gamma out of the inner loop.
+static void supertonic_pw2_residual_tc(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int c = ith; c < C; c += nth) {
+        const float bv = b[c];
+        const float gv = g[c];
+        const float * xc = x + (size_t) c * L;
+        const float * rc = r + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            yc[t] = rc[t] + (xc[t] + bv) * gv;
+        }
+    }
+}
+
+// [C, T]: channels are contiguous, so stripe over timesteps. All four streams
+// are then unit-stride; striping over channels would walk one float per line.
+static void supertonic_pw2_residual_ct(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        const float * xt = x + (size_t) t * C;
+        const float * rt = r + (size_t) t * C;
+        float       * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = rt[c] + (xt[c] + b[c]) * g[c];
+        }
+    }
+}
+
 void ggml_compute_forward_supertonic_pw2_residual(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -8152,45 +8184,58 @@ void ggml_compute_forward_supertonic_pw2_residual(
 
     const int32_t layout = ((const int32_t *) dst->op_params)[0];
 
-    int L, C, sxt, sxc, syt, syc, srt, src;
-    if (layout == 0) {
-        L = (int) x->ne[0];
-        C = (int) x->ne[1];
-        sxt = 1;  sxc = L;
-        syt = 1;  syc = L;
-        srt = 1;  src = L;
-    } else {
-        C = (int) x->ne[0];
-        L = (int) x->ne[1];
-        sxt = C;  sxc = 1;
-        syt = C;  syc = 1;
-        srt = C;  src = 1;
-    }
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const float * x_data   = (const float *) x->data;
     const float * b_data   = (const float *) bias->data;
     const float * g_data   = (const float *) gamma->data;
     const float * r_data   = (const float *) residual->data;
           float * y_data   = (float *) dst->data;
 
-    // Stripe over channels.  For each channel c, bias and gamma are read
-    // once and applied across all L timesteps; layout flag flips x/y/r index
-    // strides between [T, C] and [C, T].
-    for (int c = ith; c < C; c += nth) {
-        const float bv = b_data[c];
-        const float gv = g_data[c];
-        for (int t = 0; t < L; ++t) {
-            const float xv = x_data[(size_t) t * sxt + (size_t) c * sxc];
-            const float rv = r_data[(size_t) t * srt + (size_t) c * src];
-            y_data[(size_t) t * syt + (size_t) c * syc] = rv + (xv + bv) * gv;
-        }
+    if (layout == 0) {
+        supertonic_pw2_residual_tc(x_data, b_data, g_data, r_data, y_data,
+            (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+    } else {
+        supertonic_pw2_residual_ct(x_data, b_data, g_data, r_data, y_data,
+            (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
     }
 }
 
 // ggml_compute_forward_supertonic_bias_gelu
+
+static const float kSupertonicInvSqrt2 = 0.7071067811865475f;
+
+static inline float supertonic_bias_gelu_one(float x, float b) {
+    const float v = x + b;
+    return 0.5f * v * (1.0f + erff(v * kSupertonicInvSqrt2));
+}
+
+// [T, C]: timesteps are contiguous, so stripe over channels.
+static void supertonic_bias_gelu_tc(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int c = ith; c < C; c += nth) {
+        const float bv = b[c];
+        const float * xc = x + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            yc[t] = supertonic_bias_gelu_one(xc[t], bv);
+        }
+    }
+}
+
+// [C, T]: channels are contiguous, so stripe over timesteps and let each row be
+// a unit-stride pass over x, bias and y. Striping over channels here would make
+// the inner loop walk one float per cache line.
+static void supertonic_bias_gelu_ct(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        const float * xt = x + (size_t) t * C;
+        float       * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = supertonic_bias_gelu_one(xt[c], b[c]);
+        }
+    }
+}
 
 void ggml_compute_forward_supertonic_bias_gelu(
         const ggml_compute_params * params,
@@ -8205,34 +8250,16 @@ void ggml_compute_forward_supertonic_bias_gelu(
 
     const int32_t layout = ((const int32_t *) dst->op_params)[0];
 
-    int L, C, sxt, sxc, syt, syc;
-    if (layout == 0) {
-        L = (int) x->ne[0];
-        C = (int) x->ne[1];
-        sxt = 1;  sxc = L;
-        syt = 1;  syc = L;
-    } else {
-        C = (int) x->ne[0];
-        L = (int) x->ne[1];
-        sxt = C;  sxc = 1;
-        syt = C;  syc = 1;
-    }
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const float * x_data = (const float *) x->data;
     const float * b_data = (const float *) bias->data;
           float * y_data = (float *)       dst->data;
 
-    static const float inv_sqrt_2 = 0.7071067811865475f;
-
-    for (int c = ith; c < C; c += nth) {
-        const float bv = b_data[c];
-        for (int t = 0; t < L; ++t) {
-            const float v = x_data[(size_t) t * sxt + (size_t) c * sxc] + bv;
-            y_data[(size_t) t * syt + (size_t) c * syc] = 0.5f * v * (1.0f + erff(v * inv_sqrt_2));
-        }
+    if (layout == 0) {
+        supertonic_bias_gelu_tc(x_data, b_data, y_data,
+            (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+    } else {
+        supertonic_bias_gelu_ct(x_data, b_data, y_data,
+            (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
     }
 }
 
