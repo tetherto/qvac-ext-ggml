@@ -8013,6 +8013,81 @@ void ggml_compute_forward_pad_reflect_1d(
 
 // ggml_compute_forward_supertonic_depthwise_1d
 
+struct supertonic_dw_params {
+    int K;
+    int dilation;
+    int k_off;
+    int seg_len;
+    int ith;
+    int nth;
+};
+
+// Clamp a tap to its segment so padding repeats the edge sample.
+static inline int supertonic_dw_tap(int t, int k, const supertonic_dw_params * p,
+                                    int lo, int hi) {
+    const int s = t + (k + p->k_off) * p->dilation;
+    if (s < lo) return lo;
+    if (s >= hi) return hi - 1;
+    return s;
+}
+
+static inline void supertonic_dw_segment(int t, int seg_len, int L,
+                                         int * lo, int * hi) {
+    *lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+    *hi = seg_len > 0 ? *lo + seg_len : L;
+}
+
+static void supertonic_dw_fill_bias(float * y, const float * b, int C) {
+    if (b) {
+        for (int c = 0; c < C; ++c) y[c] = b[c];
+    } else {
+        for (int c = 0; c < C; ++c) y[c] = 0.0f;
+    }
+}
+
+// [T, C]: each channel owns a contiguous run of timesteps, so stripe over
+// channels and keep the tap loop innermost.
+static void supertonic_depthwise_1d_tc(
+        const float * x, const float * w, const float * b, float * y,
+        int L, int C, const supertonic_dw_params * p) {
+    for (int c = p->ith; c < C; c += p->nth) {
+        const float bias_v = b ? b[c] : 0.0f;
+        const float * w_c = w + (size_t) c * p->K;
+        const float * xc = x + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            int lo, hi;
+            supertonic_dw_segment(t, p->seg_len, L, &lo, &hi);
+            float sum = bias_v;
+            for (int k = 0; k < p->K; ++k) {
+                sum += xc[supertonic_dw_tap(t, k, p, lo, hi)] * w_c[k];
+            }
+            yc[t] = sum;
+        }
+    }
+}
+
+// [C, T]: each timestep is a contiguous row of channels. Stripe over timesteps
+// and hoist the tap loop outside the channel loop, so every tap reads one
+// contiguous row instead of C-strided singles. Taps still accumulate in
+// ascending k, which keeps the result bit-identical to the [T, C] order.
+static void supertonic_depthwise_1d_ct(
+        const float * x, const float * w, const float * b, float * y,
+        int L, int C, const supertonic_dw_params * p) {
+    for (int t = p->ith; t < L; t += p->nth) {
+        int lo, hi;
+        supertonic_dw_segment(t, p->seg_len, L, &lo, &hi);
+        float * yt = y + (size_t) t * C;
+        supertonic_dw_fill_bias(yt, b, C);
+        for (int k = 0; k < p->K; ++k) {
+            const float * xs = x + (size_t) supertonic_dw_tap(t, k, p, lo, hi) * C;
+            for (int c = 0; c < C; ++c) {
+                yt[c] += xs[c] * w[(size_t) c * p->K + k];
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_supertonic_depthwise_1d(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -8034,42 +8109,21 @@ void ggml_compute_forward_supertonic_depthwise_1d(
     const int32_t seg_len = opts[4];
     const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
 
-    int L, C, sxt, sxc, syt, syc;
-    if (layout == 0) {
-        L = (int) x->ne[0];
-        C = (int) x->ne[1];
-        sxt = 1;  sxc = L;
-        syt = 1;  syc = L;
-    } else {
-        C = (int) x->ne[0];
-        L = (int) x->ne[1];
-        sxt = C;  sxc = 1;
-        syt = C;  syc = 1;
-    }
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const float * x_data = (const float *) x->data;
     const float * w_data = (const float *) w->data;
     const float * b_data = bias ? (const float *) bias->data : NULL;
           float * y_data = (float *) dst->data;
 
-    for (int c = ith; c < C; c += nth) {
-        const float bias_v = b_data ? b_data[c] : 0.0f;
-        const float * w_c = w_data + (size_t) c * K;
-        for (int t = 0; t < L; ++t) {
-            const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
-            const int hi = seg_len > 0 ? lo + seg_len : L;
-            float sum = bias_v;
-            for (int k = 0; k < K; ++k) {
-                int s = t + (k + k_off) * dilation;
-                if (s < lo) s = lo;
-                else if (s >= hi) s = hi - 1;
-                sum += x_data[(size_t) s * sxt + (size_t) c * sxc] * w_c[k];
-            }
-            y_data[(size_t) t * syt + (size_t) c * syc] = sum;
-        }
+    const supertonic_dw_params dw = {
+        K, dilation, k_off, seg_len, params->ith, params->nth
+    };
+
+    if (layout == 0) {
+        supertonic_depthwise_1d_tc(x_data, w_data, b_data, y_data,
+            (int) x->ne[0], (int) x->ne[1], &dw);
+    } else {
+        supertonic_depthwise_1d_ct(x_data, w_data, b_data, y_data,
+            (int) x->ne[1], (int) x->ne[0], &dw);
     }
 }
 
