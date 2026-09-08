@@ -8276,6 +8276,37 @@ static void supertonic_bias_gelu_tc(
     }
 }
 
+// One contiguous row: y[i] = gelu_erf(x[i] + b[i]). The ISA order here mirrors
+// vec.h exactly, since those blocks are #elif and only one defines
+// ggml_v_gelu_erf. SVE has no vector form and falls through to the scalar tail.
+static void supertonic_bias_gelu_row(float * y, const float * x, const float * b, int n) {
+    int i = 0;
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(y + i, ggml_v_gelu_erf(vaddq_f32(vld1q_f32(x + i), vld1q_f32(b + i))));
+    }
+#elif defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm512_add_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(b + i))));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm256_add_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(b + i))));
+    }
+#elif defined(__SSE2__)
+    for (; i + 3 < n; i += 4) {
+        _mm_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm_add_ps(_mm_loadu_ps(x + i), _mm_loadu_ps(b + i))));
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = supertonic_bias_gelu_one(x[i], b[i]);
+    }
+}
+
 // [C, T]: channels are contiguous, so stripe over timesteps and let each row be
 // a unit-stride pass over x, bias and y. Striping over channels here would make
 // the inner loop walk one float per cache line.
@@ -8283,11 +8314,7 @@ static void supertonic_bias_gelu_ct(
         const float * x, const float * b, float * y,
         int L, int C, int ith, int nth) {
     for (int t = ith; t < L; t += nth) {
-        const float * xt = x + (size_t) t * C;
-        float       * yt = y + (size_t) t * C;
-        for (int c = 0; c < C; ++c) {
-            yt[c] = supertonic_bias_gelu_one(xt[c], b[c]);
-        }
+        supertonic_bias_gelu_row(y + (size_t) t * C, x + (size_t) t * C, b, C);
     }
 }
 
