@@ -207,6 +207,7 @@ jobs:
 
   ggml-ci-x64-nvidia-cuda:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
     steps:
       - name: Clone
@@ -221,6 +222,7 @@ jobs:
 
   ggml-ci-x64-nvidia-vulkan-cm:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
     steps:
       - name: Clone
@@ -235,6 +237,7 @@ jobs:
 
   ggml-ci-x64-nvidia-vulkan-cm2:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia_coopmat2) }}
     steps:
       - name: Clone
@@ -263,6 +266,7 @@ jobs:
 
   ggml-ci-mac-metal:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps:
       - name: Clone
@@ -276,6 +280,7 @@ jobs:
 
   ggml-ci-mac-vulkan:
     needs: runner_names
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps:
       - name: Clone
