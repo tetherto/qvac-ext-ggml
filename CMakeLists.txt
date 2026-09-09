@@ -511,6 +511,7 @@ if (MSVC)
 
     if (GGML_BUILD_TESTS)
         configure_msvc_target(test-mul-mat)
+        configure_msvc_target(test-mul-mat-convrot)
         configure_msvc_target(test-arange)
         configure_msvc_target(test-backend-ops)
         configure_msvc_target(test-cont)

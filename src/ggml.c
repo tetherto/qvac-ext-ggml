@@ -1175,9 +1175,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "GLU",
     "ROPE_FLUX",
+    "MUL_MAT_CONVROT",
 };
 
-static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1303,9 +1304,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "glu(x)",
     "rope_flux(x)",
+    "convrot(X,W,S)",
 };
 
-static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3460,6 +3462,44 @@ struct ggml_tensor * ggml_mul_mat(
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_convrot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * activations,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * scales,
+        int32_t               group_size) {
+    GGML_ASSERT(activations->type == GGML_TYPE_F32 || activations->type == GGML_TYPE_F16);
+    GGML_ASSERT(weights->type == GGML_TYPE_I8);
+    GGML_ASSERT(scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(!ggml_is_transposed(weights));
+    GGML_ASSERT(group_size == 256);
+
+    GGML_ASSERT(activations->ne[0] > 0 && weights->ne[0] > 0 && weights->ne[1] > 0);
+    GGML_ASSERT(activations->ne[0] == weights->ne[0]);
+    GGML_ASSERT(weights->ne[0] % group_size == 0);
+    GGML_ASSERT(weights->ne[2] == 1 && weights->ne[3] == 1);
+    GGML_ASSERT(scales->ne[0] == weights->ne[1]);
+    GGML_ASSERT(scales->ne[1] == 1 && scales->ne[2] == 1 && scales->ne[3] == 1);
+
+    // Validate every multiplication used by the result and compact source
+    // layouts before asking ggml to reserve tensor storage.
+    GGML_ASSERT(weights->ne[0] <= INT64_MAX / weights->ne[1]);
+    GGML_ASSERT(activations->ne[1] <= INT64_MAX / weights->ne[1]);
+    GGML_ASSERT(activations->ne[2] <= INT64_MAX / (weights->ne[1] * activations->ne[1]));
+    GGML_ASSERT(activations->ne[3] <= INT64_MAX / (weights->ne[1] * activations->ne[1] * activations->ne[2]));
+
+    const int64_t ne[4] = { weights->ne[1], activations->ne[1], activations->ne[2], activations->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, group_size);
+    result->op     = GGML_OP_MUL_MAT_CONVROT;
+    result->src[0] = activations;
+    result->src[1] = weights;
+    result->src[2] = scales;
 
     return result;
 }
