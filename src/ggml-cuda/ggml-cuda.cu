@@ -5569,6 +5569,13 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
         static std::mutex mutex;
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
+            // needed to initialize ggml_time in this module's own ggml-base copy
+            // under GGML_BACKEND_DL (mirrors ggml_cpu_init): on Windows ggml_time_us
+            // divides by a QueryPerformanceFrequency value that only ggml_time_init
+            // sets, and the cuda-graph eviction sweep calls ggml_time_us on every
+            // graph compute
+            ggml_time_init();
+
             ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
