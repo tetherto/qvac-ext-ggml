@@ -8013,6 +8013,81 @@ void ggml_compute_forward_pad_reflect_1d(
 
 // ggml_compute_forward_supertonic_depthwise_1d
 
+struct supertonic_dw_params {
+    int K;
+    int dilation;
+    int k_off;
+    int seg_len;
+    int ith;
+    int nth;
+};
+
+// Clamp a tap to its segment so padding repeats the edge sample.
+static inline int supertonic_dw_tap(int t, int k, const supertonic_dw_params * p,
+                                    int lo, int hi) {
+    const int s = t + (k + p->k_off) * p->dilation;
+    if (s < lo) return lo;
+    if (s >= hi) return hi - 1;
+    return s;
+}
+
+static inline void supertonic_dw_segment(int t, int seg_len, int L,
+                                         int * lo, int * hi) {
+    *lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
+    *hi = seg_len > 0 ? *lo + seg_len : L;
+}
+
+static void supertonic_dw_fill_bias(float * y, const float * b, int C) {
+    if (b) {
+        for (int c = 0; c < C; ++c) y[c] = b[c];
+    } else {
+        for (int c = 0; c < C; ++c) y[c] = 0.0f;
+    }
+}
+
+// [T, C]: each channel owns a contiguous run of timesteps, so stripe over
+// channels and keep the tap loop innermost.
+static void supertonic_depthwise_1d_tc(
+        const float * x, const float * w, const float * b, float * y,
+        int L, int C, const supertonic_dw_params * p) {
+    for (int c = p->ith; c < C; c += p->nth) {
+        const float bias_v = b ? b[c] : 0.0f;
+        const float * w_c = w + (size_t) c * p->K;
+        const float * xc = x + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            int lo, hi;
+            supertonic_dw_segment(t, p->seg_len, L, &lo, &hi);
+            float sum = bias_v;
+            for (int k = 0; k < p->K; ++k) {
+                sum += xc[supertonic_dw_tap(t, k, p, lo, hi)] * w_c[k];
+            }
+            yc[t] = sum;
+        }
+    }
+}
+
+// [C, T]: each timestep is a contiguous row of channels. Stripe over timesteps
+// and hoist the tap loop outside the channel loop, so every tap reads one
+// contiguous row instead of C-strided singles. Taps still accumulate in
+// ascending k, which keeps the result bit-identical to the [T, C] order.
+static void supertonic_depthwise_1d_ct(
+        const float * x, const float * w, const float * b, float * y,
+        int L, int C, const supertonic_dw_params * p) {
+    for (int t = p->ith; t < L; t += p->nth) {
+        int lo, hi;
+        supertonic_dw_segment(t, p->seg_len, L, &lo, &hi);
+        float * yt = y + (size_t) t * C;
+        supertonic_dw_fill_bias(yt, b, C);
+        for (int k = 0; k < p->K; ++k) {
+            const float * xs = x + (size_t) supertonic_dw_tap(t, k, p, lo, hi) * C;
+            for (int c = 0; c < C; ++c) {
+                yt[c] += xs[c] * w[(size_t) c * p->K + k];
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_supertonic_depthwise_1d(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -8034,42 +8109,21 @@ void ggml_compute_forward_supertonic_depthwise_1d(
     const int32_t seg_len = opts[4];
     const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
 
-    int L, C, sxt, sxc, syt, syc;
-    if (layout == 0) {
-        L = (int) x->ne[0];
-        C = (int) x->ne[1];
-        sxt = 1;  sxc = L;
-        syt = 1;  syc = L;
-    } else {
-        C = (int) x->ne[0];
-        L = (int) x->ne[1];
-        sxt = C;  sxc = 1;
-        syt = C;  syc = 1;
-    }
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const float * x_data = (const float *) x->data;
     const float * w_data = (const float *) w->data;
     const float * b_data = bias ? (const float *) bias->data : NULL;
           float * y_data = (float *) dst->data;
 
-    for (int c = ith; c < C; c += nth) {
-        const float bias_v = b_data ? b_data[c] : 0.0f;
-        const float * w_c = w_data + (size_t) c * K;
-        for (int t = 0; t < L; ++t) {
-            const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
-            const int hi = seg_len > 0 ? lo + seg_len : L;
-            float sum = bias_v;
-            for (int k = 0; k < K; ++k) {
-                int s = t + (k + k_off) * dilation;
-                if (s < lo) s = lo;
-                else if (s >= hi) s = hi - 1;
-                sum += x_data[(size_t) s * sxt + (size_t) c * sxc] * w_c[k];
-            }
-            y_data[(size_t) t * syt + (size_t) c * syc] = sum;
-        }
+    const supertonic_dw_params dw = {
+        K, dilation, k_off, seg_len, params->ith, params->nth
+    };
+
+    if (layout == 0) {
+        supertonic_depthwise_1d_tc(x_data, w_data, b_data, y_data,
+            (int) x->ne[0], (int) x->ne[1], &dw);
+    } else {
+        supertonic_depthwise_1d_ct(x_data, w_data, b_data, y_data,
+            (int) x->ne[1], (int) x->ne[0], &dw);
     }
 }
 
@@ -8135,6 +8189,38 @@ void ggml_compute_forward_supertonic_layer_norm_channel(
 
 // ggml_compute_forward_supertonic_pw2_residual
 
+// [T, C]: timesteps are contiguous, so stripe over channels and hoist the
+// per-channel bias and gamma out of the inner loop.
+static void supertonic_pw2_residual_tc(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int c = ith; c < C; c += nth) {
+        const float bv = b[c];
+        const float gv = g[c];
+        const float * xc = x + (size_t) c * L;
+        const float * rc = r + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            yc[t] = rc[t] + (xc[t] + bv) * gv;
+        }
+    }
+}
+
+// [C, T]: channels are contiguous, so stripe over timesteps. All four streams
+// are then unit-stride; striping over channels would walk one float per line.
+static void supertonic_pw2_residual_ct(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        const float * xt = x + (size_t) t * C;
+        const float * rt = r + (size_t) t * C;
+        float       * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = rt[c] + (xt[c] + b[c]) * g[c];
+        }
+    }
+}
+
 void ggml_compute_forward_supertonic_pw2_residual(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -8152,45 +8238,85 @@ void ggml_compute_forward_supertonic_pw2_residual(
 
     const int32_t layout = ((const int32_t *) dst->op_params)[0];
 
-    int L, C, sxt, sxc, syt, syc, srt, src;
-    if (layout == 0) {
-        L = (int) x->ne[0];
-        C = (int) x->ne[1];
-        sxt = 1;  sxc = L;
-        syt = 1;  syc = L;
-        srt = 1;  src = L;
-    } else {
-        C = (int) x->ne[0];
-        L = (int) x->ne[1];
-        sxt = C;  sxc = 1;
-        syt = C;  syc = 1;
-        srt = C;  src = 1;
-    }
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const float * x_data   = (const float *) x->data;
     const float * b_data   = (const float *) bias->data;
     const float * g_data   = (const float *) gamma->data;
     const float * r_data   = (const float *) residual->data;
           float * y_data   = (float *) dst->data;
 
-    // Stripe over channels.  For each channel c, bias and gamma are read
-    // once and applied across all L timesteps; layout flag flips x/y/r index
-    // strides between [T, C] and [C, T].
-    for (int c = ith; c < C; c += nth) {
-        const float bv = b_data[c];
-        const float gv = g_data[c];
-        for (int t = 0; t < L; ++t) {
-            const float xv = x_data[(size_t) t * sxt + (size_t) c * sxc];
-            const float rv = r_data[(size_t) t * srt + (size_t) c * src];
-            y_data[(size_t) t * syt + (size_t) c * syc] = rv + (xv + bv) * gv;
-        }
+    if (layout == 0) {
+        supertonic_pw2_residual_tc(x_data, b_data, g_data, r_data, y_data,
+            (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+    } else {
+        supertonic_pw2_residual_ct(x_data, b_data, g_data, r_data, y_data,
+            (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
     }
 }
 
 // ggml_compute_forward_supertonic_bias_gelu
+
+static const float kSupertonicInvSqrt2 = 0.7071067811865475f;
+
+static inline float supertonic_bias_gelu_one(float x, float b) {
+    const float v = x + b;
+    return 0.5f * v * (1.0f + erff(v * kSupertonicInvSqrt2));
+}
+
+// [T, C]: timesteps are contiguous, so stripe over channels.
+static void supertonic_bias_gelu_tc(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int c = ith; c < C; c += nth) {
+        const float bv = b[c];
+        const float * xc = x + (size_t) c * L;
+        float       * yc = y + (size_t) c * L;
+        for (int t = 0; t < L; ++t) {
+            yc[t] = supertonic_bias_gelu_one(xc[t], bv);
+        }
+    }
+}
+
+// One contiguous row: y[i] = gelu_erf(x[i] + b[i]). The ISA order here mirrors
+// vec.h exactly, since those blocks are #elif and only one defines
+// ggml_v_gelu_erf. SVE has no vector form and falls through to the scalar tail.
+static void supertonic_bias_gelu_row(float * y, const float * x, const float * b, int n) {
+    int i = 0;
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(y + i, ggml_v_gelu_erf(vaddq_f32(vld1q_f32(x + i), vld1q_f32(b + i))));
+    }
+#elif defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm512_add_ps(_mm512_loadu_ps(x + i), _mm512_loadu_ps(b + i))));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm256_add_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(b + i))));
+    }
+#elif defined(__SSE2__)
+    for (; i + 3 < n; i += 4) {
+        _mm_storeu_ps(y + i, ggml_v_gelu_erf(
+            _mm_add_ps(_mm_loadu_ps(x + i), _mm_loadu_ps(b + i))));
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = supertonic_bias_gelu_one(x[i], b[i]);
+    }
+}
+
+// [C, T]: channels are contiguous, so stripe over timesteps and let each row be
+// a unit-stride pass over x, bias and y. Striping over channels here would make
+// the inner loop walk one float per cache line.
+static void supertonic_bias_gelu_ct(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        supertonic_bias_gelu_row(y + (size_t) t * C, x + (size_t) t * C, b, C);
+    }
+}
 
 void ggml_compute_forward_supertonic_bias_gelu(
         const ggml_compute_params * params,
@@ -8205,34 +8331,16 @@ void ggml_compute_forward_supertonic_bias_gelu(
 
     const int32_t layout = ((const int32_t *) dst->op_params)[0];
 
-    int L, C, sxt, sxc, syt, syc;
-    if (layout == 0) {
-        L = (int) x->ne[0];
-        C = (int) x->ne[1];
-        sxt = 1;  sxc = L;
-        syt = 1;  syc = L;
-    } else {
-        C = (int) x->ne[0];
-        L = (int) x->ne[1];
-        sxt = C;  sxc = 1;
-        syt = C;  syc = 1;
-    }
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
     const float * x_data = (const float *) x->data;
     const float * b_data = (const float *) bias->data;
           float * y_data = (float *)       dst->data;
 
-    static const float inv_sqrt_2 = 0.7071067811865475f;
-
-    for (int c = ith; c < C; c += nth) {
-        const float bv = b_data[c];
-        for (int t = 0; t < L; ++t) {
-            const float v = x_data[(size_t) t * sxt + (size_t) c * sxc] + bv;
-            y_data[(size_t) t * syt + (size_t) c * syc] = 0.5f * v * (1.0f + erff(v * inv_sqrt_2));
-        }
+    if (layout == 0) {
+        supertonic_bias_gelu_tc(x_data, b_data, y_data,
+            (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+    } else {
+        supertonic_bias_gelu_ct(x_data, b_data, y_data,
+            (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
     }
 }
 
