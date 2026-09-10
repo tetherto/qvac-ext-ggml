@@ -5925,14 +5925,14 @@ static inline float supertonic_depthwise_tap_sum(device const float * x_c, devic
 
 // Supertonic fused depthwise-1D conv with edge-clamp padding + bias add.
 // Replaces the edge_clamp_pad_1d + im2col + mul_mat + add sequence the
-// stock depthwise_same_ggml graph fallback emits.  One threadgroup per
-// channel; threads iterate over the time dimension.
+// stock depthwise_same_ggml graph fallback emits. One threadgroup per
+// (channel, batch); threads iterate over the time dimension.
 //
 // Layout (all f32 contiguous):
-//   x:    [L, C, 1, 1] memory offset (t, c) -> c*L + t
+//   x:    [L, C, B, 1] memory offset (t, c, batch) -> batch*L*C + c*L + t
 //   w:    [K, 1, C, 1] memory offset (k, 0, c, 0) -> c*K + k
 //   bias: [C]          memory offset c -> c     (omitted when has_bias = 0)
-//   y:    [L, C, 1, 1] same layout as x
+//   y:    [L, C, B, 1] same layout as x
 kernel void kernel_supertonic_depthwise_1d_f32(
     constant   ggml_metal_kargs_supertonic_depthwise_1d & args,
     device  const float * x,
@@ -5944,7 +5944,8 @@ kernel void kernel_supertonic_depthwise_1d_f32(
     uint3   ntg[[threads_per_threadgroup]]) {
 
     const int c = (int) tgpig.x;
-    if (c >= args.C) return;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
 
     const int L        = args.L;
     const int K        = args.K;
@@ -5952,12 +5953,13 @@ kernel void kernel_supertonic_depthwise_1d_f32(
     const int causal   = args.causal;
     const int sxt = args.sxt, sxc = args.sxc;
     const int syt = args.syt, syc = args.syc;
+    const size_t batch_offset = (size_t) batch * L * args.C;
 
     // Layout-agnostic per-channel base pointers: x[t, c] = x[t*sxt + c*sxc].
     // w is stored as [K, 1, C] f32 contiguous, so w_c = w + c*K stays.
-    device const float * x_c = x + (size_t) c * sxc;
+    device const float * x_c = x + batch_offset + (size_t) c * sxc;
     device const float * w_c = w + (size_t) c * K;
-    device       float * y_c = y + (size_t) c * syc;
+    device       float * y_c = y + batch_offset + (size_t) c * syc;
 
     const float bias_v = (args.has_bias != 0) ? bias[c] : 0.0f;
 
@@ -5994,7 +5996,8 @@ kernel void kernel_supertonic_depthwise_1d_layer_norm_f32(
     uint  tiisg [[thread_index_in_simdgroup]]) {
 
     const int t = (int) tgpig.x;
-    if (t >= args.L) return;
+    const int batch = (int) tgpig.y;
+    if (t >= args.L || batch >= args.B) return;
 
     const int L = args.L;
     const int C = args.C;
@@ -6006,13 +6009,14 @@ kernel void kernel_supertonic_depthwise_1d_layer_norm_f32(
     const int seg_len = args.seg_len;
     const int lo = seg_len > 0 ? (t / seg_len) * seg_len : 0;
     const int hi = seg_len > 0 ? lo + seg_len : L;
+    const size_t batch_offset = (size_t) batch * L * C;
 
     float vals[GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD];
     for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
         const int c = (int) tpitg.x + i * (int) ntg.x;
         if (c < C) {
             const float bias_v = (args.has_bias != 0) ? bias[c] : 0.0f;
-            vals[i] = supertonic_depthwise_tap_sum(x + (size_t) c * sxc, w + (size_t) c * K,
+            vals[i] = supertonic_depthwise_tap_sum(x + batch_offset + (size_t) c * sxc, w + (size_t) c * K,
                                                    t, lo, hi, K, dilation, k_off, sxt, bias_v);
         }
     }
@@ -6059,7 +6063,7 @@ kernel void kernel_supertonic_depthwise_1d_layer_norm_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv_std = rsqrt(shared[0] / (float) C + args.eps);
 
-    device float * y_t = y + (size_t) t * syt;
+    device float * y_t = y + batch_offset + (size_t) t * syt;
     for (int i = 0; i < GGML_METAL_SUPERTONIC_DW_LN_MAX_PER_THREAD; ++i) {
         const int c = (int) tpitg.x + i * (int) ntg.x;
         if (c < C) {
@@ -6074,8 +6078,8 @@ kernel void kernel_supertonic_depthwise_1d_layer_norm_f32(
 // stock ggml_norm requires (since ggml_norm normalises along ne[0]).
 // One threadgroup per timestep; threads stripe over channels.
 //
-// Layout: x and y are f32 contiguous [L, C, 1, 1] with element (t, c) at
-// offset c*L + t (channel slow, time fast).  Affine params g, b are f32 [C].
+// Layout: x and y are f32 contiguous [L, C, B, 1] with element (t, c, batch)
+// at offset batch*L*C + c*L + t. Affine params g, b are f32 [C].
 //
 // Reduction uses simdgroup_sum + threadgroup memory across simdgroups.
 // Assumes threads_per_threadgroup is a multiple of 32 (simdgroup size on
@@ -6094,16 +6098,18 @@ kernel void kernel_supertonic_layer_norm_channel_f32(
     uint  tiisg [[thread_index_in_simdgroup]]) {
 
     const int t = (int) tgpig.x;
-    if (t >= args.L) return;
+    const int batch = (int) tgpig.y;
+    if (t >= args.L || batch >= args.B) return;
 
     const int C = args.C;
     // Element strides — let the same kernel handle both
     // [T, C] (sxt=1, sxc=L) and [C, T] (sxt=C, sxc=1) layouts.
     const int sxt = args.sxt, sxc = args.sxc;
     const int syt = args.syt, syc = args.syc;
+    const size_t batch_offset = (size_t) batch * args.L * C;
 
-    device const float * x_t = x + (size_t) t * sxt;
-    device       float * y_t = y + (size_t) t * syt;
+    device const float * x_t = x + batch_offset + (size_t) t * sxt;
+    device       float * y_t = y + batch_offset + (size_t) t * syt;
 
     // ---- Mean ----
     float my_sum = 0.0f;
@@ -6157,12 +6163,12 @@ kernel void kernel_supertonic_layer_norm_channel_f32(
 
 // Supertonic fused (x + bias) * gamma + residual.  Replaces the
 // ggml_add → ggml_mul → ggml_add chain at the end of every ConvNeXt
-// block.  One threadgroup per channel; threads stride over the time
-// dim.  bias and gamma are constants for the channel — load once into
+// block. One threadgroup per (channel, batch); threads stride over the time
+// dim. bias and gamma are constants for the channel — load once into
 // registers and broadcast across timesteps.
 //
-// Layout: x, residual, y are f32 contiguous [L, C, 1, 1] with element
-// (t, c) at offset c*L + t.  bias and gamma are f32 [C].
+// Layout: x, residual, y are f32 contiguous [L, C, B, 1] with element
+// (t, c, batch) at offset batch*L*C + c*L + t. bias and gamma are f32 [C].
 kernel void kernel_supertonic_pw2_residual_f32(
     constant   ggml_metal_kargs_supertonic_pw2_residual & args,
     device  const float * x,
@@ -6175,7 +6181,8 @@ kernel void kernel_supertonic_pw2_residual_f32(
     uint3   ntg[[threads_per_threadgroup]]) {
 
     const int c = (int) tgpig.x;
-    if (c >= args.C) return;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
 
     const int L = args.L;
     const int sxt = args.sxt, sxc = args.sxc;
@@ -6183,10 +6190,11 @@ kernel void kernel_supertonic_pw2_residual_f32(
     const int srt = args.srt, src = args.src;
     const float bv = bias[c];
     const float gv = gamma[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
 
-    device const float * x_c = x        + (size_t) c * sxc;
-    device const float * r_c = residual + (size_t) c * src;
-    device       float * y_c = y        + (size_t) c * syc;
+    device const float * x_c = x        + batch_offset + (size_t) c * sxc;
+    device const float * r_c = residual + batch_offset + (size_t) c * src;
+    device       float * y_c = y        + batch_offset + (size_t) c * syc;
 
     for (int t = (int) tpitg.x; t < L; t += (int) ntg.x) {
         y_c[(size_t) t * syt] = r_c[(size_t) t * srt] + (x_c[(size_t) t * sxt] + bv) * gv;
@@ -6195,8 +6203,8 @@ kernel void kernel_supertonic_pw2_residual_f32(
 
 // Fused bias + GELU (erf form):  y[t, c] = gelu_erf(x[t, c] + bias[c])
 //                                        = 0.5 * v * (1 + erf(v / sqrt(2)))
-// Same channel-major contiguous layout as pw2_residual.  One threadgroup
-// per channel; threads in the threadgroup stride over the time axis so
+// Same batched contiguous layouts as pw2_residual. One threadgroup per
+// (channel, batch); threads in the threadgroup stride over the time axis so
 // the per-channel bias load lives in a register for the whole row.
 kernel void kernel_supertonic_bias_gelu_f32(
     constant   ggml_metal_kargs_supertonic_bias_gelu & args,
@@ -6208,15 +6216,17 @@ kernel void kernel_supertonic_bias_gelu_f32(
     uint3   ntg[[threads_per_threadgroup]]) {
 
     const int c = (int) tgpig.x;
-    if (c >= args.C) return;
+    const int batch = (int) tgpig.y;
+    if (c >= args.C || batch >= args.B) return;
 
     const int L = args.L;
     const int sxt = args.sxt, sxc = args.sxc;
     const int syt = args.syt, syc = args.syc;
     const float bv = bias[c];
+    const size_t batch_offset = (size_t) batch * L * args.C;
 
-    device const float * x_c = x + (size_t) c * sxc;
-    device       float * y_c = y + (size_t) c * syc;
+    device const float * x_c = x + batch_offset + (size_t) c * sxc;
+    device       float * y_c = y + batch_offset + (size_t) c * syc;
 
     // Use the same erf_approx template as kernel_gelu_erf_f32 above
     // (Abramowitz & Stegun 7.1.26 / Hastings approximation) so the fused

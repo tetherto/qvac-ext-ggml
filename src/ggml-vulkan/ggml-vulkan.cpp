@@ -913,6 +913,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_zero_upsample_f32;
     vk_pipeline pipeline_channel_shuffle_f32;
     vk_pipeline pipeline_affine_prelu_f32;
+    vk_pipeline pipeline_supertonic_depthwise_1d_f32;
+    vk_pipeline pipeline_supertonic_depthwise_1d_layer_norm_channel_f32;
+    vk_pipeline pipeline_supertonic_layer_norm_channel_f32;
+    vk_pipeline pipeline_supertonic_pw2_residual_f32;
+    vk_pipeline pipeline_supertonic_bias_gelu_f32;
+    vk_pipeline pipeline_supertonic_edge_pad_1d_f32;
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_lstm_cell_f32;
     vk_pipeline pipeline_lstm_cell_masked_f32;
@@ -1700,6 +1706,28 @@ struct vk_op_channel_shuffle_push_constants {
 
 struct vk_op_affine_prelu_push_constants {
     uint32_t ne, F, FT, C;
+};
+
+struct vk_op_supertonic_depthwise_1d_push_constants {
+    uint32_t ne, L, C, B, K, dilation, layout, causal, seg_len, has_bias;
+};
+
+struct vk_op_supertonic_depthwise_1d_layer_norm_channel_push_constants {
+    uint32_t L, C, B, K, dilation, layout, causal, seg_len, has_bias;
+    float eps;
+};
+
+struct vk_op_supertonic_layer_norm_channel_push_constants {
+    uint32_t L, C, B, layout;
+    float eps;
+};
+
+struct vk_op_supertonic_pointwise_push_constants {
+    uint32_t ne, L, C, B, layout;
+};
+
+struct vk_op_supertonic_edge_pad_1d_push_constants {
+    uint32_t ne, L_in, L_out, C, layout, pad_left;
 };
 
 struct vk_op_snake_push_constants {
@@ -5201,6 +5229,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_zero_upsample_f32, "zero_upsample_f32", zero_upsample_f32_len, zero_upsample_f32_data, "main", 2, sizeof(vk_op_zero_upsample_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_channel_shuffle_f32, "channel_shuffle_f32", channel_shuffle_f32_len, channel_shuffle_f32_data, "main", 2, sizeof(vk_op_channel_shuffle_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_supertonic_depthwise_1d_f32, "supertonic_depthwise_1d_f32", supertonic_depthwise_1d_f32_len, supertonic_depthwise_1d_f32_data, "main", 4, sizeof(vk_op_supertonic_depthwise_1d_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_supertonic_depthwise_1d_layer_norm_channel_f32, "supertonic_depthwise_1d_layer_norm_channel_f32", supertonic_depthwise_1d_layer_norm_channel_f32_len, supertonic_depthwise_1d_layer_norm_channel_f32_data, "main", 6, sizeof(vk_op_supertonic_depthwise_1d_layer_norm_channel_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_supertonic_layer_norm_channel_f32, "supertonic_layer_norm_channel_f32", supertonic_layer_norm_channel_f32_len, supertonic_layer_norm_channel_f32_data, "main", 4, sizeof(vk_op_supertonic_layer_norm_channel_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_supertonic_pw2_residual_f32, "supertonic_pw2_residual_f32", supertonic_pw2_residual_f32_len, supertonic_pw2_residual_f32_data, "main", 5, sizeof(vk_op_supertonic_pointwise_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_supertonic_bias_gelu_f32, "supertonic_bias_gelu_f32", supertonic_bias_gelu_f32_len, supertonic_bias_gelu_f32_data, "main", 3, sizeof(vk_op_supertonic_pointwise_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_supertonic_edge_pad_1d_f32, "supertonic_edge_pad_1d_f32", supertonic_edge_pad_1d_f32_len, supertonic_edge_pad_1d_f32_data, "main", 2, sizeof(vk_op_supertonic_edge_pad_1d_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32, "snake_f32", snake_f32_len, snake_f32_data, "main", 4, sizeof(vk_op_snake_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_lstm_cell_f32, "lstm_cell_f32", lstm_cell_f32_len, lstm_cell_f32_data, "main", 3, sizeof(vk_op_lstm_cell_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_lstm_cell_masked_f32, "lstm_cell_masked_f32", lstm_cell_masked_f32_len, lstm_cell_masked_f32_data, "main", 4, sizeof(vk_op_lstm_cell_push_constants), {512, 1, 1}, {}, 1);
@@ -10669,6 +10703,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_affine_prelu_f32;
         }
         return nullptr;
+    case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_supertonic_depthwise_1d_f32 : nullptr;
+    case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_supertonic_layer_norm_channel_f32 : nullptr;
+    case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_supertonic_pw2_residual_f32 : nullptr;
+    case GGML_OP_SUPERTONIC_BIAS_GELU:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_supertonic_bias_gelu_f32 : nullptr;
+    case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
+        return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            ? ctx->device->pipeline_supertonic_edge_pad_1d_f32 : nullptr;
     case GGML_OP_SNAKE:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_snake_f32;
@@ -11113,6 +11162,22 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             GGML_ABORT("invalid push constant type for CONV_2D");
         }
         break;
+    case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
+        {
+            const uint32_t ne = ggml_nelements(dst);
+            if (ne > 262144) {
+                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+            } else if (ne > 512) {
+                elements = { 512, CEIL_DIV(ne, 512), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+        }
+        break;
+    case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
+        elements = { 512, (uint32_t)(ggml_get_op_params_i32(dst, 1) == 0 ? src0->ne[0] : src0->ne[1]),
+                     (uint32_t)src0->ne[2] };
+        break;
     case GGML_OP_ADD:
     case GGML_OP_SUB:
     case GGML_OP_DIV:
@@ -11142,6 +11207,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_ZERO_UPSAMPLE:
     case GGML_OP_CHANNEL_SHUFFLE:
     case GGML_OP_AFFINE_PRELU:
+    case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
+    case GGML_OP_SUPERTONIC_BIAS_GELU:
+    case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
     case GGML_OP_SNAKE:
         {
             uint32_t ne = ggml_nelements(dst);
@@ -11833,6 +11901,120 @@ static void ggml_vk_affine_prelu(ggml_backend_vk_context * ctx, vk_context& subc
         (uint32_t)(src0->ne[0] * src0->ne[1]),
         (uint32_t)src0->ne[2],
     });
+}
+
+static void ggml_vk_supertonic_depthwise_1d(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * bias = dst->src[2];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 2);
+    const uint32_t L = (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]);
+    const uint32_t C = (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]);
+    ggml_vk_op_f32<vk_op_supertonic_depthwise_1d_push_constants>(
+        ctx, subctx, x, w, bias ? bias : x, nullptr, dst, dst->op, {
+            (uint32_t)ggml_nelements(dst), L, C, (uint32_t)x->ne[2],
+            (uint32_t)ggml_get_op_params_i32(dst, 0),
+            (uint32_t)ggml_get_op_params_i32(dst, 1),
+            layout,
+            (uint32_t)ggml_get_op_params_i32(dst, 3),
+            (uint32_t)ggml_get_op_params_i32(dst, 4),
+            bias != nullptr ? 1u : 0u,
+        });
+}
+
+static void ggml_vk_supertonic_depthwise_1d_layer_norm_channel(
+        ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+
+    const ggml_tensor * depthwise = cgraph->nodes[node_idx];
+    const ggml_tensor * layer_norm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * x = depthwise->src[0];
+    const ggml_tensor * w = depthwise->src[1];
+    const ggml_tensor * bias = depthwise->src[2];
+    const ggml_tensor * gamma = layer_norm->src[1];
+    const ggml_tensor * beta = layer_norm->src[2];
+    ggml_tensor * dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(depthwise, 2);
+    const uint32_t L = (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]);
+    const uint32_t C = (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]);
+    float eps;
+    memcpy(&eps, layer_norm->op_params, sizeof(eps));
+
+    const vk_op_supertonic_depthwise_1d_layer_norm_channel_push_constants pc = {
+        L,
+        C,
+        (uint32_t)x->ne[2],
+        (uint32_t)ggml_get_op_params_i32(depthwise, 0),
+        (uint32_t)ggml_get_op_params_i32(depthwise, 1),
+        layout,
+        (uint32_t)ggml_get_op_params_i32(depthwise, 3),
+        (uint32_t)ggml_get_op_params_i32(depthwise, 4),
+        bias != nullptr ? 1u : 0u,
+        eps,
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_supertonic_depthwise_1d_layer_norm_channel_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, x),
+        ggml_vk_tensor_subbuffer(ctx, w),
+        ggml_vk_tensor_subbuffer(ctx, bias ? bias : x),
+        ggml_vk_tensor_subbuffer(ctx, gamma),
+        ggml_vk_tensor_subbuffer(ctx, beta),
+        ggml_vk_tensor_subbuffer(ctx, dst),
+    }, pc, { 512, L, (uint32_t)x->ne[2] });
+}
+
+static void ggml_vk_supertonic_layer_norm_channel(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 1);
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+    ggml_vk_op_f32<vk_op_supertonic_layer_norm_channel_push_constants>(
+        ctx, subctx, x, dst->src[1], dst->src[2], nullptr, dst, dst->op, {
+            (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]),
+            (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]),
+            (uint32_t)x->ne[2], layout, eps,
+        });
+}
+
+static void ggml_vk_supertonic_pw2_residual(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 0);
+    ggml_vk_op_f32<vk_op_supertonic_pointwise_push_constants>(
+        ctx, subctx, x, dst->src[1], dst->src[2], dst->src[3], dst, dst->op, {
+            (uint32_t)ggml_nelements(dst),
+            (uint32_t)(layout == 0 ? x->ne[0] : layout == 1 ? x->ne[1] : x->ne[0]),
+            (uint32_t)(layout == 0 ? x->ne[1] : layout == 1 ? x->ne[0] : x->ne[1]),
+            (uint32_t)x->ne[2], layout,
+        });
+}
+
+static void ggml_vk_supertonic_bias_gelu(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 0);
+    ggml_vk_op_f32<vk_op_supertonic_pointwise_push_constants>(
+        ctx, subctx, x, dst->src[1], nullptr, nullptr, dst, dst->op, {
+            (uint32_t)ggml_nelements(dst),
+            (uint32_t)(layout == 0 ? x->ne[0] : layout == 1 ? x->ne[1] : x->ne[0]),
+            (uint32_t)(layout == 0 ? x->ne[1] : layout == 1 ? x->ne[0] : x->ne[1]),
+            (uint32_t)x->ne[2], layout,
+        });
+}
+
+static void ggml_vk_supertonic_edge_pad_1d(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const uint32_t layout = (uint32_t)ggml_get_op_params_i32(dst, 2);
+    ggml_vk_op_f32<vk_op_supertonic_edge_pad_1d_push_constants>(
+        ctx, subctx, x, nullptr, nullptr, nullptr, dst, dst->op, {
+            (uint32_t)ggml_nelements(dst),
+            (uint32_t)(layout == 0 ? x->ne[0] : x->ne[1]),
+            (uint32_t)(layout == 0 ? dst->ne[0] : dst->ne[1]),
+            (uint32_t)(layout == 0 ? x->ne[1] : x->ne[0]),
+            layout,
+            (uint32_t)ggml_get_op_params_i32(dst, 0),
+        });
 }
 
 static void ggml_vk_snake(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -14709,6 +14891,25 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_affine_prelu(ctx, compute_ctx, node);
 
         break;
+    case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
+        if (ctx->num_additional_fused_ops > 0) {
+            ggml_vk_supertonic_depthwise_1d_layer_norm_channel(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_supertonic_depthwise_1d(ctx, compute_ctx, node);
+        }
+        break;
+    case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
+        ggml_vk_supertonic_layer_norm_channel(ctx, compute_ctx, node);
+        break;
+    case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
+        ggml_vk_supertonic_pw2_residual(ctx, compute_ctx, node);
+        break;
+    case GGML_OP_SUPERTONIC_BIAS_GELU:
+        ggml_vk_supertonic_bias_gelu(ctx, compute_ctx, node);
+        break;
+    case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
+        ggml_vk_supertonic_edge_pad_1d(ctx, compute_ctx, node);
+        break;
 
     case GGML_OP_OPT_STEP_ADAMW:
         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
@@ -15887,6 +16088,70 @@ static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b
     return false;
 }
 
+static bool ggml_vk_can_fuse_supertonic_depthwise_layer_norm(
+        const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, {
+            GGML_OP_SUPERTONIC_DEPTHWISE_1D,
+            GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL })) {
+        return false;
+    }
+
+    const ggml_tensor * depthwise = cgraph->nodes[node_idx];
+    const ggml_tensor * layer_norm = cgraph->nodes[node_idx + 1];
+    if (layer_norm->src[0] != depthwise ||
+        ggml_get_op_params_i32(depthwise, 2) != ggml_get_op_params_i32(layer_norm, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * x = depthwise->src[0];
+    const ggml_tensor * w = depthwise->src[1];
+    const ggml_tensor * bias = depthwise->src[2];
+    const ggml_tensor * gamma = layer_norm->src[1];
+    const ggml_tensor * beta = layer_norm->src[2];
+    if (!x || !w || !gamma || !beta) {
+        return false;
+    }
+
+    const int32_t layout = ggml_get_op_params_i32(depthwise, 2);
+    const int64_t C = layout == 0 ? x->ne[1] : x->ne[0];
+    const int32_t K = ggml_get_op_params_i32(depthwise, 0);
+
+    // The shader keeps every depthwise result in registers until both layer-norm
+    // reductions finish. Wider tensors retain the two standalone dispatches.
+    static constexpr int64_t values_per_lane = 8;
+    static constexpr int64_t local_size = 512;
+    if (C > values_per_lane * local_size ||
+        !ggml_are_same_shape(depthwise, x) ||
+        w->ne[0] != K || w->ne[1] != 1 || w->ne[2] != C || w->ne[3] != 1 ||
+        (bias && ggml_nelements(bias) != C) ||
+        ggml_nelements(gamma) != C || ggml_nelements(beta) != C) {
+        return false;
+    }
+
+    if (x->ne[3] != 1 ||
+        x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        (bias && bias->type != GGML_TYPE_F32) ||
+        gamma->type != GGML_TYPE_F32 || beta->type != GGML_TYPE_F32 ||
+        depthwise->type != GGML_TYPE_F32 || layer_norm->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
+        (bias && !ggml_is_contiguous(bias)) ||
+        !ggml_is_contiguous(gamma) || !ggml_is_contiguous(beta) ||
+        !ggml_is_contiguous(depthwise) || !ggml_is_contiguous(layer_norm) ||
+        (K != 3 && K != 5 && K != 7)) {
+        return false;
+    }
+
+    // Unlike the standalone pair, the fused workgroups can still be reading
+    // neighboring timesteps or affine parameters when another workgroup writes.
+    for (const ggml_tensor * input : { x, w, bias, gamma, beta }) {
+        if (input && ggml_vk_tensors_overlap(input, layer_norm, false)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     GGML_UNUSED(ctx);
@@ -16097,6 +16362,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_supertonic_depthwise_layer_norm(cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "SUPERTONIC_DEPTHWISE_1D_LAYER_NORM_CHANNEL";
+                // Depthwise reads neighboring timesteps and layer norm reduces all channels.
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -17463,6 +17734,38 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+        case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
+            return op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   (!op->src[2] || op->src[2]->type == GGML_TYPE_F32) &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   (!op->src[2] || ggml_is_contiguous(op->src[2])) && ggml_is_contiguous(op) &&
+                   (ggml_get_op_params_i32(op, 0) == 3 ||
+                    ggml_get_op_params_i32(op, 0) == 5 ||
+                    ggml_get_op_params_i32(op, 0) == 7);
+        case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
+            return op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
+        case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
+            return op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
+                   ggml_is_contiguous(op->src[3]) && ggml_is_contiguous(op);
+        case GGML_OP_SUPERTONIC_BIAS_GELU:
+            return op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
+        case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_SNAKE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&

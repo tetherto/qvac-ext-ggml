@@ -1206,22 +1206,26 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
             {
                 const int K = ggml_get_op_params_i32(op, 0);
-                return op->src[0]->type == GGML_TYPE_F32 &&
+                return op->src[0]->ne[3] == 1 &&
+                       op->src[0]->type == GGML_TYPE_F32 &&
                        op->src[1]->type == GGML_TYPE_F32 &&
                        (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32) &&
                        (K == 3 || K == 5 || K == 7);
             }
         case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 &&
                    op->src[3]->type == GGML_TYPE_F32;
         case GGML_OP_SUPERTONIC_BIAS_GELU:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return op->src[0]->ne[3] == 1 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
             return op->src[0]->type == GGML_TYPE_F32;
