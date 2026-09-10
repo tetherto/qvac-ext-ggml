@@ -2155,6 +2155,12 @@ struct ggml_backend_vk_context {
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
+    // Set when a graph ends with writes that were never followed by a barrier. The
+    // per-node tracking above is reset between graphs, so a tensor that outlives the
+    // graph (persistent decoder state, for example) would otherwise be read by the next
+    // graph with no dependency recorded against the write. Forces one barrier before the
+    // first node of the next graph.
+    bool unsynced_writes_pending {};
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
@@ -14425,7 +14431,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         // there is no auxiliary memory use, it shouldn't be necessary to call ggml_vk_sync_buffers
         // outside of this logic. When a node uses one of the prealloc buffers for something like
         // dequantization or split_k, additional synchronization is needed between those passes.
-        bool need_sync = false;
+        // Writes left outstanding by the previous graph are not represented in the
+        // per-node lists any more, so pay one barrier for them before touching anything.
+        bool need_sync = ctx->unsynced_writes_pending;
 
         // Check whether "node" requires synchronization. The node requires synchronization if it
         // overlaps in memory with another unsynchronized node and at least one of them is a write.
@@ -14484,6 +14492,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             }
             ctx->unsynced_nodes_written.clear();
             ctx->unsynced_nodes_read.clear();
+            ctx->unsynced_writes_pending = false;
             ggml_vk_sync_buffers(ctx, compute_ctx);
 
             if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
@@ -14498,6 +14507,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
             if (ctx->fused_ops_write_mask & (1 << i)) {
                 ctx->unsynced_nodes_written.push_back(cur_node);
+                ctx->unsynced_writes_pending = true;
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
@@ -15004,6 +15014,9 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_graph_cleanup()");
     ctx->prealloc_y_last_pipeline_used = {};
 
+    // unsynced_writes_pending deliberately survives: the tensors these lists point at
+    // are per-graph, but the GPU writes they describe are not, and the next graph may
+    // read a buffer that outlives the graph (persistent state) before it is visible.
     ctx->unsynced_nodes_written.clear();
     ctx->unsynced_nodes_read.clear();
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
@@ -15652,6 +15665,8 @@ static ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             return ctx->status;
         }
         ctx->submit_pending = false;
+        // The fence wait completed every submitted write, so nothing is outstanding.
+        ctx->unsynced_writes_pending = false;
         if (cmd_buf) {
             cmd_buf->in_use = false;
             cmd_buf->buf.reset();
