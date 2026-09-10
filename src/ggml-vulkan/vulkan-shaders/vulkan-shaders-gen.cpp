@@ -1055,6 +1055,12 @@ void process_shaders() {
     string_to_spv("zero_upsample_f32",   "zero_upsample.comp",   {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("channel_shuffle_f32", "channel_shuffle.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("affine_prelu_f32",    "affine_prelu.comp",    {{"A_TYPE", "float"}});
+    string_to_spv("supertonic_depthwise_1d_f32",       "supertonic_depthwise_1d.comp",       {});
+    string_to_spv("supertonic_depthwise_1d_layer_norm_channel_f32", "supertonic_depthwise_1d_layer_norm_channel.comp", {});
+    string_to_spv("supertonic_layer_norm_channel_f32", "supertonic_layer_norm_channel.comp", {});
+    string_to_spv("supertonic_pw2_residual_f32",       "supertonic_pw2_residual.comp",       {});
+    string_to_spv("supertonic_bias_gelu_f32",           "supertonic_bias_gelu.comp",           {});
+    string_to_spv("supertonic_edge_pad_1d_f32",         "supertonic_edge_pad_1d.comp",         {});
     string_to_spv("snake_f32",           "snake.comp",           {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("lstm_cell_f32",        "lstm_cell.comp",      {{"A_TYPE", "float"}});
     string_to_spv("lstm_cell_masked_f32", "lstm_cell.comp",      {{"A_TYPE", "float"}, {"MASKED", "1"}});

@@ -4781,6 +4781,7 @@ static int ggml_metal_op_supertonic_depthwise_1d_layer_norm(ggml_metal_op_t ctx,
     ggml_metal_kargs_supertonic_depthwise_1d_layer_norm args = {
         /*.L        =*/ dw.L,
         /*.C        =*/ dw.C,
+        /*.B        =*/ dw.B,
         /*.K        =*/ dw.K,
         /*.dilation =*/ dw.dilation,
         /*.has_bias =*/ dw.has_bias,
@@ -4805,7 +4806,7 @@ static int ggml_metal_op_supertonic_depthwise_1d_layer_norm(ggml_metal_op_t ctx,
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ln),         6); // y
     ggml_metal_encoder_set_threadgroup_memory_size(enc, ggml_metal_supertonic_layer_norm_shared_bytes, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, dw.L, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, dw.L, dw.B, 1, nth, 1, 1);
 
     return 2;
 }
@@ -4839,6 +4840,7 @@ int ggml_metal_op_supertonic_depthwise_1d(ggml_metal_op_t ctx, int idx) {
     ggml_metal_kargs_supertonic_depthwise_1d args = {
         /*.L        =*/ L,
         /*.C        =*/ C,
+        /*.B        =*/ ne2,
         /*.K        =*/ K,
         /*.dilation =*/ dilation,
         /*.has_bias =*/ (op->src[2] != nullptr) ? 1 : 0,
@@ -4876,7 +4878,7 @@ int ggml_metal_op_supertonic_depthwise_1d(ggml_metal_op_t ctx, int idx) {
     }
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4); // y
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, C, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, C, ne2, 1, nth, 1, 1);
 
     return 1;
 }
@@ -4915,6 +4917,7 @@ int ggml_metal_op_supertonic_layer_norm_channel(ggml_metal_op_t ctx, int idx) {
     ggml_metal_kargs_supertonic_layer_norm_channel args = {
         /*.L   =*/ L,
         /*.C   =*/ C,
+        /*.B   =*/ ne2,
         /*.eps =*/ eps,
         /*.sxt =*/ sxt,
         /*.sxc =*/ sxc,
@@ -4934,7 +4937,7 @@ int ggml_metal_op_supertonic_layer_norm_channel(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4); // y
     ggml_metal_encoder_set_threadgroup_memory_size(enc, ggml_metal_supertonic_layer_norm_shared_bytes, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, L, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, L, ne2, 1, nth, 1, 1);
 
     return 1;
 }
@@ -4947,7 +4950,7 @@ int ggml_metal_op_supertonic_pw2_residual(ggml_metal_op_t ctx, int idx) {
 
     GGML_TENSOR_LOCALS(int32_t, ne, op, ne);
 
-    // op_params[0]: layout flag.  0 = [T, C] default, 1 = [C, T] (full B2).
+    // op_params[0]: 0 = [T, C], 1 = [C, T], 2 = [T, C] input to [C, T] output.
     const int32_t layout = ((const int32_t *) op->op_params)[0];
 
     int L, C, sxt, sxc, syt, syc, srt, src;
@@ -4956,12 +4959,15 @@ int ggml_metal_op_supertonic_pw2_residual(ggml_metal_op_t ctx, int idx) {
         sxt = 1; sxc = L; syt = 1; syc = L; srt = 1; src = L;
     } else {
         C = ne0; L = ne1;
-        sxt = C; sxc = 1; syt = C; syc = 1; srt = C; src = 1;
+        sxt = layout == 1 ? C : 1;
+        sxc = layout == 1 ? 1 : L;
+        syt = C; syc = 1; srt = C; src = 1;
     }
 
     ggml_metal_kargs_supertonic_pw2_residual args = {
         /*.L   =*/ L,
         /*.C   =*/ C,
+        /*.B   =*/ ne2,
         /*.sxt =*/ sxt,
         /*.sxc =*/ sxc,
         /*.syt =*/ syt,
@@ -4984,7 +4990,7 @@ int ggml_metal_op_supertonic_pw2_residual(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4); // residual
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         5); // y
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, C, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, C, ne2, 1, nth, 1, 1);
 
     return 1;
 }
@@ -4997,7 +5003,7 @@ int ggml_metal_op_supertonic_bias_gelu(ggml_metal_op_t ctx, int idx) {
 
     GGML_TENSOR_LOCALS(int32_t, ne, op, ne);
 
-    // op_params[0]: layout flag.  0 = [T, C] default, 1 = [C, T] (full B2).
+    // op_params[0]: 0 = [T, C], 1 = [C, T], 2 = [T, C] input to [C, T] output.
     const int32_t layout = ((const int32_t *) op->op_params)[0];
 
     int L, C, sxt, sxc, syt, syc;
@@ -5006,12 +5012,15 @@ int ggml_metal_op_supertonic_bias_gelu(ggml_metal_op_t ctx, int idx) {
         sxt = 1; sxc = L; syt = 1; syc = L;
     } else {
         C = ne0; L = ne1;
-        sxt = C; sxc = 1; syt = C; syc = 1;
+        sxt = layout == 1 ? C : 1;
+        sxc = layout == 1 ? 1 : L;
+        syt = C; syc = 1;
     }
 
     ggml_metal_kargs_supertonic_bias_gelu args = {
         /*.L   =*/ L,
         /*.C   =*/ C,
+        /*.B   =*/ ne2,
         /*.sxt =*/ sxt,
         /*.sxc =*/ sxc,
         /*.syt =*/ syt,
@@ -5030,7 +5039,7 @@ int ggml_metal_op_supertonic_bias_gelu(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // bias
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3); // y
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, C, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, C, ne2, 1, nth, 1, 1);
 
     return 1;
 }

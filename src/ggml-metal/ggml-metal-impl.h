@@ -1119,6 +1119,7 @@ typedef struct {
 typedef struct {
     int32_t L;
     int32_t C;
+    int32_t B;
     int32_t K;
     int32_t dilation;
     int32_t has_bias;
@@ -1133,6 +1134,7 @@ typedef struct {
 typedef struct {
     int32_t L;
     int32_t C;
+    int32_t B;
     float   eps;
     // Per-axis element strides for x and y.  Lets the same kernel handle
     // both [T, C] (sxt=1, sxc=L) and [C, T] (sxt=C, sxc=1) layouts.
@@ -1149,6 +1151,7 @@ typedef struct {
 typedef struct {
     int32_t L;
     int32_t C;
+    int32_t B;
     int32_t K;
     int32_t dilation;
     int32_t has_bias;
@@ -1164,6 +1167,7 @@ typedef struct {
 typedef struct {
     int32_t L;
     int32_t C;
+    int32_t B;
     int32_t sxt;
     int32_t sxc;
     int32_t syt;
@@ -1175,6 +1179,7 @@ typedef struct {
 typedef struct {
     int32_t L;
     int32_t C;
+    int32_t B;
     int32_t sxt;
     int32_t sxc;
     int32_t syt;

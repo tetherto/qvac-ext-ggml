@@ -8092,7 +8092,7 @@ void ggml_compute_forward_supertonic_depthwise_1d(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
 
-    const ggml_tensor * x    = dst->src[0]; // [L, C, 1, 1]
+    const ggml_tensor * x    = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
     const ggml_tensor * w    = dst->src[1]; // [K, 1, C, 1]
     const ggml_tensor * bias = dst->src[2]; // [C] or NULL
 
@@ -8118,12 +8118,16 @@ void ggml_compute_forward_supertonic_depthwise_1d(
         K, dilation, k_off, seg_len, params->ith, params->nth
     };
 
-    if (layout == 0) {
-        supertonic_depthwise_1d_tc(x_data, w_data, b_data, y_data,
-            (int) x->ne[0], (int) x->ne[1], &dw);
-    } else {
-        supertonic_depthwise_1d_ct(x_data, w_data, b_data, y_data,
-            (int) x->ne[1], (int) x->ne[0], &dw);
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            supertonic_depthwise_1d_tc(x_data + batch_offset, w_data, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], &dw);
+        } else {
+            supertonic_depthwise_1d_ct(x_data + batch_offset, w_data, b_data, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], &dw);
+        }
     }
 }
 
@@ -8133,7 +8137,7 @@ void ggml_compute_forward_supertonic_layer_norm_channel(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
 
-    const ggml_tensor * x = dst->src[0]; // [L, C, 1, 1]
+    const ggml_tensor * x = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
     const ggml_tensor * g = dst->src[1]; // [C]
     const ggml_tensor * b = dst->src[2]; // [C]
 
@@ -8146,19 +8150,17 @@ void ggml_compute_forward_supertonic_layer_norm_channel(
     memcpy(&eps, dst->op_params, sizeof(eps));
     const int32_t layout = ((const int32_t *) dst->op_params)[1];
 
-    int L, C, sxt, sxc, syt, syc;
+    int L, C, sxt, sxc;
     if (layout == 0) {
         // [T, C]: T inner.
         L = (int) x->ne[0];
         C = (int) x->ne[1];
         sxt = 1;  sxc = L;
-        syt = 1;  syc = L;
     } else {
         // [C, T]: C inner.
         C = (int) x->ne[0];
         L = (int) x->ne[1];
         sxt = C;  sxc = 1;
-        syt = C;  syc = 1;
     }
 
     const int ith = params->ith;
@@ -8169,20 +8171,26 @@ void ggml_compute_forward_supertonic_layer_norm_channel(
     const float * b_data = (const float *) b->data;
           float * y_data = (float *) dst->data;
 
-    // Layout-agnostic indexing via element strides.
-    for (int t = ith; t < L; t += nth) {
-        double mean = 0.0;
-        for (int c = 0; c < C; ++c) mean += x_data[(size_t) t * sxt + (size_t) c * sxc];
-        mean /= (double) C;
-        double var = 0.0;
-        for (int c = 0; c < C; ++c) {
-            const double d = (double) x_data[(size_t) t * sxt + (size_t) c * sxc] - mean;
-            var += d * d;
-        }
-        const float inv = 1.0f / sqrtf((float) (var / (double) C) + eps);
-        for (int c = 0; c < C; ++c) {
-            const float xv = x_data[(size_t) t * sxt + (size_t) c * sxc];
-            y_data[(size_t) t * syt + (size_t) c * syc] = (xv - (float) mean) * inv * g_data[c] + b_data[c];
+    // Layout-agnostic indexing via element strides. Each batch occupies one
+    // contiguous L*C plane and reuses the same affine channel parameters.
+    const size_t batch_stride = (size_t) L * C;
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        for (int t = ith; t < L; t += nth) {
+            double mean = 0.0;
+            for (int c = 0; c < C; ++c) mean += x_data[batch_offset + (size_t) t * sxt + (size_t) c * sxc];
+            mean /= (double) C;
+            double var = 0.0;
+            for (int c = 0; c < C; ++c) {
+                const double d = (double) x_data[batch_offset + (size_t) t * sxt + (size_t) c * sxc] - mean;
+                var += d * d;
+            }
+            const float inv = 1.0f / sqrtf((float) (var / (double) C) + eps);
+            for (int c = 0; c < C; ++c) {
+                const size_t offset = batch_offset + (size_t) t * sxt + (size_t) c * sxc;
+                const float xv = x_data[offset];
+                y_data[offset] = (xv - (float) mean) * inv * g_data[c] + b_data[c];
+            }
         }
     }
 }
@@ -8221,14 +8229,28 @@ static void supertonic_pw2_residual_ct(
     }
 }
 
+// Transpose while fusing the pointwise epilogue: x is [T, C], residual/y are
+// [C, T]. Stripe over output timesteps for contiguous residual/output writes.
+static void supertonic_pw2_residual_tc_to_ct(
+        const float * x, const float * b, const float * g, const float * r,
+        float * y, int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        const float * rt = r + (size_t) t * C;
+        float       * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = rt[c] + (x[(size_t) c * L + t] + b[c]) * g[c];
+        }
+    }
+}
+
 void ggml_compute_forward_supertonic_pw2_residual(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
 
-    const ggml_tensor * x        = dst->src[0]; // [L, C, 1, 1]
+    const ggml_tensor * x        = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
     const ggml_tensor * bias     = dst->src[1]; // [C]
     const ggml_tensor * gamma    = dst->src[2]; // [C]
-    const ggml_tensor * residual = dst->src[3]; // [L, C, 1, 1]
+    const ggml_tensor * residual = dst->src[3]; // same shape as dst
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(bias->type == GGML_TYPE_F32);
@@ -8244,12 +8266,20 @@ void ggml_compute_forward_supertonic_pw2_residual(
     const float * r_data   = (const float *) residual->data;
           float * y_data   = (float *) dst->data;
 
-    if (layout == 0) {
-        supertonic_pw2_residual_tc(x_data, b_data, g_data, r_data, y_data,
-            (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
-    } else {
-        supertonic_pw2_residual_ct(x_data, b_data, g_data, r_data, y_data,
-            (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            supertonic_pw2_residual_tc(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        } else if (layout == 1) {
+            supertonic_pw2_residual_ct(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
+        } else {
+            GGML_ASSERT(layout == 2);
+            supertonic_pw2_residual_tc_to_ct(x_data + batch_offset, b_data, g_data, r_data + batch_offset, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        }
     }
 }
 
@@ -8318,11 +8348,22 @@ static void supertonic_bias_gelu_ct(
     }
 }
 
+static void supertonic_bias_gelu_tc_to_ct(
+        const float * x, const float * b, float * y,
+        int L, int C, int ith, int nth) {
+    for (int t = ith; t < L; t += nth) {
+        float * yt = y + (size_t) t * C;
+        for (int c = 0; c < C; ++c) {
+            yt[c] = supertonic_bias_gelu_one(x[(size_t) c * L + t], b[c]);
+        }
+    }
+}
+
 void ggml_compute_forward_supertonic_bias_gelu(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
 
-    const ggml_tensor * x    = dst->src[0]; // [L, C, 1, 1]
+    const ggml_tensor * x    = dst->src[0]; // [L, C, B, 1] or [C, L, B, 1]
     const ggml_tensor * bias = dst->src[1]; // [C]
 
     GGML_ASSERT(x->type    == GGML_TYPE_F32);
@@ -8335,12 +8376,20 @@ void ggml_compute_forward_supertonic_bias_gelu(
     const float * b_data = (const float *) bias->data;
           float * y_data = (float *)       dst->data;
 
-    if (layout == 0) {
-        supertonic_bias_gelu_tc(x_data, b_data, y_data,
-            (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
-    } else {
-        supertonic_bias_gelu_ct(x_data, b_data, y_data,
-            (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
+    const size_t batch_stride = (size_t) x->ne[0] * x->ne[1];
+    for (int64_t ib = 0; ib < x->ne[2]; ++ib) {
+        const size_t batch_offset = (size_t) ib * batch_stride;
+        if (layout == 0) {
+            supertonic_bias_gelu_tc(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        } else if (layout == 1) {
+            supertonic_bias_gelu_ct(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[1], (int) x->ne[0], params->ith, params->nth);
+        } else {
+            GGML_ASSERT(layout == 2);
+            supertonic_bias_gelu_tc_to_ct(x_data + batch_offset, b_data, y_data + batch_offset,
+                (int) x->ne[0], (int) x->ne[1], params->ith, params->nth);
+        }
     }
 }
 

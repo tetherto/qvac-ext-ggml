@@ -2401,18 +2401,18 @@ extern "C" {
             int                   p1);
 
     // Supertonic fused depthwise 1D convolution with edge-clamp (replicate)
-    // padding and bias add.  Per-channel filter of width K applied to the
-    // time dim of a (ne0 = L, ne1 = C, ne2 = 1, ne3 = 1).
-    //   y[t, c] = bias[c]
-    //           + sum_{k=0..K-1} a[clamp(t + (k - K/2)*dilation, 0, L-1), c]
-    //                          * w[k, c]
+    // padding and bias add. Per-channel filter of width K applied independently
+    // to every batch in a (ne0 = L, ne1 = C, ne2 = B, ne3 = 1) tensor.
+    //   y[t, c, batch] = bias[c]
+    //                  + sum_{k=0..K-1} a[clamp(t + (k - K/2)*dilation, 0, L-1), c, batch]
+    //                                 * w[k, c]
     //
-    // a:    [L, C]  f32 contiguous
-    // w:    [K, C]  f32 contiguous (or [K, 1, C, 1] from a depthwise conv weight)
-    // bias: [C]     f32 contiguous (may be NULL — pass GGML_NULL_TENSOR to skip)
+    // a:    [L, C, B, 1]  f32 contiguous
+    // w:    [K, C]        f32 contiguous (or [K, 1, C, 1] from a depthwise conv weight)
+    // bias: [C]           f32 contiguous (may be NULL — pass GGML_NULL_TENSOR to skip)
     // dilation: positive integer
     //
-    // Output ne=[L, C] matching a's shape.  Currently supports K in {3, 5}.
+    // Output matches a's shape. Currently supports K in {3, 5, 7}.
     GGML_API struct ggml_tensor * ggml_supertonic_depthwise_1d(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2420,8 +2420,8 @@ extern "C" {
             struct ggml_tensor  * bias,
             int                   dilation);
 
-    // [C, T]-layout variant: a is [C, L, 1, 1] with C inner-most.  Same kernel,
-    // strides flipped via a layout flag in op_params.  Full B2 path.
+    // [C, T]-layout variant: a is [C, L, B, 1] with C inner-most. Same kernel,
+    // strides flipped via a layout flag in op_params.
     GGML_API struct ggml_tensor * ggml_supertonic_depthwise_1d_ct(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2438,8 +2438,8 @@ extern "C" {
             struct ggml_tensor  * bias,
             int                   dilation);
 
-    // [C, T] variant over T / seg_len independent segments: the edge clamp
-    // never crosses a segment boundary (batched sequences share one tensor).
+    // [C, T] variant over independent batches and T / seg_len segments: the
+    // edge clamp never crosses a batch or segment boundary.
     GGML_API struct ggml_tensor * ggml_supertonic_depthwise_1d_ct_segmented(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2448,17 +2448,18 @@ extern "C" {
             int                   dilation,
             int                   seg_len);
 
-    // Supertonic fused channel-axis layer norm.  Normalises across the
-    // channel dim (ne[1]) of a [L, C, 1, 1] tensor and applies an affine
-    // scale + shift, all in one Metal dispatch.  Replaces the
-    // permute + cont + ggml_norm + mul + add + permute + cont chain that
-    // stock ggml_norm requires (since it normalises along ne[0]).
+    // Supertonic fused channel-axis layer norm. Normalises across the
+    // channel dim (ne[1]) of each batch in a [L, C, B, 1] tensor and applies
+    // an affine scale + shift. Replaces the permute + cont + ggml_norm + mul
+    // + add + permute + cont chain that stock ggml_norm requires (since it
+    // normalises along ne[0]).
     //
-    //   y[t, c] = ((a[t, c] - mean_t) / sqrt(var_t + eps)) * g[c] + b[c]
+    //   y[t, c, batch] = ((a[t, c, batch] - mean[t, batch]) /
+    //                     sqrt(var[t, batch] + eps)) * g[c] + b[c]
     //
-    // a: [L, C, 1, 1]  f32 contiguous
-    // g: [C]           f32 contiguous (scale)
-    // b: [C]           f32 contiguous (shift)
+    // a: [L, C, B, 1]  f32 contiguous
+    // g: [C]            f32 contiguous (scale)
+    // b: [C]            f32 contiguous (shift)
     // eps: numerical epsilon (passed as float op param)
     GGML_API struct ggml_tensor * ggml_supertonic_layer_norm_channel(
             struct ggml_context * ctx,
@@ -2467,11 +2468,10 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 eps);
 
-    // [C, T]-layout variant: a is [C, T, 1, 1] with C inner-most.  g and b
+    // [C, T]-layout variant: a is [C, T, B, 1] with C inner-most. g and b
     // still have length C (== a->ne[0] here, vs == a->ne[1] in the [T, C]
-    // variant).  Same op + Metal kernel under the hood — the kernel reads
-    // per-axis strides from kargs, so this variant just sets a layout
-    // flag so the dispatch passes the right strides.  Phase B2 path.
+    // variant). Same op + Metal kernel under the hood — the kernel reads
+    // per-axis strides from kargs, so this variant just sets a layout flag.
     GGML_API struct ggml_tensor * ggml_supertonic_layer_norm_channel_ct(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2479,11 +2479,11 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 eps);
 
-    // Supertonic fused (x + bias) * gamma + residual.  Channel-axis
+    // Supertonic fused (x + bias) * gamma + residual. Channel-axis
     // broadcasts for `bias` and `gamma` (both [C]); `x` and `residual`
-    // are [L, C, 1, 1] f32 contiguous.  Output ne matches `x`.
+    // are [L, C, B, 1] f32 contiguous. Output matches `x`.
     //
-    //   y[t, c] = residual[t, c] + (x[t, c] + bias[c]) * gamma[c]
+    //   y[t, c, batch] = residual[t, c, batch] + (x[t, c, batch] + bias[c]) * gamma[c]
     GGML_API struct ggml_tensor * ggml_supertonic_pw2_residual(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
@@ -2491,8 +2491,8 @@ extern "C" {
             struct ggml_tensor  * gamma,
             struct ggml_tensor  * residual);
 
-    // [C, T]-layout variant.  Bias/gamma still have length C (== x->ne[0]
-    // here, vs == x->ne[1] in the [T, C] variant).  Full B2 path.
+    // [C, T]-layout variant. Bias/gamma still have length C (== x->ne[0]
+    // here, vs == x->ne[1] in the [T, C] variant).
     GGML_API struct ggml_tensor * ggml_supertonic_pw2_residual_ct(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
@@ -2500,12 +2500,21 @@ extern "C" {
             struct ggml_tensor  * gamma,
             struct ggml_tensor  * residual);
 
+    // Fused transpose variant. `x` is contiguous [T, C, B, 1], while
+    // `residual` and the returned tensor are contiguous [C, T, B, 1].
+    GGML_API struct ggml_tensor * ggml_supertonic_pw2_residual_tc_to_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * residual);
+
     // Supertonic fused bias-add + GELU (erf form, the gelu_erf in ggml).
-    // Channel-axis broadcasts for `bias` ([C]); `x` is [L, C, 1, 1] f32
-    // contiguous.  Output ne matches `x`.
+    // Channel-axis broadcasts for `bias` ([C]); `x` is [L, C, B, 1] f32
+    // contiguous. Output matches `x`.
     //
-    //   y[t, c] = gelu_erf(x[t, c] + bias[c])
-    //           = 0.5 * v * (1 + erf(v * 1/sqrt(2)))  where v = x + bias
+    //   y[t, c, batch] = gelu_erf(x[t, c, batch] + bias[c])
+    //                  = 0.5 * v * (1 + erf(v * 1/sqrt(2)))  where v = x + bias
     GGML_API struct ggml_tensor * ggml_supertonic_bias_gelu(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
@@ -2513,6 +2522,13 @@ extern "C" {
 
     // [C, T]-layout variant.  Bias still has length C (== x->ne[0] here).
     GGML_API struct ggml_tensor * ggml_supertonic_bias_gelu_ct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * bias);
+
+    // Fused transpose variant. `x` is contiguous [T, C, B, 1]; the returned
+    // tensor is contiguous [C, T, B, 1].
+    GGML_API struct ggml_tensor * ggml_supertonic_bias_gelu_tc_to_ct(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * bias);
