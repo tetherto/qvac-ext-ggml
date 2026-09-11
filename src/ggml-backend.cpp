@@ -490,6 +490,33 @@ bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor *
     return ggml_backend_dev_supports_op(backend->device, op);
 }
 
+bool ggml_backend_supports_convrot(ggml_backend_t backend, enum ggml_type activation_type, int32_t group_size) {
+    if (!backend || group_size != 256 ||
+        (activation_type != GGML_TYPE_F32 && activation_type != GGML_TYPE_F16)) {
+        return false;
+    }
+
+    std::vector<uint8_t> buffer(4 * ggml_tensor_overhead() + 1024);
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buffer.size(),
+        /*.mem_buffer =*/ buffer.data(),
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    struct ggml_tensor * activations = ggml_new_tensor_2d(ctx, activation_type, group_size, 1);
+    struct ggml_tensor * weights     = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, group_size, 1);
+    struct ggml_tensor * scales      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+    struct ggml_tensor * op = ggml_mul_mat_convrot(ctx, activations, weights, scales, group_size);
+    const bool supported = ggml_backend_supports_op(backend, op);
+
+    ggml_free(ctx);
+    return supported;
+}
+
 bool ggml_backend_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(backend);
     return ggml_backend_dev_supports_buft(backend->device, buft);

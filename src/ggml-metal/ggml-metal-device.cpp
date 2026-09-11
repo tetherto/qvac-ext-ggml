@@ -1011,6 +1011,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mat_convrot(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    const char * suffix = nullptr;
+    switch (op->src[0]->type) {
+        case GGML_TYPE_F32: suffix = "f32"; break;
+        case GGML_TYPE_F16: suffix = "f16"; break;
+        default: GGML_ABORT("unsupported ConvRot activation type");
+    }
+
+    char name[256];
+    snprintf(name, sizeof(name), "kernel_mul_mat_convrot_%s", suffix);
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
     char base[256];
     char name[256];

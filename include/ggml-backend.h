@@ -115,6 +115,9 @@ extern "C" {
 
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);
+    // No-allocation capability check for the fixed 256-wide ConvRot I8 linear operation.
+    // This is intended for loaders to select a compact path before model tensors are allocated.
+    GGML_API bool ggml_backend_supports_convrot(ggml_backend_t backend, enum ggml_type activation_type, int32_t group_size);
     GGML_API bool ggml_backend_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft);
     GGML_API bool ggml_backend_offload_op(ggml_backend_t backend, const struct ggml_tensor * op);
 

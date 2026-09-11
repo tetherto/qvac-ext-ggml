@@ -1607,6 +1607,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_MUL_MAT_CONVROT:
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16
+                ? op->src[1]->type == GGML_TYPE_I8 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32
+                    && ggml_get_op_params_i32(op, 0) == 256
+                    && op->src[0]->ne[0] == op->src[1]->ne[0] && op->src[0]->ne[0] > 0 && op->src[0]->ne[0] % 256 == 0
+                    && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1
+                    && op->src[2]->ne[0] == op->src[1]->ne[1] && op->src[2]->ne[1] == 1 && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1
+                    && op->ne[0] == op->src[1]->ne[1] && op->ne[1] == op->src[0]->ne[1] && op->ne[2] == op->src[0]->ne[2] && op->ne[3] == op->src[0]->ne[3]
+                    && op->src[0]->ne[1] <= max_dispatch_dim && op->src[1]->ne[1] <= max_dispatch_dim
+                    && op->src[0]->ne[2] * op->src[0]->ne[3] <= max_grid_id
+                : false;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
