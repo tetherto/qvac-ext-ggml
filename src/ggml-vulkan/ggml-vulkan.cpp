@@ -1025,6 +1025,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[4];
+    vk_pipeline pipeline_mul_mat_convrot_f32;
+    vk_pipeline pipeline_mul_mat_convrot_f16;
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1350,6 +1352,15 @@ struct vk_op_fwht_push_constants {
     uint32_t src_offset;
     uint32_t dst_offset;
     float scale;
+};
+
+struct vk_op_mul_mat_convrot_push_constants {
+    uint32_t k;
+    uint32_t ne02;
+    uint32_t a_offset;
+    uint32_t w_offset;
+    uint32_t s_offset;
+    uint32_t d_offset;
 };
 
 struct vk_op_count_experts_push_constants {
@@ -6653,6 +6664,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    // Each workgroup produces one output row; the 256 local invocations process its ConvRot tile.
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_convrot_f32, "mul_mat_convrot_f32", mul_mat_convrot_f32_len, mul_mat_convrot_f32_data, "main", 4, sizeof(vk_op_mul_mat_convrot_push_constants), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_convrot_f16, "mul_mat_convrot_f16", mul_mat_convrot_f16_len, mul_mat_convrot_f16_data, "main", 4, sizeof(vk_op_mul_mat_convrot_push_constants), { 1, 1, 1 }, {}, 1);
+
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_f32,       "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 256, device->subgroup_size, cumsum_elem_per_thread }, 1, true, true, device->subgroup_size);
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_small_f32, "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 128, device->subgroup_size, 1 }, 1, true, true, device->subgroup_size);
@@ -11582,6 +11597,27 @@ static int ggml_vk_fwht_pipeline_idx(int64_t n) {
         case 512: return 3;
         default:  return -1;
     }
+}
+
+static void ggml_vk_mul_mat_convrot(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * s = dst->src[2];
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(w) && ggml_is_contiguous(s) && ggml_is_contiguous(dst));
+    vk_pipeline pipeline = a->type == GGML_TYPE_F32 ? ctx->device->pipeline_mul_mat_convrot_f32 : ctx->device->pipeline_mul_mat_convrot_f16;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_op_mul_mat_convrot_push_constants pc = {
+        (uint32_t) a->ne[0], (uint32_t) a->ne[2],
+        (uint32_t) (get_misalign_bytes(ctx, a) / ggml_type_size(a->type)),
+        (uint32_t) get_misalign_bytes(ctx, w),
+        (uint32_t) (get_misalign_bytes(ctx, s) / sizeof(float)),
+        (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(float)),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, w, true),
+          ggml_vk_tensor_subbuffer(ctx, s, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc,
+        { (uint32_t) w->ne[1], (uint32_t) a->ne[1], (uint32_t) (a->ne[2] * a->ne[3]) });
 }
 
 static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -17974,6 +18010,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
 
         break;
+    case GGML_OP_MUL_MAT_CONVROT:
+        ggml_vk_mul_mat_convrot(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MUL_MAT_ID:
         ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
 
@@ -20378,6 +20418,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 default:
                     return false;
             }
+        case GGML_OP_MUL_MAT_CONVROT:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->src[1]->type == GGML_TYPE_I8 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_get_op_params_i32(op, 0) == 256 &&
+                op->src[0]->ne[0] == op->src[1]->ne[0] && op->src[0]->ne[0] > 0 && op->src[0]->ne[0] % 256 == 0 &&
+                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                op->src[2]->ne[0] == op->src[1]->ne[1] && op->src[2]->ne[1] == 1 && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                op->ne[0] == op->src[1]->ne[1] && op->ne[1] == op->src[0]->ne[1] && op->ne[2] == op->src[0]->ne[2] && op->ne[3] == op->src[0]->ne[3] &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -21144,6 +21193,8 @@ static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
             return 0;
         case GGML_OP_MUL_MAT:
             return op->ne[1];
+        case GGML_OP_MUL_MAT_CONVROT:
+            return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
@@ -21702,6 +21753,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             }
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_MUL_MAT_CONVROT) {
+            tensor_clone = ggml_mul_mat_convrot(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], ggml_get_op_params_i32(tensor, 0));
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID_BACK_A) {

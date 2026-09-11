@@ -13,6 +13,7 @@
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
+#include "ggml-cuda/convrot.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
@@ -2199,6 +2200,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
+            break;
+        case GGML_OP_MUL_MAT_CONVROT:
+            ggml_cuda_op_mul_mat_convrot(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
@@ -4816,6 +4820,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                 }
             } break;
+        case GGML_OP_MUL_MAT_CONVROT:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->src[1]->type == GGML_TYPE_I8 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_get_op_params_i32(op, 0) == 256 &&
+                op->src[0]->ne[0] == op->src[1]->ne[0] && op->src[0]->ne[0] > 0 && op->src[0]->ne[0] % 256 == 0 &&
+                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                op->src[2]->ne[0] == op->src[1]->ne[1] && op->src[2]->ne[1] == 1 && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                op->ne[0] == op->src[1]->ne[1] && op->ne[1] == op->src[0]->ne[1] &&
+                op->ne[2] == op->src[0]->ne[2] && op->ne[3] == op->src[0]->ne[3];
         case GGML_OP_OUT_PROD:
             {
                 // ggml_cuda_out_prod dequantizes any non-F32 src to F32 via ggml_get_to_fp32_cuda
@@ -5147,6 +5160,8 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+            return op->ne[1];
+        case GGML_OP_MUL_MAT_CONVROT:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:
