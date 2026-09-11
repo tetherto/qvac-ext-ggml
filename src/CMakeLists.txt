@@ -307,7 +307,7 @@ function(ggml_add_backend_library backend)
     target_link_libraries(${backend} PRIVATE ggml-base)
     target_include_directories(${backend} PRIVATE ..)
 
-    if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+    if (BUILD_SHARED_LIBS OR (GGML_BACKEND_DL AND NOT (GGML_CPU_STATIC AND ${backend} MATCHES "^ggml-cpu")))
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
         target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
     endif()
