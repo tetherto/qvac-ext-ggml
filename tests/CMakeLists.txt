@@ -12,6 +12,8 @@ if (TARGET ggml-cuda)
     target_compile_definitions(test-mul-mat-convrot-h256-hint-cuda PRIVATE GGML_TEST_CONVROT_H256_CUDA)
     target_link_libraries(test-mul-mat-convrot-h256-hint-cuda PRIVATE ggml ggml-cuda)
     add_test(NAME test-mul-mat-convrot-h256-hint-cuda COMMAND test-mul-mat-convrot-h256-hint-cuda)
+    add_executable(test-mul-mat-convrot-h256-bench test-mul-mat-convrot-h256-bench.cpp)
+    target_link_libraries(test-mul-mat-convrot-h256-bench PRIVATE ggml ggml-cuda)
 endif()
 
 if (TARGET ggml-metal)
