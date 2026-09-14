@@ -53,13 +53,13 @@ int main() {
     ggml_tensor * x = ggml_reshape_2d(ctx, x_groups, kK, 1);
     ggml_tensor * wi8 = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, kK, kN);
     ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kN);
-    ggml_tensor * wf16 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kK, kN);
+    ggml_tensor * wf32 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kK, kN);
 
     ggml_tensor * fused = ggml_mul_mat_convrot(ctx, x, wi8, scales, kH);
     ggml_tensor * rotated_groups = ggml_mul_mat(ctx, h, x_groups);
     ggml_mul_mat_set_hint(rotated_groups, GGML_HINT_SRC0_IS_CONVROT_H256);
     ggml_tensor * rotated = ggml_reshape_2d(ctx, rotated_groups, kK, 1);
-    ggml_tensor * hinted = ggml_mul_mat(ctx, wf16, rotated);
+    ggml_tensor * hinted = ggml_mul_mat(ctx, wf32, rotated);
     ggml_cgraph * fused_graph = ggml_new_graph(ctx);
     ggml_cgraph * hint_graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(fused_graph, fused);
@@ -67,7 +67,7 @@ int main() {
 
     std::vector<float> h_data(kH * kH), x_data(kK), scale_data(kN);
     std::vector<int8_t> i8_data(kK * kN);
-    std::vector<ggml_fp16_t> f16_data(kK * kN);
+    std::vector<float> f32_data(kK * kN);
     for (int col = 0; col < kH; ++col) {
         std::array<float, kH> basis = {}; basis[col] = 1.0f; convrot(basis.data());
         for (int row = 0; row < kH; ++row) h_data[col + row * kH] = basis[row];
@@ -78,7 +78,7 @@ int main() {
         for (int64_t col = 0; col < kK; ++col) {
             const int8_t q = (int8_t) ((col * 17 + row * 31) % 255 - 127);
             i8_data[col + row * kK] = q;
-            f16_data[col + row * kK] = ggml_fp32_to_fp16(q * scale_data[row]);
+            f32_data[col + row * kK] = q * scale_data[row];
         }
     }
 
@@ -89,27 +89,25 @@ int main() {
     ggml_backend_tensor_set(x_groups, x_data.data(), 0, ggml_nbytes(x_groups));
     ggml_backend_tensor_set(wi8, i8_data.data(), 0, ggml_nbytes(wi8));
     ggml_backend_tensor_set(scales, scale_data.data(), 0, ggml_nbytes(scales));
-    ggml_backend_tensor_set(wf16, f16_data.data(), 0, ggml_nbytes(wf16));
+    ggml_backend_tensor_set(wf32, f32_data.data(), 0, ggml_nbytes(wf32));
 
     std::vector<float> fused_data(kN), hinted_data(kN);
     if (ggml_backend_graph_compute(backend, fused_graph) != GGML_STATUS_SUCCESS ||
         ggml_backend_graph_compute(backend, hint_graph) != GGML_STATUS_SUCCESS) return 3;
     ggml_backend_tensor_get(fused, fused_data.data(), 0, ggml_nbytes(fused));
     ggml_backend_tensor_get(hinted, hinted_data.data(), 0, ggml_nbytes(hinted));
-    // The hinted compatibility path materializes scaled weights as F16,
-    // whereas the fused path retains FP32 scaled I8 values. Report that
-    // expected reduction error but benchmark both mathematically equivalent
-    // graphs rather than treating storage precision as a graph failure.
+    // Both paths retain FP32 scaled weight values. Any residual is only the
+    // expected change in floating-point reduction order.
     float max_relative_error = 0.0f;
     for (int64_t i = 0; i < kN; ++i) {
         max_relative_error = std::max(max_relative_error,
             std::fabs(fused_data[i] - hinted_data[i]) / (1.0f + std::fabs(fused_data[i])));
     }
-    std::printf("max F16 materialization relative error: %.4f%%\n", 100.0f * max_relative_error);
+    std::printf("max FP32 path relative error: %.6f%%\n", 100.0f * max_relative_error);
 
     std::printf("ConvRot CUDA F32 benchmark (%lldx%lld): fused=", (long long) kK, (long long) kN);
     if (!compute(backend, fused_graph)) return 5;
-    std::printf(" ms/run, hinted-H256+F16= ");
+    std::printf(" ms/run, hinted-H256+F32= ");
     if (!compute(backend, hint_graph)) return 6;
     std::printf(" ms/run\n");
     ggml_backend_buffer_free(buffer); ggml_backend_free(backend); ggml_free(ctx);
