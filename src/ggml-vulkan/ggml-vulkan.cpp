@@ -20419,6 +20419,26 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
             }
         case GGML_OP_MUL_MAT_CONVROT:
+            // The ConvRot shader loads activations and I8 weights through
+            // uint[] arrays.  Decline sub-word views rather than exposing a
+            // descriptor range that can omit the final packed word.
+            if (((vk_tensor_offset(op->src[0]) + op->src[0]->view_offs) & 3) != 0 ||
+                ((vk_tensor_offset(op->src[1]) + op->src[1]->view_offs) & 3) != 0 ||
+                ((vk_tensor_offset(op->src[2]) + op->src[2]->view_offs) & 3) != 0 ||
+                ((vk_tensor_offset(op) + op->view_offs) & 3) != 0) {
+                return false;
+            }
+
+            // The implementation maps output rows, columns, and batches to
+            // X/Y/Z workgroups respectively.  It has no split-dispatch path.
+            if (op->src[1]->ne[1] <= 0 || op->src[0]->ne[1] <= 0 ||
+                op->src[0]->ne[2] <= 0 || op->src[0]->ne[3] <= 0 ||
+                op->src[1]->ne[1] > device->properties.limits.maxComputeWorkGroupCount[0] ||
+                op->src[0]->ne[1] > device->properties.limits.maxComputeWorkGroupCount[1] ||
+                op->src[0]->ne[2] > device->properties.limits.maxComputeWorkGroupCount[2] / op->src[0]->ne[3]) {
+                return false;
+            }
+
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 op->src[1]->type == GGML_TYPE_I8 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                 ggml_get_op_params_i32(op, 0) == 256 &&

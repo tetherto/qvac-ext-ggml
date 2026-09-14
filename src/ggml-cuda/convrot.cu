@@ -12,6 +12,7 @@ template <typename T>
 __global__ void convrot_rotate_input(const T * x, float * rotated) {
     __shared__ float v[256];
     const int tid = threadIdx.x;
+    ggml_cuda_pdl_sync();
     const size_t offset = size_t(blockIdx.x) * 256;
     v[tid] = float(x[offset + tid]);
     __syncthreads();
@@ -41,6 +42,7 @@ __global__ void convrot_reconstruct_f16(const int8_t * weights, const float * sc
     __shared__ float transformed[256];
 
     const int tid = threadIdx.x;
+    ggml_cuda_pdl_sync();
     const int row = blockIdx.x;
     const int tile = blockIdx.y;
     const size_t offset = size_t(row) * k + size_t(tile) * 256;
@@ -113,6 +115,7 @@ template <int Columns>
 __global__ void convrot_i8_matvec(const float * x, const int8_t * w, const float * scales,
                                 float * dst, int k, int n, int columns) {
     const int lane = threadIdx.x;
+    ggml_cuda_pdl_sync();
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= n) return;
     const int first_column = blockIdx.y * Columns;
@@ -153,6 +156,7 @@ __global__ void mul_mat_convrot_cuda(
     __shared__ float transformed[256];
 
     const int tid = threadIdx.x;
+    ggml_cuda_pdl_sync();
     const int row = blockIdx.x;
     const int i1 = blockIdx.y;
     const int i2 = blockIdx.z % ne02;
