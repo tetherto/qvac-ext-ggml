@@ -610,6 +610,7 @@ extern "C" {
 
         GGML_OP_GLU,
         GGML_OP_ROPE_FLUX,
+        GGML_OP_MUL_MAT_CONVROT,
 
         GGML_OP_COUNT,
     };
@@ -1489,6 +1490,25 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // ConvRot tensor-wise int8 linear operation.
+    //
+    // The raw weight matrix is [in_features, out_features] in I8.  scales is
+    // F32[out_features, 1], with one scale for each weight row.  The operation
+    // applies the normalized regular 4-way Hadamard stages to every
+    // group_size-wide, scaled weight row before multiplying it by activations.
+    // Only the verified 256-wide ConvRot format is accepted.
+    //
+    // activations : F32 or F16 [in_features, batch, ...]
+    // weights     : [in_features, out_features]
+    // scales      : [out_features, 1]
+    // result      : [out_features, batch, ...]
+    GGML_API struct ggml_tensor * ggml_mul_mat_convrot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * activations,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * scales,
+            int32_t               group_size);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

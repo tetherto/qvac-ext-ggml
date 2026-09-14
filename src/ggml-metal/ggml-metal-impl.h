@@ -595,6 +595,27 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mv;
 
+// Compact I8/F32 ConvRot mat-vec.  The weight buffer stays quantized; each
+// 256-element block is transformed in threadgroup memory before dotting it.
+typedef struct {
+    int32_t  k;
+    int32_t  out_features;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb20;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_mul_mat_convrot;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

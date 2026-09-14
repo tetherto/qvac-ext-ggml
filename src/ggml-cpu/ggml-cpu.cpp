@@ -455,6 +455,20 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
                 (src0->type == GGML_TYPE_TQ2_0 &&
                     (src1->type == GGML_TYPE_Q8_1 || src1->type == GGML_TYPE_Q8_0));
+        case GGML_OP_MUL_MAT_CONVROT:
+            return src0 && src1 && op->src[2] &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+                src1->type == GGML_TYPE_I8 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                ggml_get_op_params_i32(op, 0) == 256 &&
+                src0->ne[0] == src1->ne[0] && src1->ne[0] > 0 &&
+                src1->ne[0] % 256 == 0 &&
+                src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                op->src[2]->ne[0] == src1->ne[1] &&
+                op->src[2]->ne[1] == 1 && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                op->type == GGML_TYPE_F32 &&
+                op->ne[0] == src1->ne[1] && op->ne[1] == src0->ne[1] &&
+                op->ne[2] == src0->ne[2] && op->ne[3] == src0->ne[3];
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

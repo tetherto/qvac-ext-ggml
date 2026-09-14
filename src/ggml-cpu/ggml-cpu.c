@@ -1526,6 +1526,94 @@ UseGgmlGemm2:;
     }
 }
 
+// ggml_compute_forward_mul_mat_convrot
+
+static inline void ggml_convrot_hadamard_4(float * values, size_t stride) {
+    const float a = values[0 * stride];
+    const float b = values[1 * stride];
+    const float c = values[2 * stride];
+    const float d = values[3 * stride];
+
+    values[0 * stride] = ( a + b + c - d) * 0.5f;
+    values[1 * stride] = ( a + b - c + d) * 0.5f;
+    values[2 * stride] = ( a - b + c + d) * 0.5f;
+    values[3 * stride] = (-a + b + c + d) * 0.5f;
+}
+
+void ggml_compute_forward_mul_mat_convrot(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * activations = dst->src[0];
+    const struct ggml_tensor * weights     = dst->src[1];
+    const struct ggml_tensor * scales      = dst->src[2];
+    const int32_t group_size = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(activations->type == GGML_TYPE_F32 || activations->type == GGML_TYPE_F16);
+    GGML_ASSERT(weights->type == GGML_TYPE_I8);
+    GGML_ASSERT(scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(group_size == 256);
+    GGML_ASSERT(weights->ne[0] == activations->ne[0]);
+    GGML_ASSERT(weights->ne[0] % group_size == 0);
+    GGML_ASSERT(scales->ne[0] == weights->ne[1]);
+    GGML_ASSERT(scales->ne[1] == 1 && scales->ne[2] == 1 && scales->ne[3] == 1);
+    GGML_ASSERT(dst->ne[0] == weights->ne[1]);
+    GGML_ASSERT(dst->ne[1] == activations->ne[1]);
+    GGML_ASSERT(dst->ne[2] == activations->ne[2]);
+    GGML_ASSERT(dst->ne[3] == activations->ne[3]);
+
+    const int64_t out_features = weights->ne[1];
+    const int64_t activation_columns = activations->ne[1] * activations->ne[2] * activations->ne[3];
+    const int64_t work_items = out_features * activation_columns;
+
+    for (int64_t item = params->ith; item < work_items; item += params->nth) {
+        const int64_t row = item % out_features;
+        const int64_t column = item / out_features;
+        const int64_t i3 = column / (activations->ne[2] * activations->ne[1]);
+        const int64_t i2 = (column / activations->ne[1]) % activations->ne[2];
+        const int64_t i1 = column % activations->ne[1];
+
+        float scale;
+        memcpy(&scale, (const char *) scales->data + row * scales->nb[0], sizeof(scale));
+        GGML_ASSERT(isfinite(scale) && scale > 0.0f);
+
+        const char * activation = (const char *) activations->data +
+            i1 * activations->nb[1] + i2 * activations->nb[2] + i3 * activations->nb[3];
+        const char * weight_row = (const char *) weights->data + row * weights->nb[1];
+        float * output = (float *) ((char *) dst->data + row * dst->nb[0] +
+            i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+
+        float sum = 0.0f;
+        for (int64_t offset = 0; offset < weights->ne[0]; offset += group_size) {
+            float values[256];
+            for (int64_t i = 0; i < group_size; ++i) {
+                int8_t value;
+                memcpy(&value, weight_row + (offset + i) * weights->nb[0], sizeof(value));
+                values[i] = (float) value * scale;
+            }
+            for (size_t stride = 1; stride < (size_t) group_size; stride *= 4) {
+                const size_t block = stride * 4;
+                for (size_t base = 0; base < (size_t) group_size; base += block) {
+                    for (size_t i = 0; i < stride; ++i) {
+                        ggml_convrot_hadamard_4(values + base + i, stride);
+                    }
+                }
+            }
+            for (int64_t i = 0; i < group_size; ++i) {
+                float value;
+                if (activations->type == GGML_TYPE_F32) {
+                    memcpy(&value, activation + (offset + i) * activations->nb[0], sizeof(value));
+                } else {
+                    ggml_fp16_t value_f16;
+                    memcpy(&value_f16, activation + (offset + i) * activations->nb[0], sizeof(value_f16));
+                    value = ggml_fp16_to_fp32(value_f16);
+                }
+                sum += values[i] * value;
+            }
+        }
+        *output = sum;
+    }
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1934,6 +2022,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT:
             {
                 ggml_compute_forward_mul_mat(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_CONVROT:
+            {
+                ggml_compute_forward_mul_mat_convrot(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -2466,6 +2558,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_CONVROT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_MUL_MAT_ID_BACK_A:
         case GGML_OP_MUL_MAT_ID_BACK_B:
