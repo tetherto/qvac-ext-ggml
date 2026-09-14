@@ -3479,6 +3479,7 @@ struct ggml_tensor * ggml_mul_mat_convrot(
     GGML_ASSERT(group_size == 256);
 
     GGML_ASSERT(activations->ne[0] > 0 && weights->ne[0] > 0 && weights->ne[1] > 0);
+    GGML_ASSERT(activations->ne[1] >= 0 && activations->ne[2] >= 0 && activations->ne[3] >= 0);
     GGML_ASSERT(activations->ne[0] == weights->ne[0]);
     GGML_ASSERT(weights->ne[0] % group_size == 0);
     GGML_ASSERT(weights->ne[2] == 1 && weights->ne[3] == 1);
@@ -3488,9 +3489,18 @@ struct ggml_tensor * ggml_mul_mat_convrot(
     // Validate every multiplication used by the result and compact source
     // layouts before asking ggml to reserve tensor storage.
     GGML_ASSERT(weights->ne[0] <= INT64_MAX / weights->ne[1]);
-    GGML_ASSERT(activations->ne[1] <= INT64_MAX / weights->ne[1]);
-    GGML_ASSERT(activations->ne[2] <= INT64_MAX / (weights->ne[1] * activations->ne[1]));
-    GGML_ASSERT(activations->ne[3] <= INT64_MAX / (weights->ne[1] * activations->ne[1] * activations->ne[2]));
+
+    // Zero-sized activation batches are valid.  Check the result shape by
+    // multiplying only while it remains non-zero, so the overflow checks do
+    // not divide by a zero batch dimension.
+    int64_t result_elements = weights->ne[1];
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (activations->ne[i] == 0) {
+            break;
+        }
+        GGML_ASSERT(result_elements <= INT64_MAX / activations->ne[i]);
+        result_elements *= activations->ne[i];
+    }
 
     const int64_t ne[4] = { weights->ne[1], activations->ne[1], activations->ne[2], activations->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);

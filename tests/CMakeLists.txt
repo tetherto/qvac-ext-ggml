@@ -1,5 +1,8 @@
 add_executable(test-mul-mat-convrot test-mul-mat-convrot.cpp)
-target_link_libraries(test-mul-mat-convrot PRIVATE ggml ggml-cpu)
+target_link_libraries(test-mul-mat-convrot PRIVATE ggml)
+if (NOT GGML_BACKEND_DL)
+    target_link_libraries(test-mul-mat-convrot PRIVATE ggml-cpu)
+endif()
 
 add_test(NAME test-mul-mat-convrot COMMAND test-mul-mat-convrot)
 

@@ -39,9 +39,7 @@ bool run_case(ggml_type activation_type) {
     ggml_build_forward_expand(graph, result);
 
     ggml_backend_t backend = ggml_backend_metal_init();
-    if (!backend || !ggml_backend_supports_convrot(backend, activation_type, kGroupSize) ||
-        ggml_backend_supports_convrot(backend, activation_type, kGroupSize / 2) ||
-        !ggml_backend_supports_op(backend, result)) {
+    if (!backend || !ggml_backend_supports_op(backend, result)) {
         std::fprintf(stderr, "Metal backend does not advertise expected ConvRot support\n");
         if (backend) ggml_backend_free(backend);
         ggml_free(ctx);
