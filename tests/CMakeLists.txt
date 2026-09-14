@@ -160,6 +160,12 @@ endif()
 add_definitions(-UNDEBUG)
 
 #
+# The client links only core ggml, including with GGML_BACKEND_DL=ON.
+set(TEST_TARGET test-cpu-graph-plan)
+add_executable(${TEST_TARGET} test-cpu-graph-plan.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 # test-backend-ops
 
 set(TEST_TARGET test-backend-ops)
