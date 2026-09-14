@@ -36,11 +36,14 @@ void hadamard_4(float * values, size_t stride) {
     values[3 * stride] = (-a + b + c + d) * 0.5f;
 }
 
-bool run_case(ggml_type activation_type) {
+bool run_case(ggml_type activation_type, bool strided = false) {
     ggml_context * ctx = ggml_init({ 4 * 1024 * 1024, nullptr, true });
     if (!ctx) return false;
 
-    ggml_tensor * activations = ggml_new_tensor_2d(ctx, activation_type, kInputFeatures, kColumns);
+    const int64_t step = strided ? 2 : 1;
+    ggml_tensor * activation_storage = ggml_new_tensor_2d(ctx, activation_type, kInputFeatures, kColumns * step);
+    ggml_tensor * activations = strided ? ggml_view_2d(ctx, activation_storage, kInputFeatures, kColumns,
+                                                       activation_storage->nb[1] * step, 0) : activation_storage;
     ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, kInputFeatures, kOutFeatures);
     ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kOutFeatures);
     ggml_tensor * result = ggml_mul_mat_convrot(ctx, activations, weights, scales, kGroupSize);
@@ -57,16 +60,16 @@ bool run_case(ggml_type activation_type) {
         return false;
     }
 
-    std::vector<float> activation_f32(kInputFeatures * kColumns);
-    std::vector<ggml_fp16_t> activation_f16(kInputFeatures * kColumns);
+    std::vector<float> activation_f32(kInputFeatures * kColumns * step);
+    std::vector<ggml_fp16_t> activation_f16(kInputFeatures * kColumns * step);
     std::vector<int8_t> weight_data(kInputFeatures * kOutFeatures);
     std::vector<float> scale_data(kOutFeatures);
     std::vector<float> expected(kOutFeatures * kColumns);
     for (int64_t column = 0; column < kColumns; ++column) {
         for (int64_t i = 0; i < kInputFeatures; ++i) {
             const float value = (float) ((i * 13 + column * 29) % 97 - 48) * 0.03125f;
-            activation_f32[i + column * kInputFeatures] = value;
-            activation_f16[i + column * kInputFeatures] = ggml_fp32_to_fp16(value);
+            activation_f32[i + column * kInputFeatures * step] = value;
+            activation_f16[i + column * kInputFeatures * step] = ggml_fp32_to_fp16(value);
         }
     }
     for (int64_t row = 0; row < kOutFeatures; ++row) {
@@ -85,7 +88,7 @@ bool run_case(ggml_type activation_type) {
                     for (size_t base = 0; base < kGroupSize; base += 4 * stride)
                         for (size_t i = 0; i < stride; ++i) hadamard_4(block.data() + base + i, stride);
                 for (int64_t i = 0; i < kGroupSize; ++i) {
-                    const int64_t index = offset + i + column * kInputFeatures;
+                    const int64_t index = offset + i + column * kInputFeatures * step;
                     const float activation = activation_type == GGML_TYPE_F32 ? activation_f32[index] : ggml_fp16_to_fp32(activation_f16[index]);
                     sum += block[i] * activation;
                 }
@@ -101,7 +104,7 @@ bool run_case(ggml_type activation_type) {
         ggml_free(ctx);
         return false;
     }
-    ggml_backend_tensor_set(activations, activation_type == GGML_TYPE_F32 ? static_cast<const void *>(activation_f32.data()) : static_cast<const void *>(activation_f16.data()), 0, ggml_nbytes(activations));
+    ggml_backend_tensor_set(activation_storage, activation_type == GGML_TYPE_F32 ? static_cast<const void *>(activation_f32.data()) : static_cast<const void *>(activation_f16.data()), 0, ggml_nbytes(activation_storage));
     ggml_backend_tensor_set(weights, weight_data.data(), 0, ggml_nbytes(weights));
     ggml_backend_tensor_set(scales, scale_data.data(), 0, ggml_nbytes(scales));
     const bool computed = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
@@ -110,7 +113,7 @@ bool run_case(ggml_type activation_type) {
 
     bool passed = computed;
     for (size_t i = 0; i < actual.size(); ++i) {
-        if (std::fabs(actual[i] - expected[i]) > 3e-5f * (1.0f + std::fabs(expected[i]))) {
+        if (!std::isfinite(actual[i]) || std::fabs(actual[i] - expected[i]) > 3e-5f * (1.0f + std::fabs(expected[i]))) {
             std::fprintf(stderr, "%s ConvRot mismatch at %zu: got %.8f, expected %.8f\n", kBackendName, i, actual[i], expected[i]);
             passed = false;
         }
@@ -124,7 +127,10 @@ bool run_case(ggml_type activation_type) {
 } // namespace
 
 int main() {
-    const bool passed = run_case(GGML_TYPE_F32) && run_case(GGML_TYPE_F16);
+    bool passed = run_case(GGML_TYPE_F32) && run_case(GGML_TYPE_F16);
+#if defined(GGML_TEST_CONVROT_CUDA)
+    passed = passed && run_case(GGML_TYPE_F32, true) && run_case(GGML_TYPE_F16, true);
+#endif
     if (passed) std::printf("ConvRot %s test passed\n", kBackendName);
     return passed ? 0 : 1;
 }
