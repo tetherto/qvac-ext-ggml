@@ -1,6 +1,9 @@
 #include "common.cuh"
 #include "convrot.cuh"
+#include "convert.cuh"
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 
 // H256 is symmetric: dot(H256 * (scale * w), x) ==
 // scale * dot(w, H256 * x). Transform activations once instead of transforming
@@ -25,6 +28,82 @@ __global__ void convrot_rotate_input(const T * x, float * rotated) {
         __syncthreads();
     }
     rotated[offset + tid] = v[tid];
+}
+
+// Reconstruct the same F16 matrix produced by stable-diffusion.cpp's
+// compatibility loader, one 256-element ConvRot tile at a time.  This is
+// deliberately separate from the compact fused kernel: the caller below then
+// invokes the standard F16 cuBLAS path, preserving its F16 input, accumulation
+// and output semantics without keeping an F16 copy of every model weight.
+__global__ void convrot_reconstruct_f16(const int8_t * weights, const float * scales,
+                                        half * reconstructed, int k) {
+    __shared__ float values[256];
+    __shared__ float transformed[256];
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const int tile = blockIdx.y;
+    const size_t offset = size_t(row) * k + size_t(tile) * 256;
+    values[tid] = float(weights[offset + tid]) * scales[row];
+    __syncthreads();
+    for (int stride = 1; stride < 256; stride *= 4) {
+        const int block = (tid / (4 * stride)) * (4 * stride);
+        const int lane = (tid / stride) % 4;
+        const int index = tid % stride;
+        const float a = values[block + 0 * stride + index];
+        const float b = values[block + 1 * stride + index];
+        const float c = values[block + 2 * stride + index];
+        const float d = values[block + 3 * stride + index];
+        transformed[tid] = lane == 0 ? ( a + b + c - d) * 0.5f :
+                           lane == 1 ? ( a + b - c + d) * 0.5f :
+                           lane == 2 ? ( a - b + c + d) * 0.5f :
+                                       (-a + b + c + d) * 0.5f;
+        __syncthreads();
+        values[tid] = transformed[tid];
+        __syncthreads();
+    }
+    reconstructed[offset + tid] = __float2half_rn(values[tid]);
+}
+
+static bool ggml_cuda_op_mul_mat_convrot_f16_compat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * activations = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+    const ggml_tensor * scales = dst->src[2];
+    if (!ggml_is_contiguous(activations) || !ggml_is_contiguous(weights) || !ggml_is_contiguous(scales) ||
+        !ggml_is_contiguous(dst) || activations->ne[2] != 1 || activations->ne[3] != 1 ||
+        weights->ne[0] > INT_MAX || weights->ne[1] > INT_MAX || activations->ne[1] > INT_MAX) {
+        return false;
+    }
+
+    const int k = int(weights->ne[0]);
+    const int n = int(weights->ne[1]);
+    const int columns = int(activations->ne[1]);
+    ggml_cuda_pool_alloc<half> reconstructed(ctx.pool(), size_t(k) * n);
+    ggml_cuda_pool_alloc<half> activation_f16(ctx.pool(), ggml_nelements(activations));
+    ggml_cuda_pool_alloc<half> output_f16(ctx.pool(), ggml_nelements(dst));
+
+    const auto reconstruct_launch = ggml_cuda_kernel_launch_params(dim3(n, k / 256), dim3(256), 0, ctx.stream());
+    ggml_cuda_kernel_launch(convrot_reconstruct_f16, reconstruct_launch,
+                            (const int8_t *) weights->data, (const float *) scales->data,
+                            reconstructed.get(), k);
+
+    const auto to_f16 = ggml_get_to_fp16_cuda(activations->type);
+    if (to_f16 == nullptr) {
+        return false;
+    }
+    to_f16(activations->data, activation_f16.get(), ggml_nelements(activations), ctx.stream());
+
+    static const half alpha = 1.0;
+    static const half beta = 0.0;
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), ctx.stream()));
+    CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                               n, columns, k,
+                               &alpha, reconstructed.get(), CUDA_R_16F, k,
+                                       activation_f16.get(), CUDA_R_16F, k,
+                               &beta, output_f16.get(), CUDA_R_16F, n,
+                               CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    ggml_get_to_fp32_cuda(GGML_TYPE_F16)(output_f16.get(), (float *) dst->data, ggml_nelements(dst), ctx.stream());
+    return true;
 }
 
 // Four bytes per lane keep global weight reads coalesced. Each warp computes
@@ -120,7 +199,13 @@ void ggml_cuda_op_mul_mat_convrot(ggml_backend_cuda_context & ctx, ggml_tensor *
     const ggml_tensor * scales = dst->src[2];
     GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == 256);
     GGML_ASSERT(activations->ne[0] == weights->ne[0] && weights->ne[0] % 256 == 0);
-
+    const char * f16_compat_mode = std::getenv("GGML_CUDA_CONVROT_F16_MATMUL");
+    const bool f16_compat_requested = ggml_get_op_params_i32(dst, 1) != 0 ||
+                                      (f16_compat_mode != nullptr && std::strcmp(f16_compat_mode, "0") != 0);
+    if (f16_compat_requested &&
+        ggml_cuda_op_mul_mat_convrot_f16_compat(ctx, dst)) {
+        return;
+    }
     if (ggml_is_contiguous(activations) && ggml_is_contiguous(weights) &&
         ggml_is_contiguous(scales) && ggml_is_contiguous(dst) &&
         uintptr_t(weights->data) % alignof(int) == 0 &&
