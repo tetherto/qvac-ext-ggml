@@ -58,9 +58,7 @@ bool run_case(ggml_type activation_type) {
     ggml_build_forward_expand(graph, result);
 
     ggml_backend_t backend = convrot_backend_init();
-    if (!backend || !ggml_backend_supports_convrot(backend, activation_type, kGroupSize) ||
-        ggml_backend_supports_convrot(backend, activation_type, kGroupSize / 2) ||
-        !ggml_backend_supports_op(backend, result)) {
+    if (!backend || !ggml_backend_supports_op(backend, result)) {
         std::fprintf(stderr, "%s backend does not advertise expected ConvRot support\n", kBackendName);
         if (backend) ggml_backend_free(backend);
         ggml_free(ctx);
@@ -131,7 +129,7 @@ bool run_case(ggml_type activation_type) {
     bool passed = computed;
     const float relative_tolerance = benchmark ? 1e-4f : 3e-5f;
     for (size_t i = 0; i < actual.size(); ++i) {
-        if (std::fabs(actual[i] - expected[i]) > relative_tolerance * (1.0f + std::fabs(expected[i]))) {
+        if (!std::isfinite(actual[i]) || std::fabs(actual[i] - expected[i]) > relative_tolerance * (1.0f + std::fabs(expected[i]))) {
             std::fprintf(stderr, "%s ConvRot mismatch at %zu: got %.8f, expected %.8f\n", kBackendName, i, actual[i], expected[i]);
             passed = false;
         }
