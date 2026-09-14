@@ -30,6 +30,11 @@ jobs:
       contents: read
     uses: ./.github/workflows/reusable-runner-names.yml
 
+  authorize:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   lint-runner-names:
     runs-on: ubuntu-latest
     permissions:
@@ -220,7 +225,8 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-x64-nvidia-cuda:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
     steps:
       - name: Clone
@@ -234,7 +240,8 @@ jobs:
           GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
 
   ggml-ci-x64-nvidia-vulkan-cm:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
     steps:
       - name: Clone
@@ -248,7 +255,8 @@ jobs:
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
 
   ggml-ci-x64-nvidia-vulkan-cm2:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia_coopmat2) }}
     steps:
       - name: Clone
@@ -276,7 +284,8 @@ jobs:
   #        bash ./ci/run.sh ~/results/ggml /mnt/ggml
 
   ggml-ci-mac-metal:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps:
       - name: Clone
@@ -289,7 +298,8 @@ jobs:
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   ggml-ci-mac-vulkan:
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps:
       - name: Clone
