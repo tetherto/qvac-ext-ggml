@@ -1510,6 +1510,13 @@ extern "C" {
             struct ggml_tensor  * scales,
             int32_t               group_size);
 
+    // Request the backend's F16 compatibility arithmetic for a ConvRot
+    // multiplication while retaining compact I8 weights at rest. Backends
+    // that do not implement the hint continue with their native path.
+    GGML_API void ggml_mul_mat_convrot_set_f16_compat(
+            struct ggml_tensor * a,
+            bool                 enabled);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(

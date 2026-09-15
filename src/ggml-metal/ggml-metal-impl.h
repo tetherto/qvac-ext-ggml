@@ -595,14 +595,15 @@ typedef struct {
     int16_t  r3;
 } ggml_metal_kargs_mul_mv;
 
-// Compact I8/F32 ConvRot mat-vec.  The weight buffer stays quantized; each
-// 256-element block is transformed in threadgroup memory before dotting it.
+// Compact I8/F32 ConvRot. Native mode rotates activations once before tiled
+// FP32 matrix multiplication; compatibility mode reconstructs F16 weight tiles.
 typedef struct {
     int32_t  k;
     int32_t  out_features;
     int32_t  ne01;
     int32_t  ne02;
     int32_t  ne03;
+    int32_t  f16_compat;
     uint64_t nb00;
     uint64_t nb01;
     uint64_t nb02;

@@ -1025,6 +1025,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[4];
+    vk_pipeline pipeline_mul_mat_convrot_f32;
+    vk_pipeline pipeline_mul_mat_convrot_f16;
+    vk_pipeline pipeline_convrot_reconstruct_f32, pipeline_convrot_reconstruct_f16;
+    vk_pipeline pipeline_convrot_convert_f32_f16, pipeline_convrot_convert_f16_f32, pipeline_convrot_round_f16;
+    vk_pipeline pipeline_rope_flux_f32;
+    vk_pipeline pipeline_convrot_convert_i8_f16, pipeline_convrot_activation_split_f32, pipeline_convrot_activation_split_f16, pipeline_convrot_combine;
+    vk_pipeline pipeline_convrot_tile_weights, pipeline_convrot_tile_activation, pipeline_convrot_accumulate;
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1350,6 +1357,15 @@ struct vk_op_fwht_push_constants {
     uint32_t src_offset;
     uint32_t dst_offset;
     float scale;
+};
+
+struct vk_op_mul_mat_convrot_push_constants {
+    uint32_t k;
+    uint32_t ne02;
+    uint32_t a_offset;
+    uint32_t w_offset;
+    uint32_t s_offset;
+    uint32_t d_offset;
 };
 
 struct vk_op_count_experts_push_constants {
@@ -2296,7 +2312,9 @@ static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
 
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
-    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MUL_MAT_CONVROT) {
+        // ConvRot swaps the operand roles, but src[1]->ne[0] is still K.
+        // Count its GEMM work so batching honors the GPU submission FLOP cap.
         const uint64_t m     = node->ne[0];
         const uint64_t n     = node->ne[1];
         const uint64_t k     = node->src[1]->ne[0];
@@ -2642,6 +2660,13 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset, prealloc_size_tile;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, prealloc_tile, sync_staging;
+    // Separate from GEMM scratch: GEMM may resize/use prealloc_x/y itself.
+    size_t prealloc_size_convrot_w = 0, prealloc_size_convrot_a = 0;
+    vk_buffer prealloc_convrot_w, prealloc_convrot_a;
+    size_t prealloc_size_convrot_low_a = 0, prealloc_size_convrot_low_d = 0;
+    vk_buffer prealloc_convrot_low_a, prealloc_convrot_low_d, prealloc_convrot_flag;
+    size_t prealloc_size_convrot_tile_a = 0, prealloc_size_convrot_tile_d = 0;
+    vk_buffer prealloc_convrot_tile_hi, prealloc_convrot_tile_lo, prealloc_convrot_tile_d;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -6653,6 +6678,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    // Each workgroup produces one output row; the 256 local invocations process its ConvRot tile.
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_convrot_f32, "mul_mat_convrot_f32", mul_mat_convrot_f32_len, mul_mat_convrot_f32_data, "main", 4, sizeof(vk_op_mul_mat_convrot_push_constants), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_convrot_f16, "mul_mat_convrot_f16", mul_mat_convrot_f16_len, mul_mat_convrot_f16_data, "main", 4, sizeof(vk_op_mul_mat_convrot_push_constants), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_reconstruct_f32, "convrot_reconstruct_f32", convrot_reconstruct_f32_len, convrot_reconstruct_f32_data, "main", 3, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_reconstruct_f16, "convrot_reconstruct_f16", convrot_reconstruct_f16_len, convrot_reconstruct_f16_data, "main", 3, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_convert_f32_f16, "convrot_convert_f32_f16", convrot_convert_f32_f16_len, convrot_convert_f32_f16_data, "main", 2, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_convert_f16_f32, "convrot_convert_f16_f32", convrot_convert_f16_f32_len, convrot_convert_f16_f32_data, "main", 2, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_round_f16, "convrot_round_f16", convrot_round_f16_len, convrot_round_f16_data, "main", 2, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_rope_flux_f32, "rope_flux_f32", rope_flux_f32_len, rope_flux_f32_data, "main", 3, 16 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_convert_i8_f16, "convrot_convert_i8_f16", convrot_convert_i8_f16_len, convrot_convert_i8_f16_data, "main", 2, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_activation_split_f32, "convrot_activation_split_f32", convrot_activation_split_f32_len, convrot_activation_split_f32_data, "main", 4, 2 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_activation_split_f16, "convrot_activation_split_f16", convrot_activation_split_f16_len, convrot_activation_split_f16_data, "main", 4, 2 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_combine, "convrot_combine", convrot_combine_len, convrot_combine_data, "main", 3, 4 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_tile_weights, "convrot_tile_weights", convrot_tile_weights_len, convrot_tile_weights_data, "main", 2, 6 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_tile_activation, "convrot_tile_activation", convrot_tile_activation_len, convrot_tile_activation_data, "main", 2, 6 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_accumulate, "convrot_accumulate", convrot_accumulate_len, convrot_accumulate_data, "main", 4, 6 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
+
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_f32,       "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 256, device->subgroup_size, cumsum_elem_per_thread }, 1, true, true, device->subgroup_size);
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_small_f32, "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 128, device->subgroup_size, 1 }, 1, true, true, device->subgroup_size);
@@ -10632,7 +10674,8 @@ static vk_pipeline ggml_vk_get_q8_0_bk64_pipeline(ggml_backend_vk_context * ctx,
     return nullptr;
 }
 
-static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
+static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k,
+                                vk_buffer src0_override = nullptr, vk_buffer src1_override = nullptr, vk_buffer dst_override = nullptr, uint32_t split_k_override = 0, uint64_t src1_override_offset = 0) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -10674,8 +10717,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool src1_uma = false;
 
     if (ctx->device->uma) {
-        ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-        ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
+        if (!src0_override) ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
+        if (!src1_override) ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src0_uma = d_Qx != nullptr;
         src1_uma = d_Qy != nullptr;
     }
@@ -10745,7 +10788,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, src0->type);
+    // Small reconstructed ConvRot matrices underfill the GPU. Splitting the
+    // reduction also avoids a long serial FP32 sum on cancellation-heavy rows.
+    const bool convrot_small_split = src0_override && full_f32 && !disable_split_k &&
+                                    ctx->device->architecture != vk_device_architecture::QUALCOMM_ADRENO &&
+                                    ne01 < 512 && ne11 <= 64 && ne10 >= 512;
+    const uint32_t split_k = split_k_override ? split_k_override : convrot_small_split ? 2 : ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, src0->type);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -10774,7 +10822,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
 
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    const uint64_t d_buf_offset = dst_override ? 0 : vk_tensor_offset(dst) + dst->view_offs;
 
     bool do_tiling = ctx->device->architecture == vk_device_architecture::QUALCOMM_ADRENO &&
         (ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) &&
@@ -10861,7 +10909,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
     }
 
-    vk_buffer d_D = dst_buf_ctx->dev_buffer;
+    vk_buffer d_D = dst_override ? dst_override : dst_buf_ctx->dev_buffer;
     GGML_ASSERT(d_D != nullptr);
     GGML_ASSERT(d_D->size >= d_buf_offset + d_sz);
     vk_buffer d_X;
@@ -10869,13 +10917,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_buffer d_Y;
     uint64_t y_buf_offset = 0;
     if (!src0_uma) {
-        d_Qx = src0_buf_ctx->dev_buffer;
-        qx_buf_offset = vk_tensor_offset(src0) + src0->view_offs;
+        d_Qx = src0_override ? src0_override : src0_buf_ctx->dev_buffer;
+        qx_buf_offset = src0_override ? 0 : vk_tensor_offset(src0) + src0->view_offs;
         GGML_ASSERT(d_Qx != nullptr);
     }
     if (!src1_uma) {
-        d_Qy = src1_buf_ctx->dev_buffer;
-        qy_buf_offset = vk_tensor_offset(src1) + src1->view_offs;
+        d_Qy = src1_override ? src1_override : src1_buf_ctx->dev_buffer;
+        qy_buf_offset = src1_override ? src1_override_offset : vk_tensor_offset(src1) + src1->view_offs;
         GGML_ASSERT(d_Qy != nullptr);
     }
     if (qx_needs_dequant) {
@@ -11582,6 +11630,320 @@ static int ggml_vk_fwht_pipeline_idx(int64_t n) {
         case 512: return 3;
         default:  return -1;
     }
+}
+
+static void ggml_vk_rope_flux(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+    const uint32_t pairs = (uint32_t) (ggml_nelements(dst) / 2);
+    const uint32_t groups = CEIL_DIV(pairs, 256);
+    const uint32_t groups_x = std::min(groups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    std::vector<uint32_t> pc = { pairs, (uint32_t) x->ne[0], (uint32_t) x->ne[1], (uint32_t) x->ne[2],
+        (uint32_t) (get_misalign_bytes(ctx, x) / sizeof(float)),
+        pe ? (uint32_t) (get_misalign_bytes(ctx, pe) / sizeof(float)) : 0,
+        (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(float)), pe ? 1u : 0u };
+    for (int i = 0; i < 4; ++i) pc.push_back((uint32_t) (x->nb[i] / sizeof(float)));
+    for (int i = 0; i < 4; ++i) pc.push_back(pe ? (uint32_t) (pe->nb[i] / sizeof(float)) : 0);
+    vk_pipeline pipeline = ctx->device->pipeline_rope_flux_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, pe ? pe : x, true),
+          ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc, { groups_x, CEIL_DIV(groups, groups_x), 1 });
+}
+
+static void ggml_vk_convrot_convert(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline pipeline,
+                                   vk_subbuffer src, vk_subbuffer dst, uint32_t count,
+                                   uint32_t src_offset, uint32_t dst_offset, bool packed_output) {
+    const uint32_t groups = CEIL_DIV(packed_output ? count / 2 : count, 256);
+    const uint32_t groups_x = std::min(groups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const std::vector<uint32_t> pc = { count, src_offset, dst_offset };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src, dst }, pc, { groups_x, CEIL_DIV(groups, groups_x), 1 });
+}
+
+static void ggml_vk_convrot_k_tiled(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    constexpr uint32_t tile_k = 512;
+    const ggml_tensor * a = dst->src[0], * w = dst->src[1];
+    const uint64_t columns = ggml_nrows(a);
+    const uint64_t tile_columns = std::min<uint64_t>(1024, columns);
+    ctx->prealloc_size_convrot_tile_a = std::max(ctx->prealloc_size_convrot_tile_a, size_t(tile_columns * tile_k * sizeof(ggml_fp16_t)));
+    ctx->prealloc_size_convrot_tile_d = std::max(ctx->prealloc_size_convrot_tile_d, size_t(tile_columns * w->ne[1] * sizeof(float)));
+    ggml_vk_preallocate_buffers(ctx, subctx);
+    const auto dispatch = [&](vk_pipeline pipeline, std::vector<vk_subbuffer> buffers, std::vector<uint32_t> pc, uint32_t items) {
+        const uint32_t groups = CEIL_DIV(items, 256);
+        const uint32_t gx = std::min(groups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        if (buffers.size() == 2) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {buffers[0], buffers[1]}, pc, {gx, CEIL_DIV(groups, gx), 1});
+        } else {
+            GGML_ASSERT(buffers.size() == 4);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {buffers[0], buffers[1], buffers[2], buffers[3]}, pc, {gx, CEIL_DIV(groups, gx), 1});
+        }
+    };
+    for (uint32_t offset = 0; offset < uint32_t(w->ne[0]); offset += tile_k) {
+        const uint32_t part_k = std::min<uint32_t>(tile_k, w->ne[0] - offset);
+        ggml_vk_sync_buffers(ctx, subctx);
+        const size_t weight_bytes = size_t(part_k) * w->ne[1] * sizeof(ggml_fp16_t);
+        dispatch(ctx->device->pipeline_convrot_tile_weights,
+            { ggml_vk_tensor_subbuffer(ctx, w, true), {ctx->prealloc_convrot_w, 0, weight_bytes} },
+            { uint32_t(part_k * w->ne[1]), part_k, uint32_t(w->ne[0]), 0, offset, get_misalign_bytes(ctx, w) },
+            part_k * w->ne[1] / 2);
+        for (uint64_t column = 0; column < columns; column += tile_columns) {
+            ggml_vk_sync_buffers(ctx, subctx);
+            const uint32_t part_columns = std::min<uint64_t>(tile_columns, columns - column);
+            const size_t activation_bytes = size_t(part_k) * part_columns * sizeof(ggml_fp16_t);
+            const std::vector<uint32_t> apc = {part_k * part_columns, part_k, uint32_t(a->ne[0]), uint32_t(column), offset, 0};
+            dispatch(ctx->device->pipeline_convrot_tile_activation,
+                {{ctx->prealloc_convrot_a, 0, size_t(ggml_nelements(a)) * sizeof(ggml_fp16_t)}, {ctx->prealloc_convrot_tile_hi, 0, activation_bytes}}, apc, part_k * part_columns / 2);
+            dispatch(ctx->device->pipeline_convrot_tile_activation,
+                {{ctx->prealloc_convrot_low_a, 0, size_t(ggml_nelements(a)) * sizeof(ggml_fp16_t)}, {ctx->prealloc_convrot_tile_lo, 0, activation_bytes}}, apc, part_k * part_columns / 2);
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_tensor weights = *w, activation = *a, result = *dst;
+            weights.ne[0] = activation.ne[0] = part_k;
+            activation.ne[1] = result.ne[1] = part_columns;
+            activation.ne[2] = activation.ne[3] = result.ne[2] = result.ne[3] = 1;
+            for (ggml_tensor * t : {&weights, &activation}) {
+                t->type = GGML_TYPE_F16; t->data = vk_ptr_base; t->view_src = nullptr; t->view_offs = 0;
+                t->nb[0] = sizeof(ggml_fp16_t);
+                for (int i = 1; i < GGML_MAX_DIMS; ++i) t->nb[i] = t->nb[i-1] * t->ne[i-1];
+            }
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) result.nb[i] = result.nb[i-1] * result.ne[i-1];
+            result.view_offs += column * result.ne[0] * sizeof(float);
+            result.op = GGML_OP_MUL_MAT; memset(result.op_params, 0, sizeof(result.op_params));
+            ggml_set_op_params_i32(&result, 0, GGML_PREC_F32);
+            result.src[0] = &weights; result.src[1] = &activation;
+            ctx->prealloc_y_last_tensor_used = nullptr;
+            ggml_vk_mul_mat_q_f16(ctx, subctx, &weights, &activation, &result, false,
+                ctx->prealloc_convrot_w, ctx->prealloc_convrot_tile_hi, ctx->prealloc_convrot_tile_d, 1);
+            ctx->prealloc_y_last_tensor_used = nullptr;
+            ggml_vk_mul_mat_q_f16(ctx, subctx, &weights, &activation, &result, false,
+                ctx->prealloc_convrot_w, ctx->prealloc_convrot_tile_lo, ctx->prealloc_convrot_low_d, 1);
+            ctx->prealloc_y_last_tensor_used = nullptr;
+            ggml_vk_sync_buffers(ctx, subctx);
+            const size_t output_bytes = ggml_nbytes(&result);
+            dispatch(ctx->device->pipeline_convrot_accumulate,
+                {{ctx->prealloc_convrot_tile_d, 0, output_bytes}, {ctx->prealloc_convrot_low_d, 0, output_bytes},
+                 ggml_vk_tensor_subbuffer(ctx, dst->src[2], true), ggml_vk_tensor_subbuffer(ctx, &result, true)},
+                {uint32_t(ggml_nelements(&result)), uint32_t(result.ne[0]), get_misalign_bytes(ctx, &result) / uint32_t(sizeof(float)),
+                 get_misalign_bytes(ctx, dst->src[2]) / uint32_t(sizeof(float)), offset == 0 ? 1u : 0u, offset + part_k == w->ne[0] ? 1u : 0u},
+                ggml_nelements(&result));
+        }
+    }
+}
+
+// Strix/RADV-only fast path, calibrated against the FP32 reconstruction
+// reference. Other Vulkan devices and the F16 compatibility hint retain their
+// existing arithmetic. Two F16 activation parts feed FP32-accumulate GEMMs;
+// long reductions use explicit K512 products instead of internal split-K.
+// GGML_VULKAN_CONVROT_DISABLE_HYBRID selects the original FP32 path for A/B
+// comparisons. GGML_VULKAN_CONVROT_TRACE reports selection and range fallback.
+static bool ggml_vk_convrot_hybrid(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0], * w = dst->src[1];
+    const bool trace = std::getenv("GGML_VULKAN_CONVROT_TRACE") != nullptr;
+    if (!ggml_vk_is_gfx1151(ctx->device) || std::getenv("GGML_VULKAN_CONVROT_DISABLE_HYBRID") ||
+        ggml_get_op_params_i32(dst, 1) != 0 || ggml_nrows(a) <= 1 ||
+        (w->ne[0] != 5376 && w->ne[0] < 7168) || !ctx->device->fp16 || !ctx->device->coopmat_support) {
+        if (trace) GGML_LOG_INFO("ConvRot hybrid: unchanged native path (gfx1151=%d K=%lld columns=%lld compat=%d)\n",
+            int(ggml_vk_is_gfx1151(ctx->device)), (long long) w->ne[0], (long long) ggml_nrows(a), ggml_get_op_params_i32(dst, 1));
+        return false;
+    }
+    const size_t w_bytes = ggml_nelements(w) * sizeof(ggml_fp16_t);
+    const size_t a_bytes = ggml_nelements(a) * sizeof(ggml_fp16_t);
+    const uint64_t columns = ggml_nrows(a);
+    const uint32_t high_split = w->ne[0] == 5376 ? 8 : 1;
+    const uint64_t max_chunk = ctx->device->properties.limits.maxStorageBufferRange / (w->ne[1] * sizeof(float) * high_split);
+    // Bound partial reduction scratch independently of video length. Whole
+    // rotated activations remain immutable while each output tile is written.
+    const uint64_t chunk_columns = std::min<uint64_t>(1024, max_chunk);
+    if (chunk_columns == 0) {
+        if (trace) GGML_LOG_INFO("ConvRot hybrid: descriptor fallback (split=%u)\n", high_split);
+        return false;
+    }
+    const size_t d_bytes = std::min(columns, chunk_columns) * w->ne[1] * sizeof(float);
+    if (!ctx->prealloc_convrot_flag || ctx->prealloc_size_convrot_w < w_bytes ||
+        ctx->prealloc_size_convrot_a < a_bytes || ctx->prealloc_size_convrot_low_a < a_bytes ||
+        ctx->prealloc_size_convrot_low_d < d_bytes) {
+        ctx->prealloc_size_convrot_w = std::max(ctx->prealloc_size_convrot_w, w_bytes);
+        ctx->prealloc_size_convrot_a = std::max(ctx->prealloc_size_convrot_a, a_bytes);
+        ctx->prealloc_size_convrot_low_a = std::max(ctx->prealloc_size_convrot_low_a, a_bytes);
+        ctx->prealloc_size_convrot_low_d = std::max(ctx->prealloc_size_convrot_low_d, d_bytes);
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+    subctx->s->buffer->buf.fillBuffer(ctx->prealloc_convrot_flag->buffer, 0, sizeof(uint32_t), 0);
+    ggml_vk_sync_buffers(ctx, subctx);
+    vk_pipeline split = a->type == GGML_TYPE_F32 ? ctx->device->pipeline_convrot_activation_split_f32 : ctx->device->pipeline_convrot_activation_split_f16;
+    ggml_pipeline_request_descriptor_sets(ctx, split, 1);
+    const uint32_t groups = ggml_nelements(a) / 256;
+    const uint32_t gx = std::min(groups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    const std::vector<uint32_t> pc = { (uint32_t) ggml_nelements(a), (uint32_t) (get_misalign_bytes(ctx, a) / ggml_type_size(a->type)) };
+    ggml_vk_dispatch_pipeline(ctx, subctx, split,
+        { ggml_vk_tensor_subbuffer(ctx, a, true), vk_subbuffer{ctx->prealloc_convrot_a, 0, a_bytes},
+          vk_subbuffer{ctx->prealloc_convrot_low_a, 0, a_bytes}, vk_subbuffer{ctx->prealloc_convrot_flag, 0, sizeof(uint32_t)} },
+        pc, { gx, CEIL_DIV(groups, gx), 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    // Use the existing submission/synchronization boundary before the host
+    // range decision. Unsafe inputs retain the original full-F32 path.
+    ggml_vk_preallocate_buffers(ctx, subctx);
+    uint32_t unsafe = 0;
+    ggml_vk_buffer_read(ctx->prealloc_convrot_flag, 0, &unsafe, sizeof(unsafe));
+    if (trace) {
+        GGML_LOG_INFO("ConvRot hybrid: %s (K=%lld rows=%lld columns=%lld)\n", unsafe ? "range fallback" : w->ne[0] == 5376 ? "split8" : "K512 tiles",
+                      (long long) w->ne[0], (long long) w->ne[1], (long long) ggml_nrows(a));
+    }
+    if (unsafe) return false;
+
+    if (w->ne[0] >= 7168) {
+        ggml_vk_convrot_k_tiled(ctx, subctx, dst);
+        return true;
+    }
+
+    ggml_vk_convrot_convert(ctx, subctx, ctx->device->pipeline_convrot_convert_i8_f16,
+        ggml_vk_tensor_subbuffer(ctx, w, true), {ctx->prealloc_convrot_w, 0, w_bytes},
+        (uint32_t) ggml_nelements(w), get_misalign_bytes(ctx, w), 0, true);
+    ggml_vk_sync_buffers(ctx, subctx);
+    const auto as_half = [](const ggml_tensor * input) {
+        ggml_tensor t = *input;
+        t.type = GGML_TYPE_F16; t.data = vk_ptr_base; t.view_src = nullptr; t.view_offs = 0;
+        t.nb[0] = sizeof(ggml_fp16_t);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) t.nb[i] = t.nb[i-1] * t.ne[i-1];
+        return t;
+    };
+    for (uint64_t column = 0; column < columns; column += chunk_columns) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_tensor weights = as_half(w), activation = as_half(a), result = *dst;
+        activation.ne[1] = std::min(chunk_columns, columns - column);
+        activation.ne[2] = activation.ne[3] = 1;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) activation.nb[i] = activation.nb[i-1] * activation.ne[i-1];
+        result.ne[1] = activation.ne[1]; result.ne[2] = result.ne[3] = 1;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) result.nb[i] = result.nb[i-1] * result.ne[i-1];
+        result.view_offs += column * result.ne[0] * sizeof(float);
+        const uint64_t activation_offset = column * a->ne[0] * sizeof(ggml_fp16_t);
+        result.op = GGML_OP_MUL_MAT;
+        memset(result.op_params, 0, sizeof(result.op_params));
+        ggml_set_op_params_i32(&result, 0, GGML_PREC_F32);
+        result.src[0] = &weights; result.src[1] = &activation;
+        ctx->prealloc_y_last_tensor_used = nullptr;
+        ggml_vk_mul_mat_q_f16(ctx, subctx, &weights, &activation, &result, false,
+                             ctx->prealloc_convrot_w, ctx->prealloc_convrot_a, nullptr, high_split, activation_offset);
+        ctx->prealloc_y_last_tensor_used = nullptr;
+        ggml_vk_mul_mat_q_f16(ctx, subctx, &weights, &activation, &result, false,
+                             ctx->prealloc_convrot_w, ctx->prealloc_convrot_low_a, ctx->prealloc_convrot_low_d, 0, activation_offset);
+        ctx->prealloc_y_last_tensor_used = nullptr;
+        ggml_vk_sync_buffers(ctx, subctx);
+        vk_pipeline combine = ctx->device->pipeline_convrot_combine;
+        ggml_pipeline_request_descriptor_sets(ctx, combine, 1);
+        const uint32_t out_groups = CEIL_DIV(ggml_nelements(&result), 256);
+        const uint32_t out_x = std::min(out_groups, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+        const std::vector<uint32_t> opc = { (uint32_t) ggml_nelements(&result), (uint32_t) dst->ne[0],
+            (uint32_t) (get_misalign_bytes(ctx, &result) / sizeof(float)), (uint32_t) (get_misalign_bytes(ctx, dst->src[2]) / sizeof(float)) };
+        ggml_vk_dispatch_pipeline(ctx, subctx, combine,
+            { ggml_vk_tensor_subbuffer(ctx, &result, true), vk_subbuffer{ctx->prealloc_convrot_low_d, 0, ggml_nbytes(&result)},
+              ggml_vk_tensor_subbuffer(ctx, dst->src[2], true) }, opc, { out_x, CEIL_DIV(out_groups, out_x), 1 });
+    }
+    return true;
+}
+
+static void ggml_vk_mul_mat_convrot(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const ggml_tensor * s = dst->src[2];
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(w) && ggml_is_contiguous(s) && ggml_is_contiguous(dst));
+    if (ggml_vk_convrot_hybrid(ctx, subctx, dst)) return;
+    const bool f16_compat = ggml_get_op_params_i32(dst, 1) != 0;
+    // The fused dot-product kernel is economical for a single column only.
+    // Video/prefill matrices must not repeat H256 reconstruction per token.
+    if (f16_compat || ggml_nrows(a) > 1) {
+        const ggml_type wt = f16_compat ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        const ggml_type at = f16_compat ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        const size_t weight_bytes = ggml_nelements(w) * ggml_type_size(wt);
+        const bool convert_a = a->type != at;
+        const size_t activation_bytes = convert_a ? ggml_nelements(a) * ggml_type_size(at) : 0;
+        if (ctx->prealloc_size_convrot_w < weight_bytes || ctx->prealloc_size_convrot_a < activation_bytes) {
+            ctx->prealloc_size_convrot_w = std::max(ctx->prealloc_size_convrot_w, weight_bytes);
+            ctx->prealloc_size_convrot_a = std::max(ctx->prealloc_size_convrot_a, activation_bytes);
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        // Scratch is shared between graph nodes, not persistent weight storage.
+        // Complete previous readers before overwriting, and publish reconstruction
+        // writes before GEMM. GEMM's own scratch can never alias these buffers.
+        ggml_vk_sync_buffers(ctx, subctx);
+        vk_pipeline reconstruct = f16_compat ? ctx->device->pipeline_convrot_reconstruct_f16 : ctx->device->pipeline_convrot_reconstruct_f32;
+        ggml_pipeline_request_descriptor_sets(ctx, reconstruct, 1);
+        const std::vector<uint32_t> rpc = { (uint32_t) w->ne[0], (uint32_t) get_misalign_bytes(ctx, w),
+                                           (uint32_t) (get_misalign_bytes(ctx, s) / sizeof(float)) };
+        ggml_vk_dispatch_pipeline(ctx, subctx, reconstruct,
+            { ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, s, true),
+              vk_subbuffer{ ctx->prealloc_convrot_w, 0, weight_bytes } }, rpc,
+            { (uint32_t) w->ne[1], (uint32_t) w->ne[0] / 256, 1 });
+        if (convert_a) {
+            ggml_vk_convrot_convert(ctx, subctx,
+                f16_compat ? ctx->device->pipeline_convrot_convert_f32_f16 : ctx->device->pipeline_convrot_convert_f16_f32,
+                ggml_vk_tensor_subbuffer(ctx, a, true), { ctx->prealloc_convrot_a, 0, activation_bytes },
+                (uint32_t) ggml_nelements(a), (uint32_t) (get_misalign_bytes(ctx, a) / ggml_type_size(a->type)), 0, f16_compat);
+        }
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        ggml_tensor reconstructed = *w;
+        reconstructed.type = wt;
+        reconstructed.data = vk_ptr_base;
+        reconstructed.view_src = nullptr;
+        reconstructed.view_offs = 0;
+        reconstructed.nb[0] = ggml_type_size(wt);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) reconstructed.nb[i] = reconstructed.nb[i - 1] * reconstructed.ne[i - 1];
+        ggml_tensor activation = *a;
+        if (convert_a) {
+            activation.type = at;
+            activation.data = vk_ptr_base;
+            activation.view_src = nullptr;
+            activation.view_offs = 0;
+            activation.nb[0] = ggml_type_size(at);
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) activation.nb[i] = activation.nb[i - 1] * activation.ne[i - 1];
+        }
+        ggml_tensor result = *dst;
+        result.op = GGML_OP_MUL_MAT;
+        memset(result.op_params, 0, sizeof(result.op_params));
+        // Preserve native FP32 weights/activations; coopmat2 must not silently
+        // convert them to F16. Compatibility preserves F16 operand/output
+        // rounding but uses FP32 accumulation: AMD's F16 reduction has much
+        // larger cancellation error than CUDA's implementation. Cross-backend
+        // reduction order is not promised to be bitwise identical.
+        ggml_set_op_params_i32(&result, 0, GGML_PREC_F32);
+        result.src[0] = &reconstructed;
+        result.src[1] = convert_a ? &activation : const_cast<ggml_tensor *>(a);
+        if (convert_a) {
+            // The temporary tensor has no persistent identity. Never let the
+            // GEMM conversion cache match a reused stack address across nodes.
+            ctx->prealloc_y_last_tensor_used = nullptr;
+        }
+        ggml_vk_mul_mat_q_f16(ctx, subctx, &reconstructed, result.src[1], &result, false,
+                             ctx->prealloc_convrot_w, convert_a ? ctx->prealloc_convrot_a : nullptr);
+        if (convert_a) {
+            ctx->prealloc_y_last_tensor_used = nullptr;
+        }
+        if (f16_compat) {
+            ggml_vk_sync_buffers(ctx, subctx);
+            const vk_subbuffer output = ggml_vk_tensor_subbuffer(ctx, dst, true);
+            const uint32_t offset = get_misalign_bytes(ctx, dst) / sizeof(float);
+            ggml_vk_convrot_convert(ctx, subctx, ctx->device->pipeline_convrot_round_f16, output, output,
+                                   (uint32_t) ggml_nelements(dst), offset, offset, false);
+        }
+        return;
+    }
+    vk_pipeline pipeline = a->type == GGML_TYPE_F32 ? ctx->device->pipeline_mul_mat_convrot_f32 : ctx->device->pipeline_mul_mat_convrot_f16;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_op_mul_mat_convrot_push_constants pc = {
+        (uint32_t) a->ne[0], (uint32_t) a->ne[2],
+        (uint32_t) (get_misalign_bytes(ctx, a) / ggml_type_size(a->type)),
+        (uint32_t) get_misalign_bytes(ctx, w),
+        (uint32_t) (get_misalign_bytes(ctx, s) / sizeof(float)),
+        (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(float)),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, w, true),
+          ggml_vk_tensor_subbuffer(ctx, s, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc,
+        { (uint32_t) w->ne[1], (uint32_t) a->ne[1], (uint32_t) (a->ne[2] * a->ne[3]) });
 }
 
 static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -17476,6 +17838,35 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         }
         ctx->prealloc_tile = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_tile);
     }
+    if (ctx->prealloc_size_convrot_w > 0 && (!ctx->prealloc_convrot_w || ctx->prealloc_convrot_w->size < ctx->prealloc_size_convrot_w)) {
+        ggml_vk_destroy_buffer(ctx->prealloc_convrot_w);
+        ctx->prealloc_convrot_w = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_convrot_w);
+    }
+    if (ctx->prealloc_size_convrot_a > 0 && (!ctx->prealloc_convrot_a || ctx->prealloc_convrot_a->size < ctx->prealloc_size_convrot_a)) {
+        ggml_vk_destroy_buffer(ctx->prealloc_convrot_a);
+        ctx->prealloc_convrot_a = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_convrot_a);
+    }
+    if (ctx->prealloc_size_convrot_low_a > 0 && (!ctx->prealloc_convrot_low_a || ctx->prealloc_convrot_low_a->size < ctx->prealloc_size_convrot_low_a)) {
+        ggml_vk_destroy_buffer(ctx->prealloc_convrot_low_a);
+        ctx->prealloc_convrot_low_a = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_convrot_low_a);
+    }
+    if (ctx->prealloc_size_convrot_low_d > 0 && (!ctx->prealloc_convrot_low_d || ctx->prealloc_convrot_low_d->size < ctx->prealloc_size_convrot_low_d)) {
+        ggml_vk_destroy_buffer(ctx->prealloc_convrot_low_d);
+        ctx->prealloc_convrot_low_d = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_convrot_low_d);
+    }
+    if (ctx->prealloc_size_convrot_low_a > 0 && !ctx->prealloc_convrot_flag) {
+        ctx->prealloc_convrot_flag = ggml_vk_create_buffer_device(ctx->device, sizeof(uint32_t));
+    }
+    if (ctx->prealloc_size_convrot_tile_a > 0 && (!ctx->prealloc_convrot_tile_hi || ctx->prealloc_convrot_tile_hi->size < ctx->prealloc_size_convrot_tile_a)) {
+        ggml_vk_destroy_buffer(ctx->prealloc_convrot_tile_hi);
+        ggml_vk_destroy_buffer(ctx->prealloc_convrot_tile_lo);
+        ctx->prealloc_convrot_tile_hi = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_convrot_tile_a);
+        ctx->prealloc_convrot_tile_lo = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_convrot_tile_a);
+    }
+    if (ctx->prealloc_size_convrot_tile_d > 0 && (!ctx->prealloc_convrot_tile_d || ctx->prealloc_convrot_tile_d->size < ctx->prealloc_size_convrot_tile_d)) {
+        ggml_vk_destroy_buffer(ctx->prealloc_convrot_tile_d);
+        ctx->prealloc_convrot_tile_d = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_convrot_tile_d);
+    }
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
@@ -17974,8 +18365,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
 
         break;
+    case GGML_OP_MUL_MAT_CONVROT:
+        ggml_vk_mul_mat_convrot(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MUL_MAT_ID:
         ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
+
+        break;
+    case GGML_OP_ROPE_FLUX:
+        ggml_vk_rope_flux(ctx, compute_ctx, node);
 
         break;
 
@@ -18166,6 +18565,18 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
     ggml_vk_destroy_buffer(ctx->prealloc_tile);
+    ggml_vk_destroy_buffer(ctx->prealloc_convrot_w);
+    ggml_vk_destroy_buffer(ctx->prealloc_convrot_a);
+    ctx->prealloc_size_convrot_w = 0;
+    ctx->prealloc_size_convrot_a = 0;
+    ggml_vk_destroy_buffer(ctx->prealloc_convrot_low_a);
+    ggml_vk_destroy_buffer(ctx->prealloc_convrot_low_d);
+    ggml_vk_destroy_buffer(ctx->prealloc_convrot_tile_hi);
+    ggml_vk_destroy_buffer(ctx->prealloc_convrot_tile_lo);
+    ggml_vk_destroy_buffer(ctx->prealloc_convrot_tile_d);
+    ctx->prealloc_size_convrot_tile_a = ctx->prealloc_size_convrot_tile_d = 0;
+    ggml_vk_destroy_buffer(ctx->prealloc_convrot_flag);
+    ctx->prealloc_size_convrot_low_a = ctx->prealloc_size_convrot_low_d = 0;
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
@@ -20378,6 +20789,68 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 default:
                     return false;
             }
+        case GGML_OP_ROPE_FLUX: {
+            const ggml_tensor * x = op->src[0];
+            const ggml_tensor * pe = op->src[1];
+            if (!x || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(op) || x->ne[0] <= 0 || (x->ne[0] % 2) != 0 ||
+                op->ne[0] != x->ne[0] || op->ne[1] != x->ne[2] ||
+                op->ne[2] != x->ne[1] * x->ne[3] || op->ne[3] != 1 ||
+                (uint64_t) ggml_nelements(op) > UINT32_MAX) return false;
+            if (pe && (pe->type != GGML_TYPE_F32 || pe->ne[0] != 2 || pe->ne[1] != 2 ||
+                       pe->ne[2] != x->ne[0] / 2 || pe->ne[3] != x->ne[2])) return false;
+            const uint64_t alignment = device->properties.limits.minStorageBufferOffsetAlignment;
+            for (const ggml_tensor * t : { x, pe, op }) {
+                if (!t) continue;
+                if (((vk_tensor_offset(t) + t->view_offs) & 3) != 0 ||
+                    ggml_nbytes(t) > device->properties.limits.maxStorageBufferRange - (alignment - 1)) return false;
+                for (int i = 0; i < 4; ++i)
+                    if (t->ne[i] <= 0 || t->ne[i] > UINT32_MAX || t->nb[i] % sizeof(float) != 0 ||
+                        t->nb[i] / sizeof(float) > UINT32_MAX) return false;
+            }
+            const uint64_t groups = ((uint64_t) ggml_nelements(op) / 2 + 255) / 256;
+            return groups <= (uint64_t) device->properties.limits.maxComputeWorkGroupCount[0] *
+                                       device->properties.limits.maxComputeWorkGroupCount[1];
+        }
+        case GGML_OP_MUL_MAT_CONVROT:
+            // The ConvRot shader loads activations and I8 weights through
+            // uint[] arrays.  Decline sub-word views rather than exposing a
+            // descriptor range that can omit the final packed word.
+            if (((vk_tensor_offset(op->src[0]) + op->src[0]->view_offs) & 3) != 0 ||
+                ((vk_tensor_offset(op->src[1]) + op->src[1]->view_offs) & 3) != 0 ||
+                ((vk_tensor_offset(op->src[2]) + op->src[2]->view_offs) & 3) != 0 ||
+                ((vk_tensor_offset(op) + op->view_offs) & 3) != 0) {
+                return false;
+            }
+
+            // The implementation maps output rows, columns, and batches to
+            // X/Y/Z workgroups respectively.  It has no split-dispatch path.
+            if (op->src[1]->ne[1] <= 0 || op->src[0]->ne[1] <= 0 ||
+                op->src[0]->ne[2] <= 0 || op->src[0]->ne[3] <= 0 ||
+                op->src[1]->ne[1] > device->properties.limits.maxComputeWorkGroupCount[0] ||
+                op->src[0]->ne[1] > device->properties.limits.maxComputeWorkGroupCount[1] ||
+                op->src[0]->ne[2] > device->properties.limits.maxComputeWorkGroupCount[2] / op->src[0]->ne[3]) {
+                return false;
+            }
+
+            // Reconstruction and conversion descriptors use 32-bit indexing.
+            // Reject unsupported sizes before graph allocation/dispatch.
+            if (op->src[1]->ne[0] / 256 > device->properties.limits.maxComputeWorkGroupCount[1] ||
+                (uint64_t) ggml_nelements(op->src[1]) > device->properties.limits.maxStorageBufferRange /
+                    (ggml_get_op_params_i32(op, 1) != 0 ? sizeof(ggml_fp16_t) : sizeof(float)) ||
+                (uint64_t) ggml_nelements(op->src[0]) > device->properties.limits.maxStorageBufferRange / sizeof(float) ||
+                ggml_nbytes(op) > device->properties.limits.maxStorageBufferRange) {
+                return false;
+            }
+
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->src[1]->type == GGML_TYPE_I8 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_get_op_params_i32(op, 0) == 256 &&
+                op->src[0]->ne[0] == op->src[1]->ne[0] && op->src[0]->ne[0] > 0 && op->src[0]->ne[0] % 256 == 0 &&
+                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                op->src[2]->ne[0] == op->src[1]->ne[1] && op->src[2]->ne[1] == 1 && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                op->ne[0] == op->src[1]->ne[1] && op->ne[1] == op->src[0]->ne[1] && op->ne[2] == op->src[0]->ne[2] && op->ne[3] == op->src[0]->ne[3] &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -21144,6 +21617,8 @@ static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
             return 0;
         case GGML_OP_MUL_MAT:
             return op->ne[1];
+        case GGML_OP_MUL_MAT_CONVROT:
+            return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
@@ -21702,6 +22177,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             }
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_MUL_MAT_CONVROT) {
+            tensor_clone = ggml_mul_mat_convrot(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], ggml_get_op_params_i32(tensor, 0));
+            ggml_mul_mat_convrot_set_f16_compat(tensor_clone, ggml_get_op_params_i32(tensor, 1) != 0);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID_BACK_A) {
@@ -21808,6 +22286,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_soft_max_ext_back(ggml_ctx, src_clone[0], src_clone[1], ((float *)tensor->op_params)[0], ((float *)tensor->op_params)[1]);
         } else if (tensor->op == GGML_OP_DIAG_MASK_INF) {
             tensor_clone = ggml_diag_mask_inf(ggml_ctx, src_clone[0], tensor->op_params[0]);
+        } else if (tensor->op == GGML_OP_ROPE_FLUX) {
+            tensor_clone = ggml_rope_flux(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_ROPE || tensor->op == GGML_OP_ROPE_BACK) {
             const int n_dims      = ((int32_t *) tensor->op_params)[1];
             const int mode        = ((int32_t *) tensor->op_params)[2];
