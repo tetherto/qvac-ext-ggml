@@ -3514,14 +3514,6 @@ struct ggml_tensor * ggml_mul_mat_convrot(
     return result;
 }
 
-void ggml_mul_mat_convrot_set_f16_compat(
-        struct ggml_tensor * a,
-        bool                 enabled) {
-    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_CONVROT);
-
-    ggml_set_op_params_i32(a, 1, enabled ? 1 : 0);
-}
-
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
