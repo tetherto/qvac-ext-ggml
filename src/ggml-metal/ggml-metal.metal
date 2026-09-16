@@ -343,86 +343,181 @@ kernel void kernel_mul_mv_tq2_0_f32(
 }
 
 template <typename T>
-inline void kernel_mul_mat_convrot_impl(
-        constant ggml_metal_kargs_mul_mat_convrot & args,
-        device const char * activations,
-        device const char * weights,
-        device const char * scales,
-        device char * dst,
-        threadgroup float * values,
-        threadgroup float * transformed,
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint row = tgpig.x;
-    const uint i1 = tgpig.y;
-    const uint i2 = tgpig.z % args.ne02;
-    const uint i3 = tgpig.z / args.ne02;
-    const float scale = *((device const float *) (scales + row * args.nb20));
-    device const char * activation = activations + i1*args.nb01 + i2*args.nb02 + i3*args.nb03;
-    device const char * weight_row = weights + row*args.nb11;
-
-    float sum = 0.0f;
-    for (uint k0 = 0; k0 < args.k; k0 += 256) {
-        values[tid] = float(*((device const int8_t *) (weight_row + (k0 + tid)*args.nb10))) * scale;
+inline void convrot_rotate_activation(
+        constant ggml_metal_kargs_mul_mat_convrot & args, device const char * activations,
+        device float * rotated, threadgroup float * values, uint3 group, ushort tid) {
+    #pragma clang fp reassociate(off) contract(off)
+    const uint i2 = group.z % args.ne02, i3 = group.z / args.ne02;
+    for (uint i = tid; i < 256; i += 64) values[i] = float(*((device const T *)(activations +
+        (group.x*256+i)*args.nb00 + group.y*args.nb01 + i2*args.nb02 + i3*args.nb03)));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1; stride < 256; stride *= 4) {
+        const uint j = tid/stride*(4*stride) + tid%stride;
+        const float a = values[j], b = values[j+stride], c = values[j+2*stride], d = values[j+3*stride];
+        values[j] = (a+b+c-d)*0.5f;
+        values[j+stride] = (a+b-c+d)*0.5f;
+        values[j+2*stride] = (a-b+c+d)*0.5f;
+        values[j+3*stride] = (-a+b+c+d)*0.5f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const ulong offset = (ulong(group.z)*args.ne01 + group.y)*args.k + group.x*256;
+    for (uint i = tid; i < 256; i += 64) rotated[offset+i] = values[i];
+}
 
+// H256 is symmetric. Rotate each activation once, then perform a tiled I8
+// matrix multiplication, scaling the FP32 result per output row. The temporary
+// activation buffer belongs to the graph allocator, not to model weights.
+inline void convrot_i8mm(
+        constant ggml_metal_kargs_mul_mat_convrot & args, device const char * weights,
+        device const char * scales, device char * dst, device const float * rotated,
+        threadgroup float * shared, uint3 group, ushort tid, ushort sg) {
+    threadgroup float * wa = shared;
+    threadgroup float * xa = shared + 1024;
+    const uint row0 = group.x*32, col0 = group.y*64;
+    const uint i2 = group.z % args.ne02, i3 = group.z / args.ne02;
+    simdgroup_float8x8 sums[4];
+    for (uint c = 0; c < 4; ++c) sums[c] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    for (uint k0 = 0; k0 < args.k; k0 += 32) {
+        for (uint i = tid; i < 1024; i += 256) {
+            const uint row = row0+i/32;
+            wa[i] = row < args.out_features ? float(*((device const int8_t *)(weights +
+                row*args.nb11 + (k0+i%32)*args.nb10))) : 0.0f;
+        }
+        for (uint i = tid; i < 2048; i += 256) {
+            const uint col = col0+i/32;
+            xa[i] = col < args.ne01 ? rotated[(ulong(group.z)*args.ne01+col)*args.k + k0+i%32] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 32; k += 8) {
+            simdgroup_float8x8 ma;
+            simdgroup_load(ma, wa+(sg/2)*8*32+k, 32);
+            for (uint c = 0; c < 4; ++c) {
+                simdgroup_float8x8 mb;
+                simdgroup_load(mb, xa+((sg%2)*32+c*8)*32+k, 32, 0, true);
+                simdgroup_multiply_accumulate(sums[c], ma, mb, sums[c]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint c = 0; c < 4; ++c) simdgroup_store(sums[c], shared+(sg/2)*8*64+(sg%2)*32+c*8, 64);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < 2048; i += 256) {
+        const uint row = row0+i/64, col = col0+i%64;
+        if (row < args.out_features && col < args.ne01) *((device float *)(dst + row*args.nb0 +
+            col*args.nb1+i2*args.nb2+i3*args.nb3)) = shared[i]*(*((device const float *)(scales+row*args.nb20)));
+    }
+}
+
+#define CONVROT_NATIVE_KERNELS(T, suffix) \
+[[host_name("kernel_mul_mat_convrot_rotate_" #suffix)]] \
+kernel void kernel_mul_mat_convrot_rotate_##suffix( \
+        constant ggml_metal_kargs_mul_mat_convrot & args, device const char * activations, \
+        device const char * weights, device const char * scales, device char * dst, device float * rotated, \
+        uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) { \
+    threadgroup float values[256]; \
+    convrot_rotate_activation<T>(args, activations, rotated, values, group, tid); \
+} \
+[[host_name("kernel_mul_mat_convrot_i8mm_" #suffix)]] \
+kernel void kernel_mul_mat_convrot_i8mm_##suffix( \
+        constant ggml_metal_kargs_mul_mat_convrot & args, device const char * activations, \
+        device const char * weights, device const char * scales, device char * dst, device const float * rotated, \
+        uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]], \
+        ushort sg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float shared[3072]; \
+    convrot_i8mm(args, weights, scales, dst, rotated, shared, group, tid, sg); \
+}
+CONVROT_NATIVE_KERNELS(float, f32)
+CONVROT_NATIVE_KERNELS(half, f16)
+#undef CONVROT_NATIVE_KERNELS
+
+// Each threadgroup reuses one reconstructed 16-row weight tile across 16
+// activation columns. The old vector implementation repeated all four H256
+// stages for every output element, which scales poorly for video token batches.
+// Scratch is fixed at 32 KiB; no expanded model weights are retained.
+template <typename T>
+inline void kernel_mul_mat_convrot_mm_impl(
+        constant ggml_metal_kargs_mul_mat_convrot & args,
+        device const char * activations, device const char * weights,
+        device const char * scales, device char * dst,
+        threadgroup float * scratch, uint3 group, ushort tid, ushort sg) {
+    #pragma clang fp reassociate(off) contract(off)
+    threadgroup float * w = scratch;
+    threadgroup float * a = scratch + 4096;
+    const uint row0 = group.x * 16;
+    const uint col0 = group.y * 16;
+    const uint i2 = group.z % args.ne02;
+    const uint i3 = group.z / args.ne02;
+    simdgroup_float8x8 accum = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    for (uint k0 = 0; k0 < args.k; k0 += 256) {
+        for (uint i = tid; i < 4096; i += 128) {
+            const uint row = row0 + i/256;
+            const uint col = col0 + i/256;
+            const uint k = k0 + i%256;
+            w[i] = row < args.out_features
+                ? float(*((device const int8_t *)(weights + row*args.nb11 + k*args.nb10))) *
+                    *((device const float *)(scales + row*args.nb20)) : 0.0f;
+            float x = col < args.ne01 ? float(*((device const T *)(activations +
+                k*args.nb00 + col*args.nb01 + i2*args.nb02 + i3*args.nb03))) : 0.0f;
+            a[i] = args.f16_compat ? float(half(x)) : x;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Each lane owns a disjoint four-element butterfly, allowing an
+        // in-place transform with one barrier per stage instead of ping-pong.
         for (uint stride = 1; stride < 256; stride *= 4) {
-            const uint block = (tid / (4*stride)) * (4*stride);
-            const uint lane = (tid / stride) % 4;
-            const uint offset = tid % stride;
-            const float a = values[block + 0*stride + offset];
-            const float b = values[block + 1*stride + offset];
-            const float c = values[block + 2*stride + offset];
-            const float d = values[block + 3*stride + offset];
-            transformed[tid] = lane == 0 ? ( a + b + c - d)*0.5f :
-                               lane == 1 ? ( a + b - c + d)*0.5f :
-                               lane == 2 ? ( a - b + c + d)*0.5f :
-                                           (-a + b + c + d)*0.5f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            values[tid] = transformed[tid];
+            for (uint i = tid; i < 1024; i += 128) {
+                const uint j = i/64*256 + (i%64)/stride*(4*stride) + i%stride;
+                const float v0 = w[j], v1 = w[j+stride], v2 = w[j+2*stride], v3 = w[j+3*stride];
+                w[j]          = ( v0 + v1 + v2 - v3)*0.5f;
+                w[j+stride]   = ( v0 + v1 - v2 + v3)*0.5f;
+                w[j+2*stride] = ( v0 - v1 + v2 + v3)*0.5f;
+                w[j+3*stride] = (-v0 + v1 + v2 + v3)*0.5f;
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        sum += values[tid] * float(*((device const T *) (activation + (k0 + tid)*args.nb00)));
+        if (args.f16_compat) {
+            for (uint i = tid; i < 4096; i += 128) w[i] = float(half(w[i]));
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (uint k = 0; k < 256; k += 8) {
+            simdgroup_float8x8 ma, mb;
+            simdgroup_load(ma, w + (sg/2)*8*256 + k, 256);
+            simdgroup_load(mb, a + (sg%2)*8*256 + k, 256, 0, true);
+            simdgroup_multiply_accumulate(accum, ma, mb, accum);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
-    // A fixed tree reduction is used here instead of a cross-simdgroup
-    // reduction.  It preserves the kernel's compact-buffer behaviour and is
-    // deterministic across Apple GPU families.
-    values[tid] = sum;
+    simdgroup_store(accum, scratch + (sg/2)*8*16 + (sg%2)*8, 16);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128; stride > 0; stride /= 2) {
-        if (tid < stride) values[tid] += values[tid + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0) {
-        *((device float *) (dst + row*args.nb0 + i1*args.nb1 + i2*args.nb2 + i3*args.nb3)) = values[0];
+    for (uint i = tid; i < 256; i += 128) {
+        const uint row = row0 + i/16, col = col0 + i%16;
+        if (row < args.out_features && col < args.ne01) {
+            float value = scratch[i];
+            if (args.f16_compat) value = float(half(value));
+            *((device float *)(dst + row*args.nb0 + col*args.nb1 + i2*args.nb2 + i3*args.nb3)) = value;
+        }
     }
 }
 
-[[host_name("kernel_mul_mat_convrot_f32")]]
-kernel void kernel_mul_mat_convrot_f32(
+[[host_name("kernel_mul_mat_convrot_mm_f32")]]
+kernel void kernel_mul_mat_convrot_mm_f32(
         constant ggml_metal_kargs_mul_mat_convrot & args,
         device const char * activations, device const char * weights, device const char * scales, device char * dst,
-        uint3 tgpig [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
-        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float values[256];
-    threadgroup float transformed[256];
-    kernel_mul_mat_convrot_impl<float>(args, activations, weights, scales, dst, values, transformed, tgpig, tid, tiisg, sgitg);
+        uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float scratch[8192];
+    kernel_mul_mat_convrot_mm_impl<float>(args, activations, weights, scales, dst, scratch, group, tid, sg);
 }
 
-[[host_name("kernel_mul_mat_convrot_f16")]]
-kernel void kernel_mul_mat_convrot_f16(
+[[host_name("kernel_mul_mat_convrot_mm_f16")]]
+kernel void kernel_mul_mat_convrot_mm_f16(
         constant ggml_metal_kargs_mul_mat_convrot & args,
         device const char * activations, device const char * weights, device const char * scales, device char * dst,
-        uint3 tgpig [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
-        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float values[256];
-    threadgroup float transformed[256];
-    kernel_mul_mat_convrot_impl<half>(args, activations, weights, scales, dst, values, transformed, tgpig, tid, tiisg, sgitg);
+        uint3 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float scratch[8192];
+    kernel_mul_mat_convrot_mm_impl<half>(args, activations, weights, scales, dst, scratch, group, tid, sg);
 }
+
 
 template <typename type4>
 void dequantize_q4_0_t4(device const block_q4_0 * xb, short il, thread type4 & reg) {
