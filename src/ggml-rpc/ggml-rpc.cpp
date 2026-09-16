@@ -1821,7 +1821,12 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // RPC cannot currently query the remote backend's operation capability.
+    // Do not select the compact ConvRot representation unless the remote side
+    // can explicitly advertise it; normal MUL_MAT remains available instead.
+    if (op && op->op == GGML_OP_MUL_MAT_CONVROT) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }

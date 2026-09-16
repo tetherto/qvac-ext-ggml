@@ -314,7 +314,12 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always need to dequant into kvsh; for f16/bf16 we can load
             // directly from global memory when alignment / bounds allow it.
-            const bool stage_k = USE_DECODE_K || KV_bounds_check || d * 16 + 16 > HSK;
+            // A partial final KV tile must not force every interior tile through
+            // shared memory. Keep this decision uniform across the workgroup;
+            // direct F16 coopmat loads require 16-byte row/base alignment.
+            const bool direct_k_tile = j * Bc + Bc <= KV &&
+                (k_stride & 7u) == 0u && (k_offset & 7u) == 0u;
+            const bool stage_k = USE_DECODE_K || (KV_bounds_check && !direct_k_tile) || d * 16 + 16 > HSK;
             if (stage_k) {
                 barrier();
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * MatBr / 4; idx += gl_WorkGroupSize.x) {
@@ -591,10 +596,13 @@ void main() {
             // If not, V is loaded directly from global memory if aligned, otherwise
             // staged through a Bc * MatBr size staging buffer.
             // If V is a quant type, then it is always staged for dequantization.
+            const bool direct_v_tile = j * Bc + Bc <= KV &&
+                (v_stride & 7u) == 0u && (v_offset & 7u) == 0u &&
+                HSV % (MatBc * row_split) == 0u;
+            const bool stage_v = USE_DECODE_V || (KV_bounds_check && !direct_v_tile);
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -632,7 +640,7 @@ void main() {
                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
 
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+                    if (!stage_v) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
