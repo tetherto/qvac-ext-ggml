@@ -67,7 +67,10 @@ bool run_case(ggml_type activation_type, int64_t test_columns, bool f16_compat,
     ggml_context * ctx = ggml_init({ 4 * 1024 * 1024, nullptr, true });
     if (!ctx) return false;
 
-    ggml_tensor * activations = ggml_new_tensor_2d(ctx, activation_type, input_features, columns);
+    // Exercise ConvRot after a GPU producer so CUDA must honor its
+    // programmatic launch dependency before consuming activations.
+    ggml_tensor * activation_input = ggml_new_tensor_2d(ctx, activation_type, input_features, columns);
+    ggml_tensor * activations = ggml_dup(ctx, activation_input);
     ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, input_features, out_features);
     ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_features);
     ggml_tensor * result = ggml_mul_mat_convrot(ctx, activations, weights, scales, kGroupSize);
@@ -174,7 +177,7 @@ bool run_case(ggml_type activation_type, int64_t test_columns, bool f16_compat,
         ggml_free(ctx);
         return false;
     }
-    ggml_backend_tensor_set(activations, activation_type == GGML_TYPE_F32 ? static_cast<const void *>(activation_f32.data()) : static_cast<const void *>(activation_f16.data()), 0, ggml_nbytes(activations));
+    ggml_backend_tensor_set(activation_input, activation_type == GGML_TYPE_F32 ? static_cast<const void *>(activation_f32.data()) : static_cast<const void *>(activation_f16.data()), 0, ggml_nbytes(activation_input));
     ggml_backend_tensor_set(weights, weight_data.data(), 0, ggml_nbytes(weights));
     ggml_backend_tensor_set(scales, scale_data.data(), 0, ggml_nbytes(scales));
     if (second_scales) {
