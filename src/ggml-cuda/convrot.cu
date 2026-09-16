@@ -77,6 +77,11 @@ static bool ggml_cuda_op_mul_mat_convrot_f16_compat(ggml_backend_cuda_context & 
         return false;
     }
 
+    const auto to_f16 = ggml_get_to_fp16_cuda(activations->type);
+    if (to_f16 == nullptr) {
+        return false;
+    }
+
     const int k = int(weights->ne[0]);
     const int n = int(weights->ne[1]);
     const int columns = int(activations->ne[1]);
@@ -89,10 +94,6 @@ static bool ggml_cuda_op_mul_mat_convrot_f16_compat(ggml_backend_cuda_context & 
                             (const int8_t *) weights->data, (const float *) scales->data,
                             reconstructed.get(), k);
 
-    const auto to_f16 = ggml_get_to_fp16_cuda(activations->type);
-    if (to_f16 == nullptr) {
-        return false;
-    }
     to_f16(activations->data, activation_f16.get(), ggml_nelements(activations), ctx.stream());
 
     static const half alpha = 1.0;

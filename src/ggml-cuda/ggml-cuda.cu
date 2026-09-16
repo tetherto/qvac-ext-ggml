@@ -4821,6 +4821,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_MUL_MAT_CONVROT:
+            // The fallback kernel maps columns to Y and flattened batches to
+            // Z. Reject dimensions which cannot be launched so the scheduler
+            // can select another backend rather than hitting cudaErrorInvalidValue.
+            if (op->src[0]->ne[1] > 65535 ||
+                op->src[0]->ne[2] <= 0 || op->src[0]->ne[3] <= 0 ||
+                op->src[0]->ne[2] > 65535 / op->src[0]->ne[3]) {
+                return false;
+            }
+
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 op->src[1]->type == GGML_TYPE_I8 && op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                 ggml_get_op_params_i32(op, 0) == 256 &&

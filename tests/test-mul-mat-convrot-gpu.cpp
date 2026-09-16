@@ -198,6 +198,7 @@ bool run_case(ggml_type activation_type, int64_t test_columns, bool f16_compat,
         for (int iteration = 0; computed && iteration < iterations; ++iteration) {
             computed = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
         }
+        ggml_backend_synchronize(backend);
         const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         std::printf("ConvRot %s %s %s: %.3f ms/run (%d runs, K=%lld N=%lld columns=%lld probe=%d)\n",
                     kBackendName, ggml_type_name(activation_type), f16_compat ? "f16-compat" : "native",
