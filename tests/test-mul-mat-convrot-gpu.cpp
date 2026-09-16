@@ -10,8 +10,18 @@ static constexpr const char * kBackendName = "CUDA";
 static ggml_backend_t convrot_backend_init() { return ggml_backend_vk_init(0); }
 static constexpr const char * kBackendName = "Vulkan";
 #elif defined(GGML_TEST_CONVROT_METAL)
-#include "ggml-metal.h"
-static ggml_backend_t convrot_backend_init() { return ggml_backend_metal_init(); }
+#include <cstring>
+static ggml_backend_t convrot_backend_init() {
+    ggml_backend_load_all();
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "MTL") == 0) {
+            return ggml_backend_dev_init(dev, nullptr);
+        }
+    }
+    return nullptr;
+}
 static constexpr const char * kBackendName = "Metal";
 #else
 #error "Select a ConvRot GPU backend"

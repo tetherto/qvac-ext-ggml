@@ -118,7 +118,9 @@ bool run_case(ggml_type activation_type, bool non_contiguous) {
         }
     }
     for (int64_t row = 0; row < kOutFeatures; ++row) {
-        const float scale = 0.00390625f * (float) (row + 1);
+        // A zero row scale is valid for an all-zero quantized row.  It must
+        // produce a zero contribution rather than aborting the CPU backend.
+        const float scale = row == 1 ? 0.0f : 0.00390625f * (float) (row + 1);
         std::memcpy((char *) scale_data.data() + row * scales->nb[0], &scale, sizeof(scale));
         for (int64_t column = 0; column < kInputFeatures; ++column) {
             const int8_t value = (int8_t) ((column * 17 + row * 31) % 255 - 127);

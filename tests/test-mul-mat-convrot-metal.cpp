@@ -1,7 +1,5 @@
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-metal.h"
-
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -14,6 +12,18 @@
 namespace {
 
 constexpr int64_t kGroupSize = 256;
+
+ggml_backend_t init_metal_backend() {
+    ggml_backend_load_all();
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "MTL") == 0) {
+            return ggml_backend_dev_init(dev, nullptr);
+        }
+    }
+    return nullptr;
+}
 
 void hadamard_4(float * values, size_t stride) {
     const float a = values[0 * stride];
@@ -46,7 +56,7 @@ bool run_case(ggml_type activation_type, int64_t kColumns, bool compat, bool ben
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
 
-    ggml_backend_t backend = ggml_backend_metal_init();
+    ggml_backend_t backend = init_metal_backend();
     if (!backend || !ggml_backend_supports_op(backend, result)) {
         std::fprintf(stderr, "Metal backend does not advertise expected ConvRot support\n");
         if (backend) ggml_backend_free(backend);

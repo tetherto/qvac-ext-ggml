@@ -1574,7 +1574,6 @@ void ggml_compute_forward_mul_mat_convrot(
 
         float scale;
         memcpy(&scale, (const char *) scales->data + row * scales->nb[0], sizeof(scale));
-        GGML_ASSERT(isfinite(scale) && scale > 0.0f);
 
         const char * activation = (const char *) activations->data +
             i1 * activations->nb[1] + i2 * activations->nb[2] + i3 * activations->nb[3];
