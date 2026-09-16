@@ -11662,8 +11662,9 @@ static void ggml_vk_convrot_convert(ggml_backend_vk_context * ctx, vk_context& s
 }
 
 static void ggml_vk_convrot_k_tiled(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    constexpr uint32_t tile_k = 512;
     const ggml_tensor * a = dst->src[0], * w = dst->src[1];
+    // F16 needs the validated 512-K accumulation bound; F32 benefits from 1024-K tiles.
+    const uint32_t tile_k = a->type == GGML_TYPE_F32 ? 1024 : 512;
     const uint64_t columns = ggml_nrows(a);
     const uint64_t tile_columns = std::min<uint64_t>(1024, columns);
     ctx->prealloc_size_convrot_tile_a = std::max(ctx->prealloc_size_convrot_tile_a, size_t(tile_columns * tile_k * sizeof(ggml_fp16_t)));
