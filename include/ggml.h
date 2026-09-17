@@ -449,8 +449,13 @@ extern "C" {
 
     // op hint
     enum ggml_op_hint {
-        GGML_HINT_NONE             = 0,
-        GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_NONE                = 0,
+        GGML_HINT_SRC0_IS_HADAMARD    = 1,
+        // src0 is the dense, normalized ComfyUI "regular" Hadamard H256
+        // matrix. Backends may replace the 256x256 matmul with the native
+        // radix-4 transform; backends that do not recognize this hint execute
+        // the ordinary MUL_MAT against src0.
+        GGML_HINT_SRC0_IS_CONVROT_H256 = 2,
     };
 
     // model file types
