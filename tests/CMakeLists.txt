@@ -6,6 +6,17 @@ endif()
 
 add_test(NAME test-mul-mat-convrot COMMAND test-mul-mat-convrot)
 
+add_executable(test-mul-mat-convrot-h256-hint test-mul-mat-convrot-h256-hint.cpp)
+target_link_libraries(test-mul-mat-convrot-h256-hint PRIVATE ggml ggml-cpu)
+add_test(NAME test-mul-mat-convrot-h256-hint COMMAND test-mul-mat-convrot-h256-hint)
+
+if (TARGET ggml-cuda)
+    add_executable(test-mul-mat-convrot-h256-hint-cuda test-mul-mat-convrot-h256-hint.cpp)
+    target_compile_definitions(test-mul-mat-convrot-h256-hint-cuda PRIVATE GGML_TEST_CONVROT_H256_CUDA)
+    target_link_libraries(test-mul-mat-convrot-h256-hint-cuda PRIVATE ggml ggml-cuda)
+    add_test(NAME test-mul-mat-convrot-h256-hint-cuda COMMAND test-mul-mat-convrot-h256-hint-cuda)
+endif()
+
 if (TARGET ggml-metal)
     add_executable(test-mul-mat-convrot-metal test-mul-mat-convrot-metal.cpp)
     target_link_libraries(test-mul-mat-convrot-metal PRIVATE ggml)
