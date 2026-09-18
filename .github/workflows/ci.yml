@@ -4,7 +4,10 @@ on:
   push:
     branches: [ master ]
   pull_request:
-    branches: [ master ]
+    # `feature*` does not match `feature/foo` (`*` stops at `/`).
+    branches:
+      - master
+      - 'feature/**'
 
 # Dedupe per PR: a re-push supersedes the in-flight run.
 #
