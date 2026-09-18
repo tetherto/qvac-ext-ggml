@@ -1027,6 +1027,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_fwht_f32[4];
     vk_pipeline pipeline_mul_mat_convrot_f32;
     vk_pipeline pipeline_mul_mat_convrot_f16;
+    vk_pipeline pipeline_convrot_f32;
     vk_pipeline pipeline_convrot_reconstruct_f32, pipeline_convrot_reconstruct_f16;
     vk_pipeline pipeline_convrot_convert_f32_f16, pipeline_convrot_convert_f16_f32, pipeline_convrot_round_f16;
     vk_pipeline pipeline_rope_flux_f32;
@@ -1366,6 +1367,24 @@ struct vk_op_mul_mat_convrot_push_constants {
     uint32_t w_offset;
     uint32_t s_offset;
     uint32_t d_offset;
+};
+
+struct vk_op_convrot_push_constants {
+    uint32_t group_size;
+    uint32_t groups_per_row;
+    uint32_t ne01;
+    uint32_t ne02;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t nb0;
+    uint32_t nb1;
+    uint32_t nb2;
+    uint32_t nb3;
+    uint32_t src_offset;
+    uint32_t dst_offset;
+    uint32_t total_groups;
 };
 
 struct vk_op_count_experts_push_constants {
@@ -6681,6 +6700,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Each workgroup produces one output row; the 256 local invocations process its ConvRot tile.
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_convrot_f32, "mul_mat_convrot_f32", mul_mat_convrot_f32_len, mul_mat_convrot_f32_data, "main", 4, sizeof(vk_op_mul_mat_convrot_push_constants), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_convrot_f16, "mul_mat_convrot_f16", mul_mat_convrot_f16_len, mul_mat_convrot_f16_data, "main", 4, sizeof(vk_op_mul_mat_convrot_push_constants), { 1, 1, 1 }, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_convrot_f32, "convrot_f32", convrot_f32_len, convrot_f32_data, "main", 2, sizeof(vk_op_convrot_push_constants), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_convrot_reconstruct_f32, "convrot_reconstruct_f32", convrot_reconstruct_f32_len, convrot_reconstruct_f32_data, "main", 3, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_convrot_reconstruct_f16, "convrot_reconstruct_f16", convrot_reconstruct_f16_len, convrot_reconstruct_f16_data, "main", 3, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_convrot_convert_f32_f16, "convrot_convert_f32_f16", convrot_convert_f32_f16_len, convrot_convert_f32_f16_data, "main", 2, 3 * sizeof(uint32_t), { 1, 1, 1 }, {}, 1);
@@ -11945,6 +11965,38 @@ static void ggml_vk_mul_mat_convrot(ggml_backend_vk_context * ctx, vk_context& s
         { ggml_vk_tensor_subbuffer(ctx, a, true), ggml_vk_tensor_subbuffer(ctx, w, true),
           ggml_vk_tensor_subbuffer(ctx, s, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc,
         { (uint32_t) w->ne[1], (uint32_t) a->ne[1], (uint32_t) (a->ne[2] * a->ne[3]) });
+}
+
+static void ggml_vk_convrot(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    const uint32_t group_size = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    const uint32_t total_groups = (uint32_t) (ggml_nelements(src) / group_size);
+    const uint32_t max_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    const uint32_t groups_x = std::min(total_groups, max_x);
+
+    const vk_op_convrot_push_constants pc = {
+        group_size,
+        (uint32_t) (src->ne[0] / group_size),
+        (uint32_t) src->ne[1],
+        (uint32_t) src->ne[2],
+        (uint32_t) (src->nb[0] / sizeof(float)),
+        (uint32_t) (src->nb[1] / sizeof(float)),
+        (uint32_t) (src->nb[2] / sizeof(float)),
+        (uint32_t) (src->nb[3] / sizeof(float)),
+        (uint32_t) (dst->nb[0] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[2] / sizeof(float)),
+        (uint32_t) (dst->nb[3] / sizeof(float)),
+        (uint32_t) (get_misalign_bytes(ctx, src) / sizeof(float)),
+        (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(float)),
+        total_groups,
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_convrot_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, src, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { groups_x, CEIL_DIV(total_groups, groups_x), 1 });
 }
 
 static bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -18370,6 +18422,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_mul_mat_convrot(ctx, compute_ctx, node);
 
         break;
+    case GGML_OP_CONVROT:
+        ggml_vk_convrot(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_MUL_MAT_ID:
         ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
 
@@ -20852,6 +20908,34 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 op->src[2]->ne[0] == op->src[1]->ne[1] && op->src[2]->ne[1] == 1 && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
                 op->ne[0] == op->src[1]->ne[1] && op->ne[1] == op->src[0]->ne[1] && op->ne[2] == op->src[0]->ne[2] && op->ne[3] == op->src[0]->ne[3] &&
                 ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
+        case GGML_OP_CONVROT: {
+            const ggml_tensor * src = op->src[0];
+            const int32_t group_size = ggml_get_op_params_i32(op, 0);
+            if (src == nullptr || src->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                !ggml_convrot_group_size_is_valid(group_size) || src->ne[0] % group_size != 0 ||
+                !ggml_are_same_shape(src, op) || (uint64_t) ggml_nelements(src) / group_size > UINT32_MAX) {
+                return false;
+            }
+            const uint64_t total_groups = (uint64_t) ggml_nelements(src) / group_size;
+            if (total_groups > (uint64_t) device->properties.limits.maxComputeWorkGroupCount[0] *
+                               device->properties.limits.maxComputeWorkGroupCount[1]) {
+                return false;
+            }
+            const uint64_t alignment = device->properties.limits.minStorageBufferOffsetAlignment;
+            for (const ggml_tensor * tensor : { src, op }) {
+                if (((vk_tensor_offset(tensor) + tensor->view_offs) & 3) != 0 ||
+                    ggml_nbytes(tensor) > device->properties.limits.maxStorageBufferRange - (alignment - 1)) {
+                    return false;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    if (tensor->ne[i] <= 0 || tensor->ne[i] > UINT32_MAX ||
+                        tensor->nb[i] % sizeof(float) != 0 || tensor->nb[i] / sizeof(float) > UINT32_MAX) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -22181,6 +22265,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (tensor->op == GGML_OP_MUL_MAT_CONVROT) {
             tensor_clone = ggml_mul_mat_convrot(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], ggml_get_op_params_i32(tensor, 0));
             ggml_mul_mat_convrot_set_f16_compat(tensor_clone, ggml_get_op_params_i32(tensor, 1) != 0);
+        } else if (tensor->op == GGML_OP_CONVROT) {
+            tensor_clone = ggml_convrot(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID_BACK_A) {

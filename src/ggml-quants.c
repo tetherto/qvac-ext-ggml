@@ -6330,3 +6330,32 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+// ConvRot: repack I8 + per-row F32 scale into Q8_0 rows without requantizing
+
+size_t ggml_convrot_repack_q8_0(
+        const int8_t * weights,
+        const float  * scales,
+        int64_t        in_features,
+        int64_t        out_features,
+        void         * dst) {
+    GGML_ASSERT(in_features > 0 && in_features % QK8_0 == 0);
+    GGML_ASSERT(out_features >= 0);
+
+    const int64_t nb = in_features / QK8_0;
+    const size_t  row_size = (size_t) nb * sizeof(block_q8_0);
+
+    if (dst) {
+        block_q8_0 * y = (block_q8_0 *) dst;
+        for (int64_t r = 0; r < out_features; ++r) {
+            const ggml_fp16_t d = GGML_FP32_TO_FP16(scales[r]);
+            const int8_t * w = weights + r*in_features;
+            for (int64_t b = 0; b < nb; ++b) {
+                y[r*nb + b].d = d;
+                memcpy(y[r*nb + b].qs, w + b*QK8_0, QK8_0);
+            }
+        }
+    }
+
+    return row_size * (size_t) out_features;
+}

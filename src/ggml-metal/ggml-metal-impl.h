@@ -617,6 +617,23 @@ typedef struct {
     uint64_t nb3;
 } ggml_metal_kargs_mul_mat_convrot;
 
+// ConvRot rotation of F32 activations, one group_size-wide block per threadgroup.
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    int32_t  group_size;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_convrot;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

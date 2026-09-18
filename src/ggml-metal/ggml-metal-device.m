@@ -1619,6 +1619,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     && op->src[0]->ne[1] <= max_dispatch_dim && op->src[1]->ne[1] <= max_dispatch_dim
                     && op->src[0]->ne[2] * op->src[0]->ne[3] <= max_grid_id
                 : false;
+        case GGML_OP_CONVROT:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_convrot_group_size_is_valid(ggml_get_op_params_i32(op, 0)) &&
+                op->src[0]->ne[0] > 0 && op->src[0]->ne[0] % ggml_get_op_params_i32(op, 0) == 0 &&
+                op->src[0]->ne[0]/ggml_get_op_params_i32(op, 0) <= max_dispatch_dim &&
+                op->src[0]->ne[1] <= max_dispatch_dim &&
+                op->src[0]->ne[2]*op->src[0]->ne[3] <= max_grid_id;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
