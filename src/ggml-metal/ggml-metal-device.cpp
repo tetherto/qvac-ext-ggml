@@ -1029,6 +1029,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mat_convrot(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_convrot(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+
+    const char * name = "kernel_convrot_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
     char base[256];
     char name[256];

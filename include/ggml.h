@@ -616,6 +616,7 @@ extern "C" {
         GGML_OP_GLU,
         GGML_OP_ROPE_FLUX,
         GGML_OP_MUL_MAT_CONVROT,
+        GGML_OP_CONVROT,
 
         GGML_OP_COUNT,
     };
@@ -1521,6 +1522,61 @@ extern "C" {
     GGML_API void ggml_mul_mat_convrot_set_f16_compat(
             struct ggml_tensor * a,
             bool                 enabled);
+
+    // ConvRot rotation.
+    //
+    // Applies the normalized regular 4-way Hadamard stages (the ConvRot
+    // transform) to every group_size-wide block along dimension 0 of a.
+    // a must be F32 and a->ne[0] a multiple of group_size; group_size must be a
+    // power of four in [4, 1024] (the ComfyUI TensorWise I8 format uses 256).
+    //
+    // The transform is symmetric and orthogonal, so rotating the activations
+    // is equivalent to rotating the weights: (H*w) . x == w . (H*x).  This lets a
+    // ConvRot linear layer run on the regular quantized ggml_mul_mat kernels
+    // once the I8 weights have been repacked with ggml_convrot_repack_q8_0().
+    GGML_API struct ggml_tensor * ggml_convrot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int32_t               group_size);
+
+    GGML_API struct ggml_tensor * ggml_convrot_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int32_t               group_size);
+
+    // true for a power of four in [4, 1024]
+    GGML_API bool ggml_convrot_group_size_is_valid(int32_t group_size);
+
+    // ConvRot linear layer on top of the standard matmul kernels:
+    //
+    //   result = ggml_mul_mat(weights, ggml_convrot(activations, group_size))
+    //
+    // weights     : [in_features, out_features], any type ggml_mul_mat accepts;
+    //               typically Q8_0 produced by ggml_convrot_repack_q8_0()
+    // activations : F32 [in_features, batch, ...]
+    // result      : F32 [out_features, batch, ...]
+    GGML_API struct ggml_tensor * ggml_convrot_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * activations,
+            int32_t               group_size);
+
+    // Repack tensor-wise I8 ConvRot weights into Q8_0 rows for ggml_mul_mat.
+    //
+    // weights is [in_features, out_features] I8 (in_features contiguous per
+    // output row) and scales holds one F32 scale per output row.  No
+    // requantization happens: the int8 values are copied verbatim and the row
+    // scale becomes the F16 scale of every 32-wide Q8_0 block in that row (the
+    // only rounding).  dst must hold at least
+    // ggml_row_size(GGML_TYPE_Q8_0, in_features) * out_features bytes; that
+    // size is returned (pass dst == NULL to query it).  in_features must be a
+    // multiple of 32.
+    GGML_API size_t ggml_convrot_repack_q8_0(
+            const int8_t * weights,
+            const float  * scales,
+            int64_t        in_features,
+            int64_t        out_features,
+            void         * dst);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

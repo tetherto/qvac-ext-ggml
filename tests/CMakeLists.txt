@@ -6,6 +6,17 @@ endif()
 
 add_test(NAME test-mul-mat-convrot COMMAND test-mul-mat-convrot)
 
+# ConvRot via rotation op + standard quantized matmul; runs on every registered backend
+add_executable(test-convrot test-convrot.cpp)
+target_link_libraries(test-convrot PRIVATE ggml)
+if (NOT GGML_BACKEND_DL)
+    target_link_libraries(test-convrot PRIVATE ggml-cpu)
+    if (TARGET ggml-metal)
+        target_link_libraries(test-convrot PRIVATE ggml-metal)
+    endif()
+endif()
+add_test(NAME test-convrot COMMAND test-convrot)
+
 add_executable(test-mul-mat-convrot-h256-hint test-mul-mat-convrot-h256-hint.cpp)
 target_link_libraries(test-mul-mat-convrot-h256-hint PRIVATE ggml ggml-cpu)
 add_test(NAME test-mul-mat-convrot-h256-hint COMMAND test-mul-mat-convrot-h256-hint)

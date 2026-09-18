@@ -13455,3 +13455,69 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_convrot
+
+// in-place normalized regular 4-way Hadamard over one block of n values (n a power of four)
+static void ggml_convrot_block_f32(float * v, int n) {
+    for (int stride = 1; stride < n; stride *= 4) {
+        for (int base = 0; base < n; base += 4*stride) {
+            for (int i = 0; i < stride; ++i) {
+                float * p = v + base + i;
+                const float a = p[0*stride];
+                const float b = p[1*stride];
+                const float c = p[2*stride];
+                const float d = p[3*stride];
+                p[0*stride] = ( a + b + c - d)*0.5f;
+                p[1*stride] = ( a + b - c + d)*0.5f;
+                p[2*stride] = ( a - b + c + d)*0.5f;
+                p[3*stride] = (-a + b + c + d)*0.5f;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_convrot(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    const int32_t group_size = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(ggml_convrot_group_size_is_valid(group_size));
+    GGML_ASSERT(src0->ne[0] % group_size == 0);
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr = ggml_nrows(src0);
+    const int64_t dr = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    // each block is staged here before it is written back, so dst may alias src0
+    float block[1024];
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(ne02*ne01);
+        const int64_t i2 = (ir - i3*ne02*ne01)/ne01;
+        const int64_t i1 = ir - i3*ne02*ne01 - i2*ne01;
+
+        const char * src_row = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
+              char * dst_row = (      char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3;
+
+        for (int64_t k0 = 0; k0 < ne00; k0 += group_size) {
+            for (int i = 0; i < group_size; ++i) {
+                block[i] = *(const float *) (src_row + (k0 + i)*nb00);
+            }
+            ggml_convrot_block_f32(block, group_size);
+            for (int i = 0; i < group_size; ++i) {
+                *(float *) (dst_row + (k0 + i)*nb0) = block[i];
+            }
+        }
+    }
+}
