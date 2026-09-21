@@ -237,7 +237,7 @@ jobs:
         id: ggml-ci
         run: |
           nvidia-smi
-          GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
+          GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   ggml-ci-x64-nvidia-vulkan-cm:
     needs: [runner_names, authorize]
@@ -252,7 +252,7 @@ jobs:
         id: ggml-ci
         run: |
           vulkaninfo --summary
-          GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
+          GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   ggml-ci-x64-nvidia-vulkan-cm2:
     needs: [runner_names, authorize]
@@ -269,7 +269,7 @@ jobs:
         id: ggml-ci
         run: |
           vulkaninfo --summary
-          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
+          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   # TODO: provision AMX-compatible machine
   #ggml-ci-x64-cpu-amx:
@@ -285,7 +285,7 @@ jobs:
   #    - name: Test
   #      id: ggml-ci
   #      run: |
-  #        bash ./ci/run.sh ~/results/ggml /mnt/ggml
+  #        bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   ggml-ci-mac-metal:
     needs: [runner_names, authorize]
