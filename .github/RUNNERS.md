@@ -17,9 +17,13 @@ A catalog value is one of:
 
 - a **scalar** label (`ubuntu-22.04`) — consumed as
   `runs-on: ${{ needs.runner_names.outputs.<key> }}`
-- a **composite label set** (`[self-hosted, Linux, X64, NVIDIA]`) — exported as a
+- a **composite label set** (`[self-hosted, macOS, ARM64]`) — exported as a
   JSON array string and consumed as
   `runs-on: ${{ fromJSON(needs.runner_names.outputs.<key>) }}`
+
+`fromJSON` is required for the array form and wrong for the scalar form — it
+raises on a bare label and the job errors before its first step. Check the
+catalog for the shape of the key you are wiring.
 
 Rolling `-latest` aliases (`ubuntu-latest`, `macos-latest`, `windows-latest`)
 are intentionally left hardcoded — they are GitHub aliases, not fleet labels.
@@ -33,9 +37,14 @@ jobs:
       contents: read
     uses: ./.github/workflows/reusable-runner-names.yml
 
-  my-gpu-job:
+  my-gpu-job:            # scalar key - no fromJSON
     needs: runner_names
-    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
+    runs-on: ${{ needs.runner_names.outputs.selfhosted_linux_x64_nvidia }}
+    steps: ...
+
+  my-mac-job:            # composite key - fromJSON
+    needs: runner_names
+    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps: ...
 ```
 
