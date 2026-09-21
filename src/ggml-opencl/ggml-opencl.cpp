@@ -836,7 +836,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_soft_max, kernel_soft_max_4;
     cl_kernel kernel_soft_max_f16, kernel_soft_max_4_f16;
     ggml_opencl_fa_kernels fa;
-    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_bf16, kernel_get_rows_q4_0, kernel_get_rows_q8_0;
+    cl_kernel kernel_get_rows_f32, kernel_get_rows_f16, kernel_get_rows_q4_0, kernel_get_rows_q8_0;
     cl_kernel kernel_set_rows_f32_i64, kernel_set_rows_f32_i32, kernel_set_rows_f16_i64, kernel_set_rows_f16_i32;
     cl_kernel kernel_set_rows_q8_0_i64, kernel_set_rows_q8_0_i32;
     cl_kernel kernel_set_rows_q8_0_soa_i64, kernel_set_rows_q8_0_soa_i32;
@@ -1728,7 +1728,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_get_rows_f32  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_f16  = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_f16", &err), err));
-        CL_CHECK((backend_ctx->kernel_get_rows_bf16 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_bf16", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_q4_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q4_0", &err), err));
         CL_CHECK((backend_ctx->kernel_get_rows_q8_0 = clCreateKernel(backend_ctx->program_get_rows, "kernel_get_rows_q8_0", &err), err));
         GGML_LOG_CONT(".");
@@ -12038,10 +12037,8 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
             kernel = backend_ctx->kernel_get_rows_f32;
             break;
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16: // stored as f16 on device
             kernel = backend_ctx->kernel_get_rows_f16;
-            break;
-        case GGML_TYPE_BF16:
-            kernel = backend_ctx->kernel_get_rows_bf16;
             break;
         case GGML_TYPE_Q4_0:
             kernel = backend_ctx->kernel_get_rows_q4_0;
