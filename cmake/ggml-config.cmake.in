@@ -6,6 +6,7 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
 if (NOT GGML_SHARED_LIB)
+    set(GGML_BASE_INTERFACE_LINK_LIBRARIES "")
     set(GGML_CPU_INTERFACE_LINK_LIBRARIES "")
     set(GGML_CPU_INTERFACE_LINK_OPTIONS   "")
 
@@ -20,7 +21,15 @@ if (NOT GGML_SHARED_LIB)
 
     if (GGML_OPENMP_ENABLED)
         find_dependency(OpenMP)
-        list(APPEND GGML_CPU_INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+        set(GGML_OPENMP_INTERFACE_LINK_LIBRARIES "")
+        if (TARGET OpenMP::OpenMP_C)
+            list(APPEND GGML_OPENMP_INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_C)
+        endif()
+        if (TARGET OpenMP::OpenMP_CXX)
+            list(APPEND GGML_OPENMP_INTERFACE_LINK_LIBRARIES OpenMP::OpenMP_CXX)
+        endif()
+        list(APPEND GGML_BASE_INTERFACE_LINK_LIBRARIES ${GGML_OPENMP_INTERFACE_LINK_LIBRARIES})
+        list(APPEND GGML_CPU_INTERFACE_LINK_LIBRARIES ${GGML_OPENMP_INTERFACE_LINK_LIBRARIES})
     endif()
 
     if (GGML_CPU_HBM)
@@ -104,6 +113,7 @@ set_and_check(GGML_LIB_DIR "@PACKAGE_GGML_LIB_INSTALL_DIR@")
 if(NOT TARGET ggml::ggml)
     find_package(Threads REQUIRED)
 
+    unset(GGML_LIBRARY CACHE)
     find_library(GGML_LIBRARY NAMES "${GGML_LIB_OUTPUT_PREFIX}ggml" ggml
         REQUIRED
         HINTS ${GGML_LIB_DIR}
@@ -115,6 +125,7 @@ if(NOT TARGET ggml::ggml)
             IMPORTED_LOCATION "${GGML_LIBRARY}"
             INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}")
 
+    unset(GGML_BASE_LIBRARY CACHE)
     find_library(GGML_BASE_LIBRARY NAMES "${GGML_LIB_OUTPUT_PREFIX}ggml-base" ggml-base
         REQUIRED
         HINTS ${GGML_LIB_DIR}
@@ -124,7 +135,9 @@ if(NOT TARGET ggml::ggml)
     set_property(TARGET ggml::ggml-base PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}")
     set_target_properties(ggml::ggml-base
         PROPERTIES
-            IMPORTED_LOCATION "${GGML_BASE_LIBRARY}")
+            IMPORTED_LOCATION "${GGML_BASE_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
+            INTERFACE_LINK_LIBRARIES "${GGML_BASE_INTERFACE_LINK_LIBRARIES}")
 
     if(GGML_MAX_NAME)
         set_property(TARGET ggml::ggml-base APPEND PROPERTY
@@ -143,6 +156,7 @@ if(NOT TARGET ggml::ggml)
             string(REPLACE "-" "_" _ggml_backend_pfx "${_ggml_backend}")
             string(TOUPPER "${_ggml_backend_pfx}" _ggml_backend_pfx)
 
+            unset(${_ggml_backend_pfx}_LIBRARY CACHE)
             find_library(${_ggml_backend_pfx}_LIBRARY
                 NAMES "${GGML_LIB_OUTPUT_PREFIX}${_ggml_backend}" "${_ggml_backend}"
                 REQUIRED

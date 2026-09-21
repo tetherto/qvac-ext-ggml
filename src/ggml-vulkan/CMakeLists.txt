@@ -9,6 +9,11 @@ endif()
 find_package(Vulkan COMPONENTS glslc REQUIRED)
 find_package(SPIRV-Headers QUIET)
 
+if (DEFINED ENV{VULKAN_SDK})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
+endif()
+find_package(SPIRV-Headers CONFIG REQUIRED)
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
     add_definitions(/MP)
@@ -76,6 +81,12 @@ if (Vulkan_FOUND)
     )
 
     test_shader_extension_support(
+        "GL_NV_cooperative_matrix_decode_vector"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2_decode_vector.comp"
+        "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT"
+    )
+
+    test_shader_extension_support(
         "GL_EXT_integer_dot_product"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
         "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
@@ -85,6 +96,18 @@ if (Vulkan_FOUND)
         "GL_EXT_bfloat16"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/bfloat16.comp"
         "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
+    )
+
+    test_shader_extension_support(
+        "GL_EXT_float_e2m1"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/float_e2m1.comp"
+        "GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT"
+    )
+
+    test_shader_extension_support(
+        "GL_EXT_float_e4m3"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/float_e4m3.comp"
+        "GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT"
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
@@ -105,6 +128,9 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_CHECK_RESULTS)
         add_compile_definitions(GGML_VULKAN_CHECK_RESULTS)
+        # the result-checking path computes a CPU reference graph via
+        # ggml_graph_compute_with_ctx(), which is defined in ggml-cpu
+        target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
     endif()
 
     if (GGML_VULKAN_DEBUG)
@@ -126,6 +152,8 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_RUN_TESTS)
         add_compile_definitions(GGML_VULKAN_RUN_TESTS)
+        # the test path also calls ggml_graph_compute_with_ctx() (ggml-cpu)
+        target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
     endif()
 
     # Set up toolchain for host compilation whether cross-compiling or not
@@ -183,6 +211,11 @@ if (Vulkan_FOUND)
 
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
 
+    set(_ggml_vk_genshaders_strip_args)
+    if (GGML_VULKAN_STRIP_SHADER_PAYLOADS)
+        list(APPEND _ggml_vk_genshaders_strip_args --strip-payloads)
+    endif()
+
     # Because external projects do not provide source-level tracking,
     # the vulkan-shaders-gen sources need to be explicitly added to
     # ensure that changes will cascade into shader re-generation.
@@ -196,6 +229,7 @@ if (Vulkan_FOUND)
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            ${_ggml_vk_genshaders_strip_args}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
         COMMENT "Generate vulkan shaders header"
@@ -215,6 +249,7 @@ if (Vulkan_FOUND)
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
+                ${_ggml_vk_genshaders_strip_args}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
                     vulkan-shaders-gen

@@ -9,9 +9,9 @@ layout (push_constant) uniform parameter
 {
     uint T_out;
     uint OC;
-    uint K;
-    uint T_in;
     uint K_OC;   // K*OC == src ne0
+    uint T_in;
+    uint K;
     int  s0;     // stride
     int  p0;     // padding cropped from both sides
 } p;

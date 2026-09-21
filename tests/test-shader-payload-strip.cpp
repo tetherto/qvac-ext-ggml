@@ -26,6 +26,22 @@ static void expect_strip_names(const char * const * names, int count) {
     }
 }
 
+static void expect_gate(const char * name, bool strip_enabled, bool expected) {
+    const bool got = should_strip_shader_payload(name, strip_enabled);
+    if (got != expected) {
+        std::printf("FAIL: \"%s\" enabled=%d strip=%d (expected %d)\n", name, strip_enabled ? 1 : 0, got ? 1 : 0, expected ? 1 : 0);
+        g_failures++;
+        return;
+    }
+    std::printf("ok:   \"%s\" enabled=%d strip=%d\n", name, strip_enabled ? 1 : 0, got ? 1 : 0);
+}
+
+static void expect_gate_names(const char * const * names, int count, bool strip_enabled, bool expected) {
+    for (int i = 0; i < count; ++i) {
+        expect_gate(names[i], strip_enabled, expected);
+    }
+}
+
 int main() {
     const char * const keep[] = {
         "matmul_q8_0_f32",
@@ -59,6 +75,10 @@ int main() {
 
     expect_keep_names(keep, static_cast<int>(sizeof(keep) / sizeof(keep[0])));
     expect_strip_names(strip, static_cast<int>(sizeof(strip) / sizeof(strip[0])));
+
+    expect_gate_names(strip, static_cast<int>(sizeof(strip) / sizeof(strip[0])), false, false);
+    expect_gate_names(strip, static_cast<int>(sizeof(strip) / sizeof(strip[0])), true, true);
+    expect_gate_names(keep, static_cast<int>(sizeof(keep) / sizeof(keep[0])), true, false);
 
     if (g_failures != 0) {
         std::printf("%d failure(s)\n", g_failures);

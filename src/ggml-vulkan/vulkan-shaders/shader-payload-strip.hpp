@@ -36,3 +36,7 @@ inline bool shader_name_contains_any_listed_token(const std::string & name) {
 inline bool should_strip_shader_payload(const std::string & name) {
     return shader_name_contains_any_listed_token(name);
 }
+
+inline bool should_strip_shader_payload(const std::string & name, bool strip_enabled) {
+    return strip_enabled && should_strip_shader_payload(name);
+}

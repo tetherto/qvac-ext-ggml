@@ -5,33 +5,46 @@ struct conv_transpose_1d_tap_range {
     int last_inclusive;
 };
 
+// Input positions that can contribute to the padded output position `span`:
+// i*s0 + k*d0 == span for some kernel tap k in [0, kernel_size).
 static __device__ __forceinline__ conv_transpose_1d_tap_range conv_transpose_1d_taps(
-        const int out_pos, const int kernel_size, const int s0, const int input_size) {
-    const int first          = out_pos >= kernel_size ? (out_pos - kernel_size) / s0 + 1 : 0;
-    const int last_inclusive = min(out_pos / s0, input_size - 1);
+        const int span, const int d0, const int kernel_size, const int s0, const int input_size) {
+    const int reach          = (kernel_size - 1) * d0;
+    const int first          = span > reach ? (span - reach + s0 - 1) / s0 : 0;
+    const int last_inclusive = span < 0 ? -1 : min(span / s0, input_size - 1);
     return { first, last_inclusive };
 }
 
 static __device__ __forceinline__ float conv_transpose_1d_accumulate_taps(
-        const float * kernel_channel, const float * input_channel, const int out_pos,
-        const int s0, const conv_transpose_1d_tap_range taps, float accumulator) {
+        const float * kernel_channel, const float * input_channel, const int span,
+        const int s0, const int d0, const conv_transpose_1d_tap_range taps, float accumulator) {
+    if (d0 == 1) {
+        for (int i = taps.first; i <= taps.last_inclusive; i++) {
+            accumulator += kernel_channel[span - i*s0] * input_channel[i];
+        }
+        return accumulator;
+    }
     for (int i = taps.first; i <= taps.last_inclusive; i++) {
-        accumulator += kernel_channel[out_pos - i*s0] * input_channel[i];
+        const int numer = span - i*s0;
+        if (numer % d0 != 0) {
+            continue;
+        }
+        accumulator += kernel_channel[numer / d0] * input_channel[i];
     }
     return accumulator;
 }
 
 static __device__ __forceinline__ float conv_transpose_1d_accumulate_channels(
-        const float * src0, const float * src1, const int channels, const int out_index,
-        const int out_pos, const int s0, const int kernel_size, const int kernel_channel_stride,
+        const float * src0, const float * src1, const int channels, const int out_ch,
+        const int span, const int s0, const int d0, const int kernel_size, const int kernel_channel_stride,
         const int input_channel_stride, const conv_transpose_1d_tap_range taps,
         float accumulator) {
     for (int c = 0; c < channels; c++) {
-        const float * kernel_channel = src0 + kernel_channel_stride * c + out_index * kernel_size;
+        const float * kernel_channel = src0 + kernel_channel_stride * c + out_ch * kernel_size;
         const float * input_channel  = src1 + input_channel_stride * c;
 
         accumulator = conv_transpose_1d_accumulate_taps(
-            kernel_channel, input_channel, out_pos, s0, taps, accumulator);
+            kernel_channel, input_channel, span, s0, d0, taps, accumulator);
     }
     return accumulator;
 }
@@ -47,16 +60,18 @@ static  __global__ void conv_transpose_1d_kernel(
         return;
     }
 
-    int out_index = global_index / dst_ne0;
-    int idx       = global_index % dst_ne0;
+    int out_t = global_index % dst_ne0;
+    int out_ch = (global_index / dst_ne0) % dst_ne1;
+    int plane = global_index / (dst_ne0 * dst_ne1);
 
+    const int span = out_t + p0;
     const conv_transpose_1d_tap_range taps =
-        conv_transpose_1d_taps(idx, src0_ne0, s0, src1_ne0);
+        conv_transpose_1d_taps(span, d0, src0_ne0, s0, src1_ne0);
 
     dst[global_index] = conv_transpose_1d_accumulate_channels(
-        src0, src1, src0_ne2, out_index, idx, s0, src0_ne0,
+        src0, src1 + src1_ne0 * src1_ne1 * plane, src0_ne2, out_ch, span, s0, d0, src0_ne0,
         src0_ne0 * src0_ne1, src1_ne0, taps, /*accumulator=*/0.0f);
-    GGML_UNUSED_VARS(p0, d0, src0_ne3, src1_ne3, dst_ne3, src1_ne1, dst_ne1, src1_ne2, dst_ne2);
+    GGML_UNUSED_VARS(src0_ne3, src1_ne2, src1_ne3, dst_ne2, dst_ne3);
 }
 
 static void conv_transpose_1d_f32_f32_cuda(
