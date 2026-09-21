@@ -14,7 +14,7 @@ on:
         description: "Ubuntu 22.04 hosted arm64"
         value: ${{ jobs.export.outputs.ubuntu_2204_arm }}
       selfhosted_linux_x64_nvidia:
-        description: "Linux x64 NVIDIA GPU, Vulkan coopmat2 capable"
+        description: "Linux x64 NVIDIA GPU, coopmat2 capable"
         value: ${{ jobs.export.outputs.selfhosted_linux_x64_nvidia }}
       selfhosted_macos_arm64:
         description: "Apple Silicon (Metal/Vulkan)"

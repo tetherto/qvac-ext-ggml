@@ -19,17 +19,9 @@
 ubuntu_2204: ubuntu-22.04 # Ubuntu 22.04 hosted x64
 ubuntu_2204_arm: ubuntu-22.04-arm # Ubuntu 22.04 hosted arm64
 
-# Self-hosted. QVAC-24501: this used to be two upstream composite sets,
-# [self-hosted, Linux, X64, NVIDIA] and the same plus COOPMAT2. No runner in the
-# qvac fleet carries those labels, so every job using them queued for 24h and was
-# killed as "cancelled" - they have never produced a result in this fork.
-#
-# Both now collapse to the fleet's NVIDIA Linux box, which already runs the same
-# three lanes in qvac-fabric-llm.cpp (gpu-cuda, gpu-vulkan-nvidia-cm,
-# gpu-vulkan-nvidia-cm2) and passes, coopmat2 included. One key rather than two
-# because the catalog rejects two keys resolving to the same target, and there is
-# no separate coopmat2 box to distinguish.
-selfhosted_linux_x64_nvidia: qvac-ubuntu2204-x64-gpu # Linux x64 NVIDIA GPU, Vulkan coopmat2 capable
-# Composite label set (all labels must match; AND semantics). This one resolves
-# on the fleet today - the Metal and Vulkan mac lanes run - so it is left alone.
+# Self-hosted. QVAC-24501: upstream's [self-hosted, Linux, X64, NVIDIA(, COOPMAT2)]
+# sets match no runner here. One key, not two: the catalog rejects duplicate targets.
+selfhosted_linux_x64_nvidia: qvac-ubuntu2204-x64-gpu # Linux x64 NVIDIA GPU, coopmat2 capable
+
+# Composite label set (all labels must match; AND semantics)
 selfhosted_macos_arm64: [self-hosted, macOS, ARM64] # Apple Silicon (Metal/Vulkan)

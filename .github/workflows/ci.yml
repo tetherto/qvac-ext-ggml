@@ -257,8 +257,6 @@ jobs:
   ggml-ci-x64-nvidia-vulkan-cm2:
     needs: [runner_names, authorize]
     if: needs.authorize.outputs.allowed == 'true'
-    # QVAC-24501: the fleet's NVIDIA box is coopmat2 capable, so this shares the
-    # one NVIDIA entry rather than a separate coopmat2 target.
     runs-on: ${{ needs.runner_names.outputs.selfhosted_linux_x64_nvidia }}
     steps:
       - name: Clone

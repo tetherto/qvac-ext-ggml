@@ -26,10 +26,8 @@ test('runners.yaml parses scalar + array entries with unique keys/targets', () =
   const mac = runners.find((e) => e.key === 'selfhosted_macos_arm64')
   assert.equal(mac.kind, 'array')
   assert.deepEqual(mac.labels, ['self-hosted', 'macOS', 'ARM64'])
-  // QVAC-24501: the NVIDIA entry is a fleet label, not an upstream composite
-  // set. Upstream's [self-hosted, Linux, X64, NVIDIA] matches no runner here, so
-  // those jobs queued 24h and were cancelled. Pinned so a sync cannot restore it
-  // silently.
+  // Pinned so an upstream sync cannot restore the composite set, which matches
+  // no runner here (QVAC-24501).
   const nvidia = runners.find((e) => e.key === 'selfhosted_linux_x64_nvidia')
   assert.equal(nvidia.kind, 'scalar')
   assert.equal(nvidia.label, 'qvac-ubuntu2204-x64-gpu')
@@ -62,7 +60,7 @@ test('reusable-runner-names.yml matches the catalog', () => {
   assert.doesNotMatch(rendered, /actions\/checkout/)
   // Array entry exported as a single-quoted JSON string.
   assert.match(rendered, /selfhosted_macos_arm64=\["self-hosted","macOS","ARM64"\]/)
-  // Scalar entry exported bare (QVAC-24501 repointed this one at the fleet).
+  // Scalar entry exported bare.
   assert.match(rendered, /selfhosted_linux_x64_nvidia=qvac-ubuntu2204-x64-gpu/)
 })
 
