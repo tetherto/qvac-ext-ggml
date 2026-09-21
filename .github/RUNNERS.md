@@ -30,6 +30,10 @@ are intentionally left hardcoded — they are GitHub aliases, not fleet labels.
 
 ## Wiring a job
 
+Every `selfhosted_*` key also needs the fork-authorization gate, or a fork's PR
+runs its own code on our hardware. `validate-runner-names.mjs` does **not** check
+for it — only for hardcoded labels and the `runner_names` dependency.
+
 ```yaml
 jobs:
   runner_names:
@@ -37,16 +41,26 @@ jobs:
       contents: read
     uses: ./.github/workflows/reusable-runner-names.yml
 
+  authorize:             # required for every self-hosted job below
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
   my-gpu-job:            # scalar key - no fromJSON
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ needs.runner_names.outputs.selfhosted_linux_x64_nvidia }}
     steps: ...
 
   my-mac-job:            # composite key - fromJSON
-    needs: runner_names
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps: ...
 ```
+
+GitHub-hosted keys (`ubuntu_2204`, `ubuntu_2204_arm`) need only
+`needs: runner_names`.
 
 ## Changing a label
 

@@ -266,10 +266,26 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          set -eo pipefail
           vulkaninfo --summary
-          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
+          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml 2>&1 \
+            | tee "$RUNNER_TEMP/ggml-ci-cm2.log"
 
-  # TODO: provision AMX-compatible machine
+      # QVAC-24501: coopmat2 is feature-detected and fails open - ggml drops to
+      # the plain Vulkan path with no error, so a runner joining the pool with an
+      # older driver or glslc makes this a silent duplicate of -vulkan-cm.
+      - name: Assert coopmat2 was actually exercised
+        run: |
+          if ! grep -q 'matrix cores: NV_coopmat2' "$RUNNER_TEMP/ggml-ci-cm2.log"; then
+            echo "::error::ggml fell back off NV_coopmat2 - this lane duplicated -vulkan-cm."
+            grep -m1 'ggml_vulkan: 0 =' "$RUNNER_TEMP/ggml-ci-cm2.log" || true
+            exit 1
+          fi
+
+  # TODO: provision AMX-compatible machine, then add its labels to runners.yaml
+  #       and wire runs-on through runner_names. The machine alone is not enough:
+  #       this label set is not in the catalog, so it would queue 24h and be
+  #       cancelled, and the detector skips comment lines so nothing warns.
   #ggml-ci-x64-cpu-amx:
   #  needs: [runner_names, authorize]
   #  if: needs.authorize.outputs.allowed == 'true'
