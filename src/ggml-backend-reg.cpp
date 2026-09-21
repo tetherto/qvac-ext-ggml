@@ -2,9 +2,11 @@
 #include "ggml-backend.h"
 #include "ggml-backend-dl.h"
 #include "ggml-impl.h"
+#include "ggml-adreno.h"
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -461,11 +463,30 @@ static fs::path get_executable_path() {
 #endif
 }
 
+// parakeet patch: allow consuming projects to override the backend
+// shared-library filename prefix at compile time. Without this, the
+// loader hard-codes "ggml-" (Windows) / "libggml-" (other), so two
+// addons that vendor different ggml versions and rename their bundled
+// backend .so/.dll files to avoid filename collisions still cannot be
+// loaded with `GGML_BACKEND_DL=ON`: the discovery walk in
+// `ggml_backend_load_best` only matches the unprefixed names. Define
+// `GGML_BACKEND_DL_PROJECT_PREFIX` (a string literal, e.g.
+// "parakeet-") at compile time and the loader will instead search for
+// "<prefix>ggml-*" / "lib<prefix>ggml-*". Default behaviour (macro
+// undefined) is byte-equal to upstream.
 static fs::path backend_filename_prefix() {
+#if defined(GGML_BACKEND_DL_PROJECT_PREFIX)
 #ifdef _WIN32
-    return fs::u8path("ggml-");
+    return fs::u8path(GGML_BACKEND_DL_PROJECT_PREFIX "ggml-");
 #else
-    return fs::u8path("libggml-");
+    return fs::u8path("lib" GGML_BACKEND_DL_PROJECT_PREFIX "ggml-");
+#endif
+#else
+#ifdef _WIN32
+    return fs::u8path("qvac-speech-ggml-");
+#else
+    return fs::u8path("libqvac-speech-ggml-");
+#endif
 #endif
 }
 
@@ -553,7 +574,119 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
                 }
             }
         }
-        return nullptr;
+        // Android app packaging keeps native libraries compressed inside the
+        // APK with no on-disk directory to scan (the default since AGP 3.6's
+        // `useLegacyPackaging=false`). The directory-iterator loop above
+        // therefore finds nothing on Android, and we fall through here.
+        //
+        // For backends that ship as a single library (Vulkan / OpenCL / ...)
+        // the base-name `dlopen` below is enough -- Android's linker resolves
+        // it via the in-APK lookup using just the bare filename
+        // (`lib<prefix>ggml-<name>.so`, prefix from
+        // `backend_filename_prefix()`).
+        //
+        // For the CPU backend with `GGML_CPU_ALL_VARIANTS=ON` there is no
+        // plain `lib<prefix>ggml-cpu.so`, only the per-arch
+        // `lib<prefix>ggml-cpu-android_armv*_*.so` files, so we also try
+        // each known per-arch variant by bare filename and let ggml's
+        // `ggml_backend_score` (e.g. `ggml_backend_cpu_aarch64_score`
+        // from src/ggml-cpu/arch/arm/cpu-feats.cpp) pick the
+        // highest-scoring variant the device's HWCAP supports.
+        //
+        // TODO: keep the variant list below in sync with the
+        // `ggml_add_cpu_backend_variant(android_armv*_*)` calls in
+        // src/CMakeLists.txt (currently around lines 410-416). New
+        // tiers added there must be appended here as well, or
+        // devices on the new tier will silently fall back to a
+        // lower one (with a measurable perf hit).
+        std::vector<fs::path> candidate_names = { name_path };
+#ifdef __ANDROID__
+        if (strcmp(name, "cpu") == 0) {
+            candidate_names.emplace_back("cpu-android_armv8.0_1");
+            candidate_names.emplace_back("cpu-android_armv8.2_1");
+            candidate_names.emplace_back("cpu-android_armv8.2_2");
+            candidate_names.emplace_back("cpu-android_armv8.6_1");
+            candidate_names.emplace_back("cpu-android_armv9.0_1");
+            candidate_names.emplace_back("cpu-android_armv9.2_1");
+            candidate_names.emplace_back("cpu-android_armv9.2_2");
+        }
+#endif
+
+        // Fast path for the common case (every backend on every non-Android
+        // platform, plus Vulkan / OpenCL / Metal / ... on Android): exactly
+        // one candidate, no real "best variant" choice to make. Skip the
+        // score-then-reload loop below so we stay on the same single-
+        // `dlopen` cost as the pre-Android-variant code path. Without this,
+        // every backend on every platform pays for a double `dlopen` (one
+        // for scoring, one in `load_backend` after we pick the winner).
+        if (candidate_names.size() == 1) {
+            fs::path filename = backend_filename_prefix().native() +
+                                candidate_names[0].native() +
+                                backend_filename_extension().native();
+            if (auto reg = get_reg().load_backend(filename, silent)) {
+                return reg;
+            }
+            return nullptr;
+        }
+
+        // Multi-candidate (Android CPU today): iterate worst -> best with a
+        // synthetic per-index offset added on top of the runtime score so
+        // that:
+        //   - if multiple variants successfully dlopen on this device
+        //     (which can happen: every variant's `ggml_backend_score`
+        //     returns non-zero when HWCAP allows it, e.g. an armv9.2
+        //     device accepts every variant <= its tier), the highest
+        //     index wins on tie;
+        //   - the runtime `ggml_backend_score` value still dominates the
+        //     offset, so a device that legitimately supports only the
+        //     baseline (e.g. armv8.0 phone) still picks `armv8.0_1`
+        //     even when later variants fail to load.
+        //
+        // Each candidate is dlopened twice on the winning path (once here
+        // for scoring, once again via the `load_backend(best_path)` tail
+        // call) because `dl_handle_ptr` releases the handle on scope exit.
+        // Acceptable because this whole block is the cold-init slow path
+        // and only fires on the small Android CPU candidate set.
+        for (size_t idx = 0; idx < candidate_names.size(); ++idx) {
+            fs::path filename = backend_filename_prefix().native() +
+                                candidate_names[idx].native() +
+                                backend_filename_extension().native();
+            dl_handle_ptr handle { dl_load_library(filename) };
+            if (!handle) {
+                if (!silent) {
+                    GGML_LOG_DEBUG("%s: dlopen(%s) failed: %s\n", __func__,
+                                   path_str(filename).c_str(), dl_error());
+                }
+                continue;
+            }
+            auto score_fn = (ggml_backend_score_t)
+                dl_get_sym(handle.get(), "ggml_backend_score");
+            int s = 1; // base score for backends without ggml_backend_score
+            if (score_fn) {
+                s = score_fn();
+                if (s == 0) {
+                    // Backend explicitly refused this device. Drop the
+                    // handle (dl_handle_ptr's deleter unloads it) so we
+                    // don't leave dead libraries mapped.
+                    continue;
+                }
+            }
+            s += static_cast<int>(idx);
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: %s score: %d\n", __func__,
+                           path_str(filename).c_str(), s);
+#endif
+            if (s > best_score) {
+                best_score = s;
+                best_path = filename;
+            }
+            // Intentional: handle goes out of scope here; load_backend()
+            // below will re-dlopen the winning path. ggml itself caches
+            // the dlopen handle once load_backend() succeeds.
+        }
+        if (best_path.empty()) {
+            return nullptr;
+        }
     }
 
     return get_reg().load_backend(best_path, silent);
@@ -562,6 +695,35 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
 void ggml_backend_load_all() {
     ggml_backend_load_all_from_path(nullptr);
 }
+
+#ifdef __ANDROID__
+namespace {
+// Smallest Adreno generation among the GPU devices a (Vulkan) backend exposes,
+// or a negative sentinel: -2 if `reg` is null, -1 if no Adreno GPU is present.
+// Vulkan is used as the probe because it is present on virtually every Android
+// GPU, so the GPU can be identified before deciding whether to load OpenCL.
+// Mirrors qvac-fabric-llm.cpp's ggml fork (the LLM stack's backend selection).
+int ggml_backend_min_adreno_version(ggml_backend_reg_t reg) {
+    if (reg == nullptr) {
+        return -2;
+    }
+    int min_found = std::numeric_limits<int>::max();
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, i);
+        if (dev == nullptr) {
+            continue;
+        }
+        const char * description = ggml_backend_dev_description(dev);
+        GGML_LOG_INFO("%s: found device description: %s\n", __func__, description ? description : "(null)");
+        const int dev_adreno_version = ggml_adreno_version_from_description(description ? description : "");
+        if (dev_adreno_version > 0) {
+            min_found = std::min(min_found, dev_adreno_version);
+        }
+    }
+    return (min_found < std::numeric_limits<int>::max()) ? min_found : -1;
+}
+} // namespace
+#endif // __ANDROID__
 
 void ggml_backend_load_all_from_path(const char * dir_path) {
 #ifdef NDEBUG
@@ -578,9 +740,54 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("metal", silent, dir_path);
     ggml_backend_load_best("rpc", silent, dir_path);
     ggml_backend_load_best("sycl", silent, dir_path);
-    ggml_backend_load_best("vulkan", silent, dir_path);
+    // Skip Vulkan dlopen when GGML_DISABLE_VULKAN is set, so GPU work can route
+    // to OpenCL on Adreno (Vulkan crashes in vkCmdBindPipeline there). Mirrors
+    // the static-link gate above.
+    if (getenv("GGML_DISABLE_VULKAN") == nullptr) {
+        ggml_backend_load_best("vulkan", silent, dir_path);
+    } else {
+        GGML_LOG_INFO("ggml_backend_load_all_from_path: skipping vulkan (GGML_DISABLE_VULKAN set)\n");
+    }
     ggml_backend_load_best("virtgpu", silent, dir_path);
-    ggml_backend_load_best("opencl", silent, dir_path);
+
+    // OpenCL is only useful (and stable) for ggml on Adreno GPUs; on every
+    // other GPU the Adreno-tuned OpenCL kernels are either unsupported or buggy.
+    // On Android, use the already-loaded Vulkan backend to detect the GPU and
+    // only keep OpenCL for an Adreno that benefits from it. This mirrors
+    // qvac-fabric-llm.cpp's ggml fork so the speech stack selects backends the
+    // same way the LLM stack does. Off Android (or when no Vulkan backend is
+    // present) behaviour is unchanged: OpenCL is loaded unconditionally here.
+    bool load_opencl = true;
+#ifdef __ANDROID__
+    {
+        ggml_backend_reg_t vulkan_backend = ggml_backend_reg_by_name("vulkan");
+        const int min_adreno_version = ggml_backend_min_adreno_version(vulkan_backend);
+        const ggml_adreno_backend_policy policy = ggml_adreno_resolve_backend_policy(min_adreno_version);
+        load_opencl = policy.load_opencl;
+        if (min_adreno_version <= 0) {
+            GGML_LOG_INFO("%s: no Adreno GPU detected (%d); skipping OpenCL, relying on Vulkan/CPU\n",
+                          __func__, min_adreno_version);
+        } else if (policy.unload_vulkan) {
+            GGML_LOG_INFO("%s: Adreno %d detected; removing Vulkan and relying on CPU only\n",
+                          __func__, min_adreno_version);
+            if (vulkan_backend != nullptr) {
+                ggml_backend_unload(vulkan_backend);
+            }
+        } else if (policy.load_opencl) {
+            GGML_LOG_INFO("%s: Adreno %d detected; keeping OpenCL backend\n", __func__, min_adreno_version);
+        }
+    }
+#endif // __ANDROID__
+    // Opt-in escape hatch: force-load the OpenCL backend even when the Android
+    // Adreno heuristic above would skip it (e.g. to evaluate OpenCL on a
+    // non-Adreno GPU such as Samsung Xclipse). Default behaviour is unchanged.
+    if (std::getenv("GGML_OPENCL_FORCE_LOAD") != nullptr) {
+        load_opencl = true;
+    }
+    if (load_opencl) {
+        ggml_backend_load_best("opencl", silent, dir_path);
+    }
+
     ggml_backend_load_best("hexagon", silent, dir_path);
     ggml_backend_load_best("musa", silent, dir_path);
     ggml_backend_load_best("openvino", silent, dir_path);

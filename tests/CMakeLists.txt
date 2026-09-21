@@ -160,6 +160,12 @@ endif()
 add_definitions(-UNDEBUG)
 
 #
+# The client links only core ggml, including with GGML_BACKEND_DL=ON.
+set(TEST_TARGET test-cpu-graph-plan)
+add_executable(${TEST_TARGET} test-cpu-graph-plan.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 # test-backend-ops
 
 set(TEST_TARGET test-backend-ops)
@@ -168,6 +174,37 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+#
+# test-adreno-version
+# Pure unit test for src/ggml-adreno.h (Adreno GPU-string parser used by the
+# Android OpenCL/Vulkan backend-selection policy). Header-only: needs the src/
+# include path but does not link the ggml runtime. Always built.
+
+set(TEST_TARGET test-adreno-version)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+set(TEST_TARGET test-shader-payload-strip)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/ggml-vulkan/vulkan-shaders)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+if (GGML_OPENCL)
+    set(TEST_TARGET test-opencl-workgroup)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
+
+if (GGML_VULKAN)
+    set(TEST_TARGET test-vulkan-status)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    # ggml-vulkan exports the testing hook; ggml carries the public headers.
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml-vulkan ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     #
@@ -247,6 +284,47 @@ if (NOT GGML_BACKEND_DL)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+    #
+    # test-col2im-1d
+
+    set(TEST_TARGET test-col2im-1d)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+    #
+    # test-snake
+
+    set(TEST_TARGET test-snake)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+    #
+    # test-vae-graph
+
+    set(TEST_TARGET test-vae-graph)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+    #
+    # vae-decode (tool: loads real acestep VAE GGUF -> WAV; no add_test, needs weights)
+
+    set(TEST_TARGET vae-decode)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+
+    #
+    # vae-roundtrip (tool: WAV -> encode -> decode -> WAV; no add_test, needs weights)
+
+    set(TEST_TARGET vae-roundtrip)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 
     #
     # test-conv-transpose
@@ -354,3 +432,10 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 endif()
+
+set(TEST_TARGET test-conv-transpose-1d-scaling)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+

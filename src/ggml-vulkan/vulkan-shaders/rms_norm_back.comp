@@ -19,6 +19,12 @@ void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationID.x;
 
+    // Workgroup count is padded up to a multiple of 512; phantom rows must
+    // not write out of bounds. p.KY carries ggml_nrows(src0).
+    if (row >= p.KY) {
+        return;
+    }
+
     // Compute derivative of x[i]/norm(x) = g[i]/norm(x) - x[i] dot(x,g)/KX / norm(x)^1.5
 
     // partial sums for thread in warp

@@ -21,6 +21,8 @@
 #include <sys/types.h>
 #include <filesystem>
 
+#include "shader-payload-strip.hpp"
+
 #ifdef _WIN32
     #define NOMINMAX
     #include <windows.h>
@@ -313,6 +315,7 @@ static uint32_t compile_count = 0;
 static std::mutex compile_count_mutex;
 static std::condition_variable compile_count_cond;
 static bool generate_dep_file = true;
+static bool strip_shader_payloads = false;
 
 void decrement_compile_count(uint32_t * count) {
     if (count) {
@@ -336,6 +339,14 @@ compile_count_guard acquire_compile_slot() {
 }
 
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
+    if (should_strip_shader_payload(name, strip_shader_payloads)) {
+        const std::string noop_path = out_path + ".noop.comp";
+        write_binary_file(noop_path, "#version 450\nlayout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;\nvoid main() {}\n");
+        in_path = noop_path;
+        defines.clear();
+        coopmat = false;
+    }
+
     std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
 
     #ifdef _WIN32
@@ -799,6 +810,7 @@ void process_shaders() {
 
     // Norms
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("norm_fused_f32", "norm_fused.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -826,9 +838,15 @@ void process_shaders() {
 
     string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    string_to_spv("cpy_transpose_large_16", "copy_transpose_large.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+    string_to_spv("cpy_transpose_large_32", "copy_transpose_large.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
 
     for (std::string t : {"q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    }
+
+    // The dequantizing direction also covers the k-quants; copy_to_quant.comp has no k-quant quantizer.
+    for (std::string t : {"q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k"}) {
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
@@ -878,6 +896,9 @@ void process_shaders() {
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+
+    string_to_spv("mul_mul_f32", "mul_pair.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"OP2_ADD", "0"}});
+    string_to_spv("mul_add_f32", "mul_pair.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"OP2_ADD", "1"}});
 
     string_to_spv("div_f32", "div.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
@@ -983,6 +1004,8 @@ void process_shaders() {
     string_to_spv("geglu_erf_f32",  "geglu_erf.comp",   {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("geglu_quick_f16","geglu_quick.comp", {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("geglu_quick_f32","geglu_quick.comp", {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("siglu_f16",      "siglu.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
+    string_to_spv("siglu_f32",      "siglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
 
     string_to_spv("silu_back_f32",  "silu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
@@ -1022,6 +1045,7 @@ void process_shaders() {
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("sum_rows_small_f32", "sum_rows_small.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("fwht_f32", "fwht.comp", {});
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
@@ -1128,6 +1152,8 @@ void process_shaders() {
     string_to_spv("conv2d_dw_whcn_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"WHCN", "1"}}));
     string_to_spv("conv2d_dw_cwhn_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"CWHN", "1"}}));
     string_to_spv("conv2d_dw_whcn_f16_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"WHCN", "1"}}));
+    string_to_spv("conv2d_dw_whcn_v4_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"WHCN", "1"}, {"WHCN_V4", "1"}}));
+    string_to_spv("conv2d_dw_whcn_v4_f16_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"WHCN", "1"}, {"WHCN_V4", "1"}}));
     string_to_spv("conv2d_dw_cwhn_f16_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"CWHN", "1"}}));
 
     string_to_spv("roll_f32", "roll.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1141,6 +1167,26 @@ void process_shaders() {
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
+
+    string_to_spv("gru_f32",             "gru.comp",             {{"A_TYPE", "float"}});
+    string_to_spv("gru_small_h2_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "2"}});
+    string_to_spv("gru_small_h4_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "4"}});
+    string_to_spv("gru_small_h8_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "8"}});
+    string_to_spv("zero_upsample_f32",   "zero_upsample.comp",   {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("channel_shuffle_f32", "channel_shuffle.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("affine_prelu_f32",    "affine_prelu.comp",    {{"A_TYPE", "float"}});
+    string_to_spv("supertonic_depthwise_1d_f32",       "supertonic_depthwise_1d.comp",       {});
+    string_to_spv("supertonic_depthwise_1d_layer_norm_channel_f32", "supertonic_depthwise_1d_layer_norm_channel.comp", {});
+    string_to_spv("supertonic_layer_norm_channel_f32", "supertonic_layer_norm_channel.comp", {});
+    string_to_spv("supertonic_pw2_residual_f32",       "supertonic_pw2_residual.comp",       {});
+    string_to_spv("supertonic_bias_gelu_f32",           "supertonic_bias_gelu.comp",           {});
+    string_to_spv("supertonic_edge_pad_1d_f32",         "supertonic_edge_pad_1d.comp",         {});
+    string_to_spv("lstm_cell_f32",        "lstm_cell.comp",      {{"A_TYPE", "float"}});
+    string_to_spv("lstm_cell_masked_f32", "lstm_cell.comp",      {{"A_TYPE", "float"}, {"MASKED", "1"}});
+    string_to_spv("tdt_step_i32",         "tdt_step.comp",       {{"A_TYPE", "int"}});
+    string_to_spv("col2im_1d_tiled_f32", "col2im_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("im2col_1d_tiled_f32",     "im2col_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"BDA", "0"}});
+    string_to_spv("im2col_1d_tiled_f32_f16", "im2col_1d_tiled.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"BDA", "0"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
@@ -1314,6 +1360,9 @@ int main(int argc, char** argv) {
 
     if (args.find("--glslc") != args.end()) {
         GLSLC = args["--glslc"]; // Path to glslc
+    }
+    if (args.find("--strip-payloads") != args.end()) {
+        strip_shader_payloads = true;
     }
     if (args.find("--source") != args.end()) {
         input_filepath = args["--source"]; // The shader source file to compile

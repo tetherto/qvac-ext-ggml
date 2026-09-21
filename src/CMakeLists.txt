@@ -185,8 +185,10 @@ endif()
 
 # ggml
 
-if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
-    message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
+# GGML_BACKEND_DL works with static core when PIC is enabled below.
+
+if (GGML_CPU_STATIC AND GGML_CPU_ALL_VARIANTS)
+    message(FATAL_ERROR "GGML_CPU_STATIC is incompatible with GGML_CPU_ALL_VARIANTS")
 endif()
 
 add_library(ggml-base
@@ -239,6 +241,10 @@ if (GGML_OPENMP_ENABLED)
     target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 endif()
 
+if (DEFINED GGML_MAX_NAME)
+    target_compile_definitions(ggml-base PUBLIC GGML_MAX_NAME=${GGML_MAX_NAME})
+endif()
+
 add_library(ggml
             ggml-backend-dl.cpp
             ggml-backend-reg.cpp)
@@ -263,10 +269,11 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
 endif()
 
 function(ggml_add_backend_library backend)
-    if (GGML_BACKEND_DL)
+    if (GGML_BACKEND_DL AND NOT (GGML_CPU_STATIC AND ${backend} MATCHES "^ggml-cpu"))
         add_library(${backend} MODULE ${ARGN})
         # write the shared library to the output directory
-        set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        set_target_properties(${backend} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
         add_dependencies(ggml ${backend})
         if (GGML_BACKEND_DIR)
@@ -283,7 +290,7 @@ function(ggml_add_backend_library backend)
     target_link_libraries(${backend} PRIVATE ggml-base)
     target_include_directories(${backend} PRIVATE ..)
 
-    if (${BUILD_SHARED_LIBS})
+    if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
         target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
     endif()
@@ -318,6 +325,9 @@ function(ggml_add_backend backend)
         if (NOT GGML_BACKEND_DL)
             string(TOUPPER "GGML_USE_${backend}" backend_use)
             target_compile_definitions(ggml PUBLIC ${backend_use})
+        endif()
+        if (GGML_CPU_STATIC AND "${backend}" STREQUAL "CPU")
+            target_compile_definitions(ggml PUBLIC GGML_USE_CPU)
         endif()
     endif()
 endfunction()
@@ -509,10 +519,16 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
     target_compile_definitions(ggml-base PUBLIC _DARWIN_C_SOURCE)
 endif()
 
-if (BUILD_SHARED_LIBS)
+if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
     foreach (target ggml-base ggml)
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
-        target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        # A static core linked into MODULE backends must not advertise itself
+        # as a DLL: on Windows GGML_SHARED turns GGML_API into
+        # __declspec(dllimport) inside the backend's translation units, and
+        # their __imp_ references cannot be satisfied by the static archive.
+        if (BUILD_SHARED_LIBS OR NOT WIN32)
+            target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        endif()
     endforeach()
 endif()
