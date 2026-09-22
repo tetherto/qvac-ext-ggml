@@ -282,8 +282,23 @@ jobs:
       # that reports a lesser backend stays correct for any device count.
       - name: Assert coopmat2 was actually exercised
         run: |
-          if grep -E 'ggml_vulkan: [0-9]+ = .*matrix cores: (none|KHR_coopmat)' \
-              "$RUNNER_TEMP/ggml-ci-cm2.log"; then
+          log="$RUNNER_TEMP/ggml-ci-cm2.log"
+
+          # Presence first. The backend can enumerate nothing and return without
+          # aborting - two early returns logging "No devices found."
+          # (src/ggml-vulkan/ggml-vulkan.cpp) - so a missing ICD or an
+          # unavailable card leaves ctest on the CPU backend with no device lines
+          # at all, and every per-device check below passes vacuously.
+          if ! grep -qE 'ggml_vulkan: [0-9]+ = ' "$log"; then
+            echo "::error::no Vulkan device lines in the log - the backend never enumerated."
+            exit 1
+          fi
+
+          # Then per device: coopmat2 is feature-detected and fails open, and
+          # ggml_vk_print_gpu_info prints a line per selected device, so a
+          # positive grep would pass on a multi-GPU box even when ctest ran on the
+          # card that fell back.
+          if grep -E 'ggml_vulkan: [0-9]+ = .*matrix cores: (none|KHR_coopmat)' "$log"; then
             echo "::error::a Vulkan device fell back off NV_coopmat2 - this lane duplicated -vulkan-cm."
             exit 1
           fi
