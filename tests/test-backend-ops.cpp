@@ -10320,6 +10320,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
 
     add_strided_mul_mat_prec_f32_tests(test_cases);
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 96, 63, 544, true, false));
 
     // The Adreno gemv splits K across waves, and is only selected once both dimensions
     // reach 384, so every n=1 case above (m=16, k=256) misses it entirely. These reach

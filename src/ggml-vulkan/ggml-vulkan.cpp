@@ -9918,7 +9918,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
-    const ggml_type x_reformat_type = (prec_f32_f32 && x_non_contig) ? GGML_TYPE_F32 : f16_type;
+    const ggml_type x_reformat_type = prec_f32_f32 ? GGML_TYPE_F32 : f16_type;
     const bool keep_operands_f32 = keep_src1_f32 || x_reformat_type == GGML_TYPE_F32;
     const ggml_type y_reformat_type = keep_operands_f32 ? GGML_TYPE_F32 : f16_type;
 
