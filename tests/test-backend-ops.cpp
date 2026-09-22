@@ -5232,10 +5232,11 @@ struct test_mul_mat_prec_f32 : public test_case {
     const int64_t n;
     const int64_t k;
     const bool strided_b;
+    const bool strided_a;
     const float b_absmax;
 
     std::string vars() override {
-        return VARS_TO_STR6(type_a, m, n, k, strided_b, b_absmax);
+        return VARS_TO_STR7(type_a, m, n, k, strided_b, strided_a, b_absmax);
     }
 
     double max_nmse_err() override {
@@ -5248,12 +5249,21 @@ struct test_mul_mat_prec_f32 : public test_case {
     }
 
     test_mul_mat_prec_f32(ggml_type type_a, int64_t m, int64_t n, int64_t k,
-            bool strided_b = false, float b_absmax = 1.0e5f)
-        : type_a(type_a), m(m), n(n), k(k), strided_b(strided_b), b_absmax(b_absmax) {}
+            bool strided_b = false, bool strided_a = false, float b_absmax = 1.0e5f)
+        : type_a(type_a), m(m), n(n), k(k), strided_b(strided_b), strided_a(strided_a),
+          b_absmax(b_absmax) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        // A dim01-strided weight is repacked before the multiply, which on some backends
+        // changes its type and so the operand pair the matmul is looked up with.
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, strided_a ? k + 32 : k, m);
         ggml_set_name(a, "a");
+
+        ggml_tensor * a_in = a;
+        if (strided_a) {
+            a_in = ggml_view_2d(ctx, a, k, m, a->nb[1], 0);
+            ggml_set_name(a_in, "a_in");
+        }
 
         // Over-allocate the row so the view's row stride exceeds its row length, which
         // is what backends test for when deciding whether src1 needs repacking.
@@ -5268,7 +5278,7 @@ struct test_mul_mat_prec_f32 : public test_case {
             ggml_set_name(b_in, "b_in");
         }
 
-        ggml_tensor * out = ggml_mul_mat(ctx, a, b_in);
+        ggml_tensor * out = ggml_mul_mat(ctx, a_in, b_in);
         ggml_mul_mat_set_prec(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
@@ -10303,6 +10313,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // k that no tile alignment divides, to reach the unaligned matmul variants
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, false));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
+
+    // A dim01-strided src0 is repacked before the multiply, so the matmul is looked up for
+    // an operand pair the contiguous cases never ask for. Narrowing that repack to f16
+    // both clamps the activations GGML_PREC_F32 promises to keep and, on
+    // Vulkan/NV_coopmat2, asks for an f16-source-with-f32-src1 matmul that has no pipeline
+    // there at all. Only f32 src0 reaches this: a quantized src0 has to be
+    // dim01-contiguous already. b_absmax past fp16 range is what makes the narrowing
+    // visible as a NaN rather than as a rounding difference.
+    for (bool strided_b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 512, 63, 512, strided_b, true));
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 512,  1, 512, strided_b, true));
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32,  96, 63, 544, strided_b, true));
+    }
 
     // The Adreno gemv splits K across waves, and is only selected once both dimensions
     // reach 384, so every n=1 case above (m=16, k=256) misses it entirely. These reach

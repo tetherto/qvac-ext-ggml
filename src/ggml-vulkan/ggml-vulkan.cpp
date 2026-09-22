@@ -9918,12 +9918,24 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
+    // A strided src0 is repacked before the multiply, and under an explicit GGML_PREC_F32
+    // the repack has to keep f32: narrowing it would clamp the very operands the caller
+    // asked to keep unclamped, and it would hand the matmul an f16-source-with-f32-src1
+    // pair, which a coopmat2 build has no pipeline for at all. f32 x f32 has the scalar
+    // fp32 matmul everywhere, so preserving the type keeps both the math and the lookup.
+    const ggml_type x_reformat_type = (prec_f32_f32 && x_non_contig) ? GGML_TYPE_F32 : f16_type;
+
+    // Keeping src0 in f32 only pays off if src1 follows it: f32 x f16 is a pair no device
+    // builds either, so the two operands have to agree on the precision the caller asked
+    // for. Both staying f32 lands on the scalar fp32 matmul, which every device has.
+    const bool keep_operands_f32 = keep_src1_f32 || x_reformat_type == GGML_TYPE_F32;
+
     // A strided src1 still has to be made contiguous even under GGML_PREC_F32, but
     // the copy stays in F32 so it cannot clamp. Without this the fp16 reformat wins
     // over keep_src1_f32 and the guarantee silently depends on src1's layout.
-    const ggml_type y_reformat_type = keep_src1_f32 ? GGML_TYPE_F32 : f16_type;
+    const ggml_type y_reformat_type = keep_operands_f32 ? GGML_TYPE_F32 : f16_type;
 
-    const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && (!y_non_contig || keep_src1_f32);
+    const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && (!y_non_contig || keep_operands_f32);
 
     // Quantizing src1 to q8_1 is likewise a throughput choice that GGML_PREC_F32 rules out.
     bool quantize_y = ctx->device->integer_dot_product && prec != GGML_PREC_F32 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
@@ -9948,7 +9960,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, prec);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, x_reformat_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, prec);
     }
 
     // Not implemented
@@ -9956,10 +9968,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const ggml_type effective_src1_type = quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, ne10, qx_needs_dequant ? f16_type : src0->type, effective_src1_type));
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align(ctx, mmp, ne01, ne11, ne10, qx_needs_dequant ? x_reformat_type : src0->type, effective_src1_type));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, ne10, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, ne10, aligned, qx_needs_dequant ? x_reformat_type : src0->type, effective_src1_type);
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -9982,7 +9994,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // (m_alloc > m) stops short of the last channel, putting those reads outside the
     // binding. ggml_nbytes() spans nb[] and equals qx_sz when the tensor really is
     // packed, so this only ever widens the range.
-    const uint64_t x_sz = !qx_needs_dequant ? ggml_nbytes(src0) : sizeof(ggml_fp16_t) * x_ne;
+    const uint64_t x_sz = !qx_needs_dequant ? ggml_nbytes(src0) : ggml_type_size(x_reformat_type) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
@@ -9991,7 +10003,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline to_q8_1 = nullptr;
 
     if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, x_reformat_type);
     } else {
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
     }
