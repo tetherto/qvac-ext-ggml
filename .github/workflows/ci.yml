@@ -274,11 +274,17 @@ jobs:
       # QVAC-24501: coopmat2 is feature-detected and fails open - ggml drops to
       # the plain Vulkan path with no error, so a runner joining the pool with an
       # older driver or glslc makes this a silent duplicate of -vulkan-cm.
+      #
+      # Asserted negatively, per device. ggml_vk_print_gpu_info runs once per
+      # selected device, so a positive grep for NV_coopmat2 would pass on a
+      # multi-GPU box even when the tests ran on the card that fell back. ci/run.sh
+      # never sets GGML_VK_VISIBLE_DEVICES, so ggml chooses. Failing on any device
+      # that reports a lesser backend stays correct for any device count.
       - name: Assert coopmat2 was actually exercised
         run: |
-          if ! grep -q 'matrix cores: NV_coopmat2' "$RUNNER_TEMP/ggml-ci-cm2.log"; then
-            echo "::error::ggml fell back off NV_coopmat2 - this lane duplicated -vulkan-cm."
-            grep -m1 'ggml_vulkan: 0 =' "$RUNNER_TEMP/ggml-ci-cm2.log" || true
+          if grep -E 'ggml_vulkan: [0-9]+ = .*matrix cores: (none|KHR_coopmat)' \
+              "$RUNNER_TEMP/ggml-ci-cm2.log"; then
+            echo "::error::a Vulkan device fell back off NV_coopmat2 - this lane duplicated -vulkan-cm."
             exit 1
           fi
 

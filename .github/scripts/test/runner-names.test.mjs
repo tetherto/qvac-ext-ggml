@@ -103,6 +103,33 @@ test('detector catches scalar and composite-array hardcoded runs-on', () => {
   )
 })
 
+test('detector flags a composite set that is in no catalog entry', () => {
+  // The regression this guards: retiring the NVIDIA array entries used to drop
+  // them from the detector's search set, so an upstream sync reintroducing
+  // `runs-on: [self-hosted, Linux, X64, NVIDIA]` validated clean and went back
+  // to queueing 24h. Nothing routes an uncatalogued set, so it is always wrong.
+  const runners = parseRunnersYaml('gpu: qvac-ubuntu2204-x64-gpu\nmac: [self-hosted, macOS, ARM64]\n')
+  const source = [
+    'jobs:',
+    '  resynced:',
+    '    runs-on: [self-hosted, Linux, X64, NVIDIA]',
+    '  known:',
+    '    runs-on: [self-hosted, macOS, ARM64]',
+    '  wired:',
+    '    runs-on: ${{ fromJSON(needs.runner_names.outputs.mac) }}',
+    '',
+  ].join('\n')
+
+  const findings = findHardcodedLabelViolations('x.yml', source, runners)
+  assert.deepEqual(
+    findings.map((f) => [f.line, f.target, Boolean(f.uncatalogued)]),
+    [
+      [3, '[self-hosted,Linux,X64,NVIDIA]', true],
+      [5, '[self-hosted,macOS,ARM64]', false],
+    ],
+  )
+})
+
 test('detector matches composite arrays regardless of token order', () => {
   const runners = parseRunnersYaml('gpu: [self-hosted, Linux, X64, NVIDIA]\n')
   const source = ['jobs:', '  a:', '    runs-on: [self-hosted, NVIDIA, X64, Linux]', ''].join('\n')

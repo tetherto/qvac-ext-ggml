@@ -28,7 +28,10 @@ function main() {
   for (const file of listAddonWorkflows()) {
     const source = readRepoFile(file)
     for (const finding of findHardcodedLabelViolations(file, source, runners)) {
-      errors.push(`${finding.file}:${finding.line} hardcodes runner target ${finding.target}: ${finding.text}`)
+      const what = finding.uncatalogued
+        ? `hardcodes composite label set ${finding.target}, which is in no catalog entry (nothing routes it)`
+        : `hardcodes runner target ${finding.target}`
+      errors.push(`${finding.file}:${finding.line} ${what}: ${finding.text}`)
     }
     for (const finding of findMissingRunnerNamesNeeds(file, source)) {
       errors.push(`${finding.file}: ${finding.message}`)
