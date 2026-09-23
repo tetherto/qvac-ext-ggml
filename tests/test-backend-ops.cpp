@@ -5221,21 +5221,22 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-// GGML_PREC_F32 on a quantized weight, with activations deliberately outside fp16
-// range. test_mul_mat cannot cover this: it initializes every tensor in [-1, 1], so a
-// backend that honours the request by converting the activations to fp16 clamps at
-// 65504 without any test noticing. strided_b additionally denies the backend a
-// directly usable src1, so the reformat it inserts has to stay in F32 as well.
 struct test_mul_mat_prec_f32 : public test_case {
+    static constexpr int64_t row_padding = 32;
+    static constexpr float fp16_overflow_magnitude = 1.0e5f;
+    static constexpr float unit_magnitude = 1.0f;
+
     const ggml_type type_a;
     const int64_t m;
     const int64_t n;
     const int64_t k;
     const bool strided_b;
+    const bool strided_a;
     const float b_absmax;
+    const float a_absmax;
 
     std::string vars() override {
-        return VARS_TO_STR6(type_a, m, n, k, strided_b, b_absmax);
+        return VARS_TO_STR8(type_a, m, n, k, strided_b, strided_a, b_absmax, a_absmax);
     }
 
     double max_nmse_err() override {
@@ -5248,27 +5249,28 @@ struct test_mul_mat_prec_f32 : public test_case {
     }
 
     test_mul_mat_prec_f32(ggml_type type_a, int64_t m, int64_t n, int64_t k,
-            bool strided_b = false, float b_absmax = 1.0e5f)
-        : type_a(type_a), m(m), n(n), k(k), strided_b(strided_b), b_absmax(b_absmax) {}
+            bool strided_b = false, bool strided_a = false,
+            float b_absmax = fp16_overflow_magnitude, float a_absmax = unit_magnitude)
+        : type_a(type_a), m(m), n(n), k(k), strided_b(strided_b), strided_a(strided_a),
+          b_absmax(b_absmax), a_absmax(a_absmax) {}
 
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
-        ggml_set_name(a, "a");
-
-        // Over-allocate the row so the view's row stride exceeds its row length, which
-        // is what backends test for when deciding whether src1 needs repacking.
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided_b ? k + 32 : k, n);
-        ggml_set_name(b, "b");
-
-        // Only name the view separately: naming b_in when it aliases b would rename b
-        // itself and initialize_tensors would no longer recognize it as the activations.
-        ggml_tensor * b_in = b;
-        if (strided_b) {
-            b_in = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
-            ggml_set_name(b_in, "b_in");
+    ggml_tensor * build_operand(ggml_context * ctx, ggml_type type, int64_t rows,
+            bool strided, const char * name, const char * view_name) {
+        ggml_tensor * tensor = ggml_new_tensor_2d(ctx, type, strided ? k + row_padding : k, rows);
+        ggml_set_name(tensor, name);
+        if (!strided) {
+            return tensor;
         }
 
-        ggml_tensor * out = ggml_mul_mat(ctx, a, b_in);
+        ggml_tensor * view = ggml_view_2d(ctx, tensor, k, rows, tensor->nb[1], 0);
+        ggml_set_name(view, view_name);
+        return view;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a_in = build_operand(ctx, type_a, m, strided_a, "a", "a_in");
+        ggml_tensor * b_in = build_operand(ctx, GGML_TYPE_F32, n, strided_b, "b", "b_in");
+        ggml_tensor * out = ggml_mul_mat(ctx, a_in, b_in);
         ggml_mul_mat_set_prec(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
@@ -5278,13 +5280,13 @@ struct test_mul_mat_prec_f32 : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) {
-                continue;  // writing through a strided view would not respect its layout
+                continue;
             }
             if (strcmp(ggml_get_name(t), "b") == 0) {
                 init_tensor_uniform(t, -b_absmax, b_absmax);
+            } else if (strcmp(ggml_get_name(t), "a") == 0) {
+                init_tensor_uniform(t, -a_absmax, a_absmax);
             } else {
-                // The weight stays in [-1, 1]: its block scales would absorb a wide
-                // range and the products would land back inside fp16.
                 init_tensor_uniform(t);
             }
         }
@@ -5295,6 +5297,19 @@ struct test_mul_mat_prec_f32 : public test_case {
         return ggml_op_name(GGML_OP_MUL_MAT);
     }
 };
+
+static void add_strided_mul_mat_prec_f32_tests(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    constexpr float overflow_magnitude = test_mul_mat_prec_f32::fp16_overflow_magnitude;
+    constexpr float unit_magnitude = test_mul_mat_prec_f32::unit_magnitude;
+
+    for (bool strided_b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 512, 63, 512, strided_b, true));
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 512,  1, 512, strided_b, true));
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32,  96, 63, 544, strided_b, true));
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 512, 63, 512, strided_b, true, unit_magnitude, overflow_magnitude));
+        test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32,  96, 63, 544, strided_b, true, unit_magnitude, overflow_magnitude));
+    }
+}
 
 // src0 as a view into a taller allocation, so consecutive channels sit m_alloc rows apart
 // while only m of each are live. Nothing about dims 0 and 1 is unusual, which is the point:
@@ -10303,6 +10318,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // k that no tile alignment divides, to reach the unaligned matmul variants
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, false));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
+
+    add_strided_mul_mat_prec_f32_tests(test_cases);
 
     // The Adreno gemv splits K across waves, and is only selected once both dimensions
     // reach 384, so every n=1 case above (m=16, k=256) misses it entirely. These reach
