@@ -294,12 +294,24 @@ jobs:
             exit 1
           fi
 
-          # Then per device: coopmat2 is feature-detected and fails open, and
-          # ggml_vk_print_gpu_info prints a line per selected device, so a
-          # positive grep would pass on a multi-GPU box even when ctest ran on the
-          # card that fell back.
-          if grep -E 'ggml_vulkan: [0-9]+ = .*matrix cores: (none|KHR_coopmat)' "$log"; then
-            echo "::error::a Vulkan device fell back off NV_coopmat2 - this lane duplicated -vulkan-cm."
+          # The log cannot prove which device ctest used, so assert what it does
+          # prove: exactly one device, reporting coopmat2. "Some device fell back"
+          # is a different proposition - ggml selects integrated GPUs as well as
+          # discrete ones (ggml-vulkan.cpp, eDiscreteGpu || eIntegratedGpu), so an
+          # iGPU joining the box would redden a correct run and point at the
+          # driver instead of at the extra card.
+          #
+          # grep -c exits 1 on zero matches and this step runs under `bash -e`
+          # without pipefail, so the count must come after the presence check
+          # above or the step aborts with no output at all.
+          devices=$(grep -cE 'ggml_vulkan: [0-9]+ = ' "$log")
+          if [ "$devices" -ne 1 ]; then
+            echo "::error::expected exactly one Vulkan device, found $devices - the pool changed, reassess which card ctest used."
+            exit 1
+          fi
+
+          if ! grep -qE 'ggml_vulkan: 0 = .*matrix cores: NV_coopmat2' "$log"; then
+            echo "::error::the Vulkan device fell back off NV_coopmat2 - this lane duplicated -vulkan-cm."
             exit 1
           fi
 
