@@ -9918,21 +9918,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
-    // A strided src0 is repacked before the multiply, and under an explicit GGML_PREC_F32
-    // the repack has to keep f32: narrowing it would clamp the very operands the caller
-    // asked to keep unclamped, and it would hand the matmul an f16-source-with-f32-src1
-    // pair, which a coopmat2 build has no pipeline for at all. f32 x f32 has the scalar
-    // fp32 matmul everywhere, so preserving the type keeps both the math and the lookup.
     const ggml_type x_reformat_type = (prec_f32_f32 && x_non_contig) ? GGML_TYPE_F32 : f16_type;
-
-    // Keeping src0 in f32 only pays off if src1 follows it: f32 x f16 is a pair no device
-    // builds either, so the two operands have to agree on the precision the caller asked
-    // for. Both staying f32 lands on the scalar fp32 matmul, which every device has.
     const bool keep_operands_f32 = keep_src1_f32 || x_reformat_type == GGML_TYPE_F32;
-
-    // A strided src1 still has to be made contiguous even under GGML_PREC_F32, but
-    // the copy stays in F32 so it cannot clamp. Without this the fp16 reformat wins
-    // over keep_src1_f32 and the guarantee silently depends on src1's layout.
     const ggml_type y_reformat_type = keep_operands_f32 ? GGML_TYPE_F32 : f16_type;
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && (!y_non_contig || keep_operands_f32);
@@ -9959,7 +9946,6 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
 
     if (qx_needs_dequant) {
-        // Fall back to dequant + f16 mulmat
         mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, x_reformat_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, prec);
     }
 
