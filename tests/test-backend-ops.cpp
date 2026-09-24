@@ -3149,6 +3149,43 @@ struct test_cont : public test_case {
     }
 };
 
+// A [KW, KH, 1, C] depthwise weight permutation has equal strides on
+// its first two axes but nonpacked inner elements. Exercise CONT and both
+// sides of CPY independently of the convolution that exposed the bug.
+struct test_copy_permuted_rows : public test_case {
+    const ggml_type type;
+    const bool gapped;
+    const int mode; // 0: CONT; 1: strided source; 2: strided destination; 3: both
+
+    test_copy_permuted_rows(ggml_type type, bool gapped, int mode)
+        : type(type), gapped(gapped), mode(mode) {}
+
+    std::string vars() override {
+        return "copy_case=permuted_rows," + VARS_TO_STR3(type, gapped, mode);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto strided = [&]() {
+            if (gapped) {
+                // nb[0] < nb[1] also does not imply packed rows: a later
+                // axis can be the physical innermost one. Add view gaps.
+                ggml_tensor * base = ggml_new_tensor_4d(ctx, type, 5, 33, 3, 2);
+                ggml_tensor * view = ggml_view_4d(ctx, base, 3, 33, 3, 2,
+                    base->nb[1], base->nb[2], base->nb[3], ggml_type_size(type));
+                return ggml_permute(ctx, view, 2, 0, 1, 3);
+            }
+            return ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, 3, 3, 1, 33), 2, 3, 1, 0);
+        };
+        auto packed = [&]() { return ggml_new_tensor_4d(ctx, type, 33, gapped ? 3 : 1, 3, gapped ? 2 : 3); };
+        ggml_tensor * src = mode == 2 ? packed() : strided();
+        if (mode == 0) return ggml_cont(ctx, src);
+        ggml_tensor * dst = mode == 1 ? packed() : strided();
+        return ggml_cpy(ctx, src, dst);
+    }
+};
+
 // GGML_OP_ADD
 // GGML_OP_SUB
 // GGML_OP_MUL
@@ -9836,6 +9873,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (bool gapped : { false, true }) {
+            for (int mode : { 0, 1, 2, 3 }) {
+                test_cases.emplace_back(new test_copy_permuted_rows(type_dst, gapped, mode));
+            }
+        }
         for (int64_t pad0 : { 1, 3, 374 }) {
             test_cases.emplace_back(new test_cpy_view(GGML_TYPE_F32, type_dst, {37, 11, 3, 2}, pad0));
             test_cases.emplace_back(new test_cpy_view(GGML_TYPE_F16, type_dst, {37, 11, 3, 2}, pad0));

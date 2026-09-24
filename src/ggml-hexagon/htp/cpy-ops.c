@@ -259,20 +259,23 @@ int op_cpy(struct htp_ops_context * octx) {
     }
 
     const bool sametype   = (src0->type == dst->type);
-    const bool transposed = (nb00 > nb01) || (nb0 > nb1);
-    const bool sameshape  = !transposed && (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
+    // A singleton dimension can give a permuted tensor nb00 == nb01 even
+    // though elements along dimension zero are not adjacent. Row-copy and
+    // conversion kernels require packed inner rows, not merely !transposed.
+    const bool sameshape  = (ne00 == ne0 && ne01 == ne1 && ne02 == ne2 && ne03 == ne3);
+    const bool packed_rows = nb00 == ct.src0_type_size && nb0 == ct.dst_type_size;
 
     ct.src0_nrows_per_thread = (nr + n_threads - 1) / n_threads;
 
     worker_callback_t copy_fun;
 
-    if (sametype && sameshape) {
+    if (sametype && sameshape && packed_rows) {
         if (src0->type == HTP_TYPE_F32) {
             copy_fun = cpy_thread_f32_sameshape;
         } else {
             copy_fun = cpy_thread_f16_sameshape;
         }
-    } else if (sameshape) {
+    } else if (sameshape && packed_rows) {
         /**/ if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32)
             copy_fun = cpy_thread_f16_f32_sameshape;
         else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_F16)
