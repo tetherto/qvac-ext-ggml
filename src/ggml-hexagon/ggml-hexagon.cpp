@@ -3321,8 +3321,10 @@ static bool ggml_hexagon_supported_im2col(const struct ggml_hexagon_session * se
     }
     const bool is_2D = p[6] == 1;
 
-    // For now support F32->F32 and F32->F16 only.
-    if (src1->type != GGML_TYPE_F32 || (dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_F32)) {
+    // Quantized weight descriptors are reshaped when repacked for HTP. IM2COL
+    // needs the original kernel dimensions even though it does not read weights.
+    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
+        src1->type != GGML_TYPE_F32 || (dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_F32)) {
         return false;
     }
 
