@@ -747,15 +747,38 @@ static int execute_op_binary(struct htp_ops_context * octx) {
 
     bool is_transposed = (src0->nb[1] < src0_row_size || src1->nb[1] < src1_row_size || dst->nb[1] < dst_row_size);
 
-    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
-               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&
-               (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&
-               (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&
-               (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
+    // QVAC-25495 fix: `ne[0]` is an element count and VLEN is a byte width, so
+    // the historical `src0->ne[0] % VLEN == 0` check compared apples to oranges
+    // and only accidentally admitted shapes where `ne[0] * elem_size` happened
+    // to be a multiple of 128. Compute the alignment in bytes so all fast
+    // paths that gate on VLEN alignment see the same criterion.
+    bool bytes_aligned = ((size_t) src0->ne[0] * elem_size % VLEN == 0);
+    bool ne0_match     = (src1->ne[0] == src0->ne[0]);
 
-    bool is_row_bcast = is_same_shape && (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
-    bool is_complex   = !is_add_id && !is_scalar && !is_same_shape && (src1->ne[0] == src0->ne[0]);
-    bool is_repeat    = !is_add_id && !is_scalar && !is_same_shape && (src1->ne[0] != src0->ne[0]);
+    // Single-row broadcast (src1 collapses to one row across the whole src0
+    // tensor) has its own specialised kernel that loads the row into VTCM
+    // once and reuses it, so keep that fast path.
+    bool is_row_bcast = !is_add_id && !is_scalar && !is_transposed &&
+               ne0_match && bytes_aligned &&
+               (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+
+    // QVAC-25495 fix: only route to `binary_job_vector_same_shape` when src1
+    // truly matches src0 on every non-innermost dim. That kernel DMAs
+    // src1 with height=current_block_size striding by nb11, which reads
+    // past the actual src1 buffer whenever src1 broadcasts on dim 1 (or 2
+    // or 3) — the out-of-bounds bytes come back as the FLT_MAX bit pattern
+    // and propagate through attention as `inf`. Any partial broadcast now
+    // routes to `binary_job_vector_complex`, which fetches each src1 row
+    // via its true broadcast-aware address (fastmodulo on ne1x) and does
+    // not overread.
+    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
+               ne0_match && bytes_aligned &&
+               (src1->ne[1] == src0->ne[1]) &&
+               (src1->ne[2] == src0->ne[2]) &&
+               (src1->ne[3] == src0->ne[3]);
+
+    bool is_complex   = !is_add_id && !is_scalar && !is_row_bcast && !is_same_shape && ne0_match;
+    bool is_repeat    = !is_add_id && !is_scalar && !is_row_bcast && !is_same_shape && !ne0_match;
 
     size_t spad_row_total;
     if (is_same_shape) {
