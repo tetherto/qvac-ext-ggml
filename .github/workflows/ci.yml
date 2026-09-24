@@ -301,10 +301,14 @@ jobs:
           # iGPU joining the box would redden a correct run and point at the
           # driver instead of at the extra card.
           #
-          # grep -c exits 1 on zero matches and this step runs under `bash -e`
-          # without pipefail, so the count must come after the presence check
-          # above or the step aborts with no output at all.
-          devices=$(grep -cE 'ggml_vulkan: [0-9]+ = ' "$log")
+          # Distinct devices, not matching lines: ggml_vk_print_gpu_info runs once
+          # per process, and ci/run.sh starts several binaries, so one card prints
+          # its line several times per run. Counting lines made this fail with
+          # "found 2" on a single-GPU box.
+          #
+          # grep exits 1 on zero matches and this step runs under `bash -e`, so
+          # the count must come after the presence check above.
+          devices=$(grep -oE 'ggml_vulkan: [0-9]+ = [^|]+' "$log" | sort -u | wc -l | tr -d ' ')
           if [ "$devices" -ne 1 ]; then
             echo "::error::expected exactly one Vulkan device, found $devices - the pool changed, reassess which card ctest used."
             exit 1
