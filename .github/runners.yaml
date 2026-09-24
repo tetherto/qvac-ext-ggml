@@ -25,3 +25,6 @@ selfhosted_linux_x64_nvidia: qvac-ubuntu2204-x64-gpu # Linux x64 NVIDIA GPU, coo
 
 # Composite label set (all labels must match; AND semantics)
 selfhosted_macos_arm64: [self-hosted, macOS, ARM64] # Apple Silicon (Metal/Vulkan)
+
+# QVAC-24501 verification: temporary comment to exercise the on-PR CI flow.
+# This line is removed before this branch is closed.
