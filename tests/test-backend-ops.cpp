@@ -6682,6 +6682,95 @@ struct test_conv_2d_dw : public test_case {
     }
 };
 
+// FastConformer regression shapes. A distinct parameter tag makes it possible
+// to require this bounded suite on an accelerator without running the large
+// image-model cases. These graphs are compared with the CPU backend by the
+// ordinary test runner; no special tolerance or reference implementation.
+struct test_speech_im2col : public test_case {
+    const bool two_d;
+    const ggml_type output_type;
+    const bool gapped;
+    const int stride;
+    const int dilation;
+    const int64_t channels;
+
+    test_speech_im2col(bool two_d, ggml_type output_type, bool gapped,
+                      int stride, int dilation, int64_t channels)
+        : two_d(two_d), output_type(output_type), gapped(gapped),
+          stride(stride), dilation(dilation), channels(channels) {}
+
+    std::string vars() override {
+        return "speech_case=im2col," + VARS_TO_STR6(two_d, output_type, gapped, stride, dilation, channels);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t width = 37;
+        const int64_t height = two_d ? 7 : channels;
+        const int64_t depth = two_d ? channels : 2;
+        const int64_t batches = two_d ? 2 : 1;
+        ggml_tensor * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+            width + (gapped && !two_d ? 3 : 0),
+            height + (gapped && two_d ? 3 : 0), depth, batches);
+        ggml_set_name(storage, "speech-input-storage");
+        ggml_tensor * input = storage;
+        if (gapped) {
+            // Channel/batch strides exceed the logical extent, and the first
+            // sample has a nonzero offset. Spatial rows stay packed, as
+            // required by GGML's CPU reference.
+            input = ggml_view_4d(ctx, storage, width, height, depth, batches,
+                storage->nb[1], storage->nb[2], storage->nb[3], sizeof(float));
+        }
+        ggml_tensor * kernel = two_d
+            ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, channels, 2)
+            : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 9, channels, 2, 1);
+        ggml_set_name(kernel, "speech-im2col-kernel");
+        ggml_tensor * out = ggml_im2col(ctx, kernel, input, stride, two_d ? stride : 0,
+            two_d ? dilation : 4 * dilation, two_d ? dilation : 0,
+            dilation, two_d ? dilation : 0, two_d, output_type);
+        ggml_set_name(out, "speech-im2col");
+        return out;
+    }
+};
+
+struct test_speech_depthwise : public test_case {
+    const ggml_type weight_type;
+    const bool cwhn;
+    const int64_t channels;
+    const int stride;
+    const int dilation;
+    const bool subsampler;
+
+    test_speech_depthwise(ggml_type weight_type, bool cwhn, int64_t channels,
+                         int stride, int dilation, bool subsampler)
+        : weight_type(weight_type), cwhn(cwhn), channels(channels),
+          stride(stride), dilation(dilation), subsampler(subsampler) {}
+
+    std::string vars() override {
+        return "speech_case=depthwise," + VARS_TO_STR6(weight_type, cwhn, channels, stride, dilation, subsampler);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // 37 positions exercise vector tails; height one is the conformer
+        // temporal convolution, height seven exercises the 2D subsampler.
+        ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 37,
+            subsampler ? 7 : 1, channels, 2);
+        ggml_tensor * kernel = ggml_new_tensor_4d(ctx, weight_type,
+            subsampler ? 3 : 9, subsampler ? 3 : 1, 1, channels);
+        ggml_set_name(input, "speech-depthwise-input");
+        ggml_set_name(kernel, "speech-depthwise-kernel");
+        if (cwhn) {
+            input = ggml_permute(ctx, ggml_cont(ctx, ggml_permute(ctx, input, 1, 2, 0, 3)), 2, 0, 1, 3);
+            kernel = ggml_permute(ctx, ggml_cont(ctx, ggml_permute(ctx, kernel, 2, 3, 1, 0)), 3, 2, 0, 1);
+        }
+        ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input,
+            stride, subsampler ? stride : 1,
+            (subsampler ? 1 : 4) * dilation, subsampler ? dilation : 0,
+            dilation, subsampler ? dilation : 1);
+        ggml_set_name(out, "speech-depthwise");
+        return out;
+    }
+};
+
 // GGML_OP_CONV_3D
 struct test_conv_3d : public test_case {
     // Logical 5D dimensions
@@ -9473,6 +9562,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {1024, 1024, 256, 1}, {3, 3, 256, 1}, 1, 1, 1, 1, 1, 1, true));
 
     test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9},  GGML_TYPE_F32, 1, 0, 1, false));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool two_d : {false, true}) {
+            for (bool gapped : {false, true}) {
+                for (int stride : {1, 2}) {
+                    for (int dilation : {1, 2}) {
+                        test_cases.emplace_back(new test_speech_im2col(two_d, type, gapped, stride, dilation, 3));
+                    }
+                }
+            }
+        }
+        for (bool cwhn : {false, true}) {
+            for (int64_t channels : {1, 31, 32, 33, 64}) {
+                for (bool subsampler : {false, true}) {
+                    test_cases.emplace_back(new test_speech_depthwise(type, cwhn, channels, 1, 1, subsampler));
+                    test_cases.emplace_back(new test_speech_depthwise(type, cwhn, channels, 2, 1, subsampler));
+                    test_cases.emplace_back(new test_speech_depthwise(type, cwhn, channels, 1, 2, subsampler));
+                }
+            }
+        }
+    }
     test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9},  GGML_TYPE_F32, 1, 0, 1, true));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F32, 2, 1, 1, false));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F32, 2, 1, 1, true));
