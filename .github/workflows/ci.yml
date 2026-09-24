@@ -227,7 +227,7 @@ jobs:
   ggml-ci-x64-nvidia-cuda:
     needs: [runner_names, authorize]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
+    runs-on: ${{ needs.runner_names.outputs.selfhosted_linux_x64_nvidia }}
     steps:
       - name: Clone
         id: checkout
@@ -237,12 +237,12 @@ jobs:
         id: ggml-ci
         run: |
           nvidia-smi
-          GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
+          GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   ggml-ci-x64-nvidia-vulkan-cm:
     needs: [runner_names, authorize]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
+    runs-on: ${{ needs.runner_names.outputs.selfhosted_linux_x64_nvidia }}
     steps:
       - name: Clone
         id: checkout
@@ -252,12 +252,12 @@ jobs:
         id: ggml-ci
         run: |
           vulkaninfo --summary
-          GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
+          GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   ggml-ci-x64-nvidia-vulkan-cm2:
     needs: [runner_names, authorize]
     if: needs.authorize.outputs.allowed == 'true'
-    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia_coopmat2) }}
+    runs-on: ${{ needs.runner_names.outputs.selfhosted_linux_x64_nvidia }}
     steps:
       - name: Clone
         id: checkout
@@ -266,10 +266,63 @@ jobs:
       - name: Test
         id: ggml-ci
         run: |
+          set -eo pipefail
           vulkaninfo --summary
-          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
+          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/ggml ~/mnt/ggml 2>&1 \
+            | tee "$RUNNER_TEMP/ggml-ci-cm2.log"
 
-  # TODO: provision AMX-compatible machine
+      # QVAC-24501: coopmat2 is feature-detected and fails open - ggml drops to
+      # the plain Vulkan path with no error, so a runner joining the pool with an
+      # older driver or glslc makes this a silent duplicate of -vulkan-cm.
+      #
+      # Asserted negatively, per device. ggml_vk_print_gpu_info runs once per
+      # selected device, so a positive grep for NV_coopmat2 would pass on a
+      # multi-GPU box even when the tests ran on the card that fell back. ci/run.sh
+      # never sets GGML_VK_VISIBLE_DEVICES, so ggml chooses. Failing on any device
+      # that reports a lesser backend stays correct for any device count.
+      - name: Assert coopmat2 was actually exercised
+        run: |
+          log="$RUNNER_TEMP/ggml-ci-cm2.log"
+
+          # Presence first. The backend can enumerate nothing and return without
+          # aborting - two early returns logging "No devices found."
+          # (src/ggml-vulkan/ggml-vulkan.cpp) - so a missing ICD or an
+          # unavailable card leaves ctest on the CPU backend with no device lines
+          # at all, and every per-device check below passes vacuously.
+          if ! grep -qE 'ggml_vulkan: [0-9]+ = ' "$log"; then
+            echo "::error::no Vulkan device lines in the log - the backend never enumerated."
+            exit 1
+          fi
+
+          # The log cannot prove which device ctest used, so assert what it does
+          # prove: exactly one device, reporting coopmat2. "Some device fell back"
+          # is a different proposition - ggml selects integrated GPUs as well as
+          # discrete ones (ggml-vulkan.cpp, eDiscreteGpu || eIntegratedGpu), so an
+          # iGPU joining the box would redden a correct run and point at the
+          # driver instead of at the extra card.
+          #
+          # Distinct devices, not matching lines: ggml_vk_print_gpu_info runs once
+          # per process, and ci/run.sh starts several binaries, so one card prints
+          # its line several times per run. Counting lines made this fail with
+          # "found 2" on a single-GPU box.
+          #
+          # grep exits 1 on zero matches and this step runs under `bash -e`, so
+          # the count must come after the presence check above.
+          devices=$(grep -oE 'ggml_vulkan: [0-9]+ = [^|]+' "$log" | sort -u | wc -l | tr -d ' ')
+          if [ "$devices" -ne 1 ]; then
+            echo "::error::expected exactly one Vulkan device, found $devices - the pool changed, reassess which card ctest used."
+            exit 1
+          fi
+
+          if ! grep -qE 'ggml_vulkan: 0 = .*matrix cores: NV_coopmat2' "$log"; then
+            echo "::error::the Vulkan device fell back off NV_coopmat2 - this lane duplicated -vulkan-cm."
+            exit 1
+          fi
+
+  # TODO: provision AMX-compatible machine, then add its labels to runners.yaml
+  #       and wire runs-on through runner_names. The machine alone is not enough:
+  #       this label set is not in the catalog, so it would queue 24h and be
+  #       cancelled, and the detector skips comment lines so nothing warns.
   #ggml-ci-x64-cpu-amx:
   #  needs: [runner_names, authorize]
   #  if: needs.authorize.outputs.allowed == 'true'
@@ -283,7 +336,7 @@ jobs:
   #    - name: Test
   #      id: ggml-ci
   #      run: |
-  #        bash ./ci/run.sh ~/results/ggml /mnt/ggml
+  #        bash ./ci/run.sh ~/results/ggml ~/mnt/ggml
 
   ggml-ci-mac-metal:
     needs: [runner_names, authorize]

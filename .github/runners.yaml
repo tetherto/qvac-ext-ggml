@@ -19,7 +19,9 @@
 ubuntu_2204: ubuntu-22.04 # Ubuntu 22.04 hosted x64
 ubuntu_2204_arm: ubuntu-22.04-arm # Ubuntu 22.04 hosted arm64
 
-# Self-hosted composite label sets (all labels must match; AND semantics)
-selfhosted_linux_x64_nvidia: [self-hosted, Linux, X64, NVIDIA] # Linux x64 NVIDIA GPU
-selfhosted_linux_x64_nvidia_coopmat2: [self-hosted, Linux, X64, NVIDIA, COOPMAT2] # + Vulkan coopmat2
+# Self-hosted. QVAC-24501: upstream's [self-hosted, Linux, X64, NVIDIA(, COOPMAT2)]
+# sets match no runner here. One key, not two: the catalog rejects duplicate targets.
+selfhosted_linux_x64_nvidia: qvac-ubuntu2204-x64-gpu # Linux x64 NVIDIA GPU, coopmat2 capable
+
+# Composite label set (all labels must match; AND semantics)
 selfhosted_macos_arm64: [self-hosted, macOS, ARM64] # Apple Silicon (Metal/Vulkan)
