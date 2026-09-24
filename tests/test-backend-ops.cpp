@@ -6808,6 +6808,52 @@ struct test_speech_depthwise : public test_case {
     }
 };
 
+// QVAC-25495 Parakeet attention bias-broadcast add.
+//
+// Repros the exact op that first produces FLT_MAX / inf on HTP0 in the
+// unfused relative-position MHA path:
+//
+//   q_perm  = cont(permute(q, 0,2,1,3))  // shape (HD, T, H, 1) f32
+//   u_bias  = reshape_3d(pos_bias_u, HD, 1, H)  // shape (HD, 1, H, 1) f32
+//   q_u     = ggml_add(q_perm, u_bias)   // broadcast on dim 1
+//
+// For Parakeet CTC 0.6b: HD=128, H=8, T=376. The parity harness measured
+// max_abs(q_u_htp) ≈ 3.402e38 (== FLT_MAX bit pattern 0x7F7FFFFF) while the
+// inputs to the ADD are both well-conditioned (|q_perm| ≤ 0.03, |u_bias|
+// ≤ ~1). This test isolates the failing op from the surrounding graph
+// so the bug can be filed against ggml-hexagon's ADD kernel independently
+// of Parakeet.
+//
+// The test does NOT use the test_bin_bcast pattern because that class
+// permutes / views one operand; we want the exact contiguous
+// (HD, T, H, 1) + (HD, 1, H, 1) case as ggml_backend_sched sees it.
+struct test_speech_attn_bcast_add : public test_case {
+    const int64_t HD;   // head dim
+    const int64_t T;    // frames
+    const int64_t H;    // heads
+
+    test_speech_attn_bcast_add(int64_t HD, int64_t T, int64_t H)
+        : HD(HD), T(T), H(H) {}
+
+    std::string vars() override {
+        return "speech_case=attn_bcast_add," + VARS_TO_STR3(HD, T, H);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q_perm: contiguous (HD, T, H, 1) f32 — matches cont(permute(q)) layout.
+        ggml_tensor * q_perm = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD, T, H, 1);
+        ggml_set_name(q_perm, "speech-attn-q-perm");
+
+        // u_bias: contiguous (HD, 1, H, 1) f32 — matches reshape_3d(pos_bias_u).
+        ggml_tensor * u_bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD, 1, H, 1);
+        ggml_set_name(u_bias, "speech-attn-u-bias");
+
+        ggml_tensor * out = ggml_add(ctx, q_perm, u_bias);
+        ggml_set_name(out, "speech-attn-bcast-add");
+        return out;
+    }
+};
+
 // GGML_OP_CONV_3D
 struct test_conv_3d : public test_case {
     // Logical 5D dimensions
@@ -9619,6 +9665,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // QVAC-25495: Parakeet's attention u_bias / v_bias broadcast add. The
+    // exact CTC 0.6b shape is (128, 376, 8, 1) + (128, 1, 8, 1) → see the
+    // struct doc above. Also probe head-dim-aligned nearby shapes so any
+    // fix can be validated across a small tile window.
+    test_cases.emplace_back(new test_speech_attn_bcast_add(128, 376, 8));
+    test_cases.emplace_back(new test_speech_attn_bcast_add(128,   1, 8));
+    test_cases.emplace_back(new test_speech_attn_bcast_add(128,  32, 8));
+    test_cases.emplace_back(new test_speech_attn_bcast_add( 64, 376, 8));
+    test_cases.emplace_back(new test_speech_attn_bcast_add(128, 375, 8));  // T not divisible by 8
     test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9},  GGML_TYPE_F32, 1, 0, 1, true));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F32, 2, 1, 1, false));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F32, 2, 1, 1, true));

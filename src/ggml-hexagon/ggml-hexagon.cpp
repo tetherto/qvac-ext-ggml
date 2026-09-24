@@ -1589,8 +1589,25 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
 
         if (rsp.status != HTP_STATUS_OK) {
-            GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp: %s\n", this->c_name(), status_to_str(rsp.status));
-            // TODO: handle errors
+            // QVAC-25495 diagnostic: swallowing a DSP failure leaves the
+            // output tensor uninitialized on the host, which downstream
+            // ops silently read as zeros. Dump the failing batch's ops so
+            // we can identify which shape/op the DSP could not execute,
+            // then abort — better a hard crash than a garbled transcript.
+            GGML_LOG_ERROR("ggml-hex: %s dspcall FAILED : dsp-rsp: %s (status=%u) batch-id=%u n_ops=%u\n",
+                           this->c_name(), status_to_str(rsp.status),
+                           (unsigned) rsp.status, (unsigned) rsp.id, (unsigned) rsp.n_ops);
+            if (op_queue && rsp.id < op_queue->op_cache.size()) {
+                const auto & ops = op_queue->op_cache[rsp.id];
+                const uint32_t n_dump = std::min<uint32_t>(rsp.n_ops, (uint32_t) ops.size());
+                for (uint32_t i = 0; i < n_dump; i++) {
+                    htp_opformat fmt(ops[i]);
+                    GGML_LOG_ERROR("ggml-hex: %s   op[%u] %s|%s|%s|%s|%s|%s|%s\n",
+                                   this->c_name(), i, ops[i].op_name().c_str(),
+                                   fmt.names, fmt.dims, fmt.types, fmt.strides, fmt.buffs, fmt.kparams);
+                }
+            }
+            GGML_ABORT("ggml-hex: %s aborting on DSP failure (see op dump above)\n", this->c_name());
         }
 
         op_queue->pop(rsp, dbuf);
@@ -2200,12 +2217,19 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     bool is_batched
 ) {
     const int ne00  = src0->ne[0];
+    const int ne01  = src0->ne[1];
     const int ne11  = src1->ne[1];
     const int ne12  = src1->ne[2];
     const int wtype = src0->type;
 
-    // HMX weight tile requires N to be 32-aligned.
-    if (ne01_padded % 32 != 0) {
+    // HMX weight tile requires N to be 32-aligned. Checking ne01_padded is
+    // pointless because it is always hex_round_up(ne01, 32) for repack
+    // types, so every quantized weight passes this gate even when the
+    // actual n is not aligned. The HMX 2D kernel (hmx_mm_2d_f32) then
+    // refuses at runtime with `n % 32 != 0`, returning INTERNAL_ERROR.
+    // QVAC-25495: check the true ne01 so non-aligned outputs (Parakeet
+    // CTC head has ne01=1025) route to HVX, which handles arbitrary N.
+    if (ne01_padded % 32 != 0 || ne01 % 32 != 0) {
         return false;
     }
 
@@ -3551,6 +3575,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
                 case GGML_UNARY_OP_EXP:        return HTP_OP_UNARY_EXP;
                 case GGML_UNARY_OP_SOFTPLUS:   return HTP_OP_UNARY_SOFTPLUS;
                 case GGML_UNARY_OP_TANH:       return HTP_OP_UNARY_TANH;
+                case GGML_UNARY_OP_RELU:       return HTP_OP_UNARY_RELU;
             default:
                 break;
             }
@@ -3753,6 +3778,19 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
             htp_opnode node(n, {}, HTP_OP_INVALID);
             node.opcode = op_remap_to_htp(n);
+            if (node.opcode == HTP_OP_INVALID) {
+                // QVAC-25495 Fix A: op_remap_to_htp can return HTP_OP_INVALID
+                // for e.g. GGML_UNARY_OP_RELU when the outer unary switch has
+                // no entry. The scheduler is meant to catch these via
+                // supports_op=false, but if one slips through it would be
+                // shipped to the DSP with opcode INVALID and crash the DSP
+                // handler silently (rsp.status=UNKNOWN, uninitialized outputs).
+                // Fail loudly at the host instead.
+                GGML_ABORT("ggml-hex: %s graph-compute cannot dispatch %s "
+                           "(HTP_OP_INVALID) — add a case to op_remap_to_htp "
+                           "and supports_op, or exclude via supports_op=false\n",
+                           sess->c_name(), ggml_op_desc(n));
+            }
             if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
                 ggml_hexagon_precompute_matmul_params(sess,
                     node.node->src[0], node.node->src[1], node.node,
@@ -4065,10 +4103,13 @@ static bool ggml_hexagon_supported_cpy(const struct ggml_hexagon_session * sess,
     // can handle any shape and any same-type (pretty slow if reshaping is required)
     if (sametype) return true;
 
-    // Conversion kernels walk packed inner rows only. In particular, equal
-    // strides around singleton axes do not prove that the rows are packed.
-    if (!sameshape || !packed_rows) return false;
+    // Conversion kernels walk packed inner rows for the fast path.
+    // Equal strides around singleton axes do not prove that the rows are packed.
+    if (!sameshape) return false;
+    if (packed_rows) return true;
 
+    // QVAC-25495: permuted / strided f32↔f16 source, same shape but non-packed
+    // rows — handled by the scalar strided conversion kernels in cpy-ops.c.
     return true;
 }
 
@@ -4210,6 +4251,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK:
+                case GGML_UNARY_OP_RELU:
                     supp = ggml_hexagon_supported_unary(sess, op);
                     break;
                 default:

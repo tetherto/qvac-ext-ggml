@@ -232,6 +232,72 @@ static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, voi
     }
 }
 
+// QVAC-25495: Parakeet's subsampler feeds the pointwise matmul with a
+// (permuted) view where dim0 has a huge byte stride (nb00 != elem_size).
+// The row-based sameshape kernels above assume packed inner rows and were
+// dispatched to NO_SUPPORT for this shape. This scalar variant walks every
+// element via its full stride quadruple so it works for arbitrary permuted
+// / strided sources. Performance is unoptimised — kept simple for
+// correctness; can be re-vectorised once we know which axis is packed.
+static void cpy_thread_f32_f16_strided(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;
+    struct htp_ops_context * octx = ct->octx;
+    cpy_preamble;
+
+    const uint32_t dr  = ct->src0_nrows_per_thread;
+    const uint32_t ir0 = dr * ith;
+    const uint32_t ir1 = (ir0 + dr) < nr ? (ir0 + dr) : nr;
+    if (ir0 >= nr) return;
+
+    for (uint32_t i03 = 0; i03 < ne03; i03++) {
+        for (uint32_t i02 = 0; i02 < ne02; i02++) {
+            for (uint32_t i01 = ir0; i01 < ir1; i01++) {
+                for (uint32_t i00 = 0; i00 < ne00; i00++) {
+                    const uint8_t * src_ptr = (const uint8_t *) src0->data +
+                                              i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+                    uint8_t *       dst_ptr = (uint8_t *) dst->data +
+                                              i00*nb0  + i01*nb1  + i02*nb2  + i03*nb3;
+                    float  x;
+                    memcpy(&x, src_ptr, sizeof(float));
+                    __fp16 y = (__fp16) x;
+                    memcpy(dst_ptr, &y, sizeof(__fp16));
+                }
+            }
+        }
+    }
+}
+
+// Mirror of cpy_thread_f32_f16_strided for the reverse conversion. Same
+// rationale — used when the graph produces a strided f16 source that must
+// be materialised as f32 (post-attention CONT+cast patterns).
+static void cpy_thread_f16_f32_strided(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_copy_context * ct = (struct htp_copy_context *) data;
+    struct htp_ops_context * octx = ct->octx;
+    cpy_preamble;
+
+    const uint32_t dr  = ct->src0_nrows_per_thread;
+    const uint32_t ir0 = dr * ith;
+    const uint32_t ir1 = (ir0 + dr) < nr ? (ir0 + dr) : nr;
+    if (ir0 >= nr) return;
+
+    for (uint32_t i03 = 0; i03 < ne03; i03++) {
+        for (uint32_t i02 = 0; i02 < ne02; i02++) {
+            for (uint32_t i01 = ir0; i01 < ir1; i01++) {
+                for (uint32_t i00 = 0; i00 < ne00; i00++) {
+                    const uint8_t * src_ptr = (const uint8_t *) src0->data +
+                                              i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+                    uint8_t *       dst_ptr = (uint8_t *) dst->data +
+                                              i00*nb0  + i01*nb1  + i02*nb2  + i03*nb3;
+                    __fp16 y;
+                    memcpy(&y, src_ptr, sizeof(__fp16));
+                    float  x = (float) y;
+                    memcpy(dst_ptr, &x, sizeof(float));
+                }
+            }
+        }
+    }
+}
+
 int op_cpy(struct htp_ops_context * octx) {
     cpy_preamble;
 
@@ -280,6 +346,17 @@ int op_cpy(struct htp_ops_context * octx) {
             copy_fun = cpy_thread_f16_f32_sameshape;
         else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_F16)
             copy_fun = cpy_thread_f32_f16_sameshape;
+        else
+            return HTP_STATUS_NO_SUPPORT;
+    } else if (sameshape && !sametype) {
+        // Permuted / strided source with a type conversion (QVAC-25495).
+        // Scalar fallback — see the strided kernels above. Only used when
+        // the type differs; same-type strided sources fall through to the
+        // existing reshape kernels below.
+        /**/ if (dst->type == HTP_TYPE_F16 && src0->type == HTP_TYPE_F32)
+            copy_fun = cpy_thread_f32_f16_strided;
+        else if (dst->type == HTP_TYPE_F32 && src0->type == HTP_TYPE_F16)
+            copy_fun = cpy_thread_f16_f32_strided;
         else
             return HTP_STATUS_NO_SUPPORT;
     } else if (sametype) {
