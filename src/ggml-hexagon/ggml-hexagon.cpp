@@ -3281,33 +3281,110 @@ static bool ggml_hexagon_supported_ssm_conv(const struct ggml_hexagon_session * 
     GGML_UNUSED(sess);
 }
 
+// HTP tensor descriptors and all convolution loop counts are 32-bit. Reject
+// oversized views before serializing them, including an overflowing byte span.
+static bool ggml_hexagon_conv_tensor_fits(const struct ggml_tensor * t) {
+    uint64_t span = ggml_type_size(t->type);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (t->ne[i] <= 0 || t->ne[i] > INT32_MAX || t->nb[i] > INT32_MAX) {
+            return false;
+        }
+        const uint64_t extent = i == 0 ? t->ne[i] / ggml_blck_size(t->type) : t->ne[i];
+        if (extent == 0) {
+            return false;
+        }
+        span += (extent - 1) * t->nb[i];
+        if (span > INT32_MAX) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_hexagon_conv_extent(int64_t input, int64_t kernel, int32_t stride,
+                                     int32_t pad, int32_t dilation, int64_t output) {
+    if (stride <= 0 || pad < 0 || dilation <= 0) {
+        return false;
+    }
+    const int64_t extent = input + 2LL * pad - (int64_t) dilation * (kernel - 1) - 1;
+    return extent >= 0 && extent / stride + 1 == output;
+}
+
 static bool ggml_hexagon_supported_im2col(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst  = op;
 
-    const bool is_2D = ((const int32_t *) op->op_params)[6] == 1;
-    if (!is_2D) {
+    const int32_t * p = (const int32_t *) op->op_params;
+    if (p[6] != 0 && p[6] != 1) {
         return false;
     }
+    const bool is_2D = p[6] == 1;
 
     // For now support F32->F32 and F32->F16 only.
     if (src1->type != GGML_TYPE_F32 || (dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_F32)) {
         return false;
     }
 
-    if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+    if (!ggml_hexagon_conv_tensor_fits(src0) || !ggml_hexagon_conv_tensor_fits(src1) ||
+        !ggml_hexagon_conv_tensor_fits(dst) || !ggml_is_contiguous(dst)) {
         return false;
     }
 
-    // For now keep padded OPs on CPU. Will revisit once we expand coverage past patch-embed OPs.
-    const int32_t p0 = ((const int32_t *) op->op_params)[2];
-    const int32_t p1 = ((const int32_t *) op->op_params)[3];
-    if (p0 != 0 || p1 != 0) {
+    // CPU IM2COL also requires packed spatial rows; channel and batch views
+    // may have gaps. The DSP uses their byte strides instead of flattening them.
+    if (src1->nb[0] != sizeof(float) ||
+        (is_2D && src1->nb[1] != src1->ne[0] * sizeof(float))) {
+        return false;
+    }
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (src1->nb[i] % sizeof(float) != 0 || src1->nb[i] < src1->nb[i - 1] * src1->ne[i - 1]) {
+            return false;
+        }
+    }
+    if (!ggml_hexagon_conv_extent(src1->ne[0], src0->ne[0], p[0], p[2], p[4], dst->ne[1])) {
+        return false;
+    }
+    if (is_2D) {
+        if (src0->ne[2] != src1->ne[2] ||
+            !ggml_hexagon_conv_extent(src1->ne[1], src0->ne[1], p[1], p[3], p[5], dst->ne[2]) ||
+            dst->ne[0] != src0->ne[0] * src0->ne[1] * src1->ne[2] || dst->ne[3] != src1->ne[3]) {
+            return false;
+        }
+    } else if (src0->ne[1] != src1->ne[1] || src1->ne[3] != 1 ||
+               dst->ne[0] != src0->ne[0] * src1->ne[1] || dst->ne[2] != src1->ne[2] || dst->ne[3] != 1 ||
+               p[3] != 0) {
         return false;
     }
 
     GGML_UNUSED(sess);
     return true;
+}
+
+static bool ggml_hexagon_supported_conv_2d_dw(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const auto * k = op->src[0];
+    const auto * x = op->src[1];
+    const int32_t * p = (const int32_t *) op->op_params;
+    if ((k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        !ggml_hexagon_conv_tensor_fits(k) || !ggml_hexagon_conv_tensor_fits(x) || !ggml_hexagon_conv_tensor_fits(op) ||
+        k->ne[2] != 1 || k->ne[3] != x->ne[2] || op->ne[2] != x->ne[2] || op->ne[3] != x->ne[3] ||
+        !ggml_hexagon_conv_extent(x->ne[0], k->ne[0], p[0], p[2], p[4], op->ne[0]) ||
+        !ggml_hexagon_conv_extent(x->ne[1], k->ne[1], p[1], p[3], p[5], op->ne[1])) {
+        return false;
+    }
+    if (ggml_is_contiguous(x)) {
+        return ggml_is_contiguous(k) && ggml_is_contiguous(op);
+    }
+    // Channel-contiguous activations and weights (logical [KW, KH, 1, C]).
+    const size_t ke = ggml_type_size(k->type);
+    const int64_t c = x->ne[2];
+    GGML_UNUSED(sess);
+    return ggml_is_contiguous_channels(x) && ggml_is_contiguous_channels(op) &&
+           x->nb[2] == sizeof(float) && x->nb[0] == c * sizeof(float) &&
+           x->nb[1] == x->ne[0] * x->nb[0] && x->nb[3] == x->ne[1] * x->nb[1] &&
+           op->nb[2] == sizeof(float) && op->nb[0] == c * sizeof(float) &&
+           op->nb[1] == op->ne[0] * op->nb[0] && op->nb[3] == op->ne[1] * op->nb[1] &&
+           k->nb[3] == ke && k->nb[0] == c * ke && k->nb[1] == k->ne[0] * k->nb[0];
 }
 
 static bool ggml_hexagon_supported_pad(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
@@ -3460,6 +3537,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_TRI:             return HTP_OP_TRI;
         case GGML_OP_PAD:             return HTP_OP_PAD;
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
+        case GGML_OP_CONV_2D_DW:      return HTP_OP_CONV_2D_DW;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -4185,6 +4263,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_IM2COL:
             supp = ggml_hexagon_supported_im2col(sess, op);
+            break;
+
+        case GGML_OP_CONV_2D_DW:
+            supp = ggml_hexagon_supported_conv_2d_dw(sess, op);
             break;
 
         case GGML_OP_GATED_DELTA_NET:
