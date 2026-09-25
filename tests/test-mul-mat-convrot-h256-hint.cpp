@@ -11,23 +11,22 @@ namespace {
 
 constexpr int kH = 256;
 
-void convrot_h256(float * values) {
-    std::array<float, kH> tmp;
-    for (int stride = 1; stride < kH; stride *= 4) {
-        for (int base = 0; base < kH; base += 4 * stride) {
-            for (int i = 0; i < stride; ++i) {
-                const float a = values[base + 0 * stride + i];
-                const float b = values[base + 1 * stride + i];
-                const float c = values[base + 2 * stride + i];
-                const float d = values[base + 3 * stride + i];
-                tmp[base + 0 * stride + i] = ( a + b + c - d) * 0.5f;
-                tmp[base + 1 * stride + i] = ( a + b - c + d) * 0.5f;
-                tmp[base + 2 * stride + i] = ( a - b + c + d) * 0.5f;
-                tmp[base + 3 * stride + i] = (-a + b + c + d) * 0.5f;
-            }
-        }
-        std::memcpy(values, tmp.data(), sizeof(float) * kH);
+// Closed-form Kronecker product of the four ComfyUI radix-4 sign matrices.
+// Unlike the CUDA kernel, this oracle does not execute any butterfly stages.
+float dense_h256_coefficient(int row, int col) {
+    constexpr int signs[4][4] = {
+        { 1,  1,  1, -1},
+        { 1,  1, -1,  1},
+        { 1, -1,  1,  1},
+        {-1,  1,  1,  1},
+    };
+    int sign = 1;
+    for (int digit = 0; digit < 4; ++digit) {
+        sign *= signs[row % 4][col % 4];
+        row /= 4;
+        col /= 4;
     }
+    return sign * (1.0f / 16.0f);
 }
 
 } // namespace
@@ -67,12 +66,9 @@ int main() {
     ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kH, kH);
     std::array<float, kH * kH> h_data = {};
 #if !defined(GGML_TEST_CONVROT_H256_CUDA)
-    for (int col = 0; col < kH; ++col) {
-        std::array<float, kH> basis = {};
-        basis[col] = 1.0f;
-        convrot_h256(basis.data());
-        for (int row = 0; row < kH; ++row) {
-            h_data[col + row * kH] = basis[row];
+    for (int row = 0; row < kH; ++row) {
+        for (int col = 0; col < kH; ++col) {
+            h_data[col + row * kH] = dense_h256_coefficient(row, col);
         }
     }
 #endif
@@ -108,14 +104,15 @@ int main() {
     if (status == 0) ggml_backend_tensor_get(y, y_data.data(), 0, ggml_nbytes(y));
 
     for (int row = 0; row < kRows * kBatches && status == 0; ++row) {
-        std::array<float, kH> expected;
-        std::memcpy(expected.data(), x_data.data() + row * kH, sizeof(float) * kH);
-        for (float & value : expected) value *= kScale;
-        convrot_h256(expected.data());
         for (int col = 0; col < kH; ++col) {
+            float expected = 0.0f;
+            for (int input = 0; input < kH; ++input) {
+                expected += dense_h256_coefficient(col, input) *
+                            (x_data[input + row * kH] * kScale);
+            }
             const float actual = y_data[col + row * kH];
-            if (std::fabs(actual - expected[col]) > 2e-5f) {
-                std::fprintf(stderr, "mismatch at [%d, %d]: %f != %f\n", col, row, actual, expected[col]);
+            if (std::fabs(actual - expected) > 2e-5f) {
+                std::fprintf(stderr, "mismatch at [%d, %d]: %f != %f\n", col, row, actual, expected);
                 status = 3;
                 break;
             }
