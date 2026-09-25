@@ -2032,6 +2032,8 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     kparams->logit_softcap = logit_softcap;
 
     kparams->is_q_fp32 = (q->type == GGML_TYPE_F32) ? 1 : 0;
+    kparams->is_k_fp32 = (k->type == GGML_TYPE_F32) ? 1 : 0;
+    kparams->is_v_fp32 = (v->type == GGML_TYPE_F32) ? 1 : 0;
     kparams->is_dst_fp32 = (dst->type == GGML_TYPE_F32) ? 1 : 0;
     kparams->G = G;
 
@@ -2044,7 +2046,8 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     const struct ggml_tensor * sinks = op->src[4];
     if (ggml_hexagon_flash_attn_is_hmx_eligible(sess, q, k, v, sinks)) {
         size_t Br = 0, Bc = 0;
-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, nek1, sess->vtcm_size, sess->n_threads, kparams->is_q_fp32 != 0);
+        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, nek1, sess->vtcm_size, sess->n_threads,
+                                         kparams->is_q_fp32 != 0, kparams->is_k_fp32 != 0, kparams->is_v_fp32 != 0);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             kparams->Br = Br;
@@ -2054,7 +2057,8 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 
             kparams->u.hmx.g_br = hex_align_up(G * Br, 32);
             kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? 1 : 0;
-            kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK, DV, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, kparams->is_q_fp32 != 0);
+            kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK, DV, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0,
+                                                           kparams->is_q_fp32 != 0, kparams->is_k_fp32 != 0, kparams->is_v_fp32 != 0);
 
             const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
             kparams->u.hmx.row_buf_stride = row_vec_bytes / 128; // HVX vector is 128 bytes
@@ -2082,10 +2086,10 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     kparams->n_threads = sess->n_threads;
 
     const size_t size_q_row_padded = hex_round_up(q->ne[0] * (kparams->is_q_fp32 ? 4 : 2), 128);
-    const size_t size_k_row_padded = hex_round_up(k->ne[0] * 2, 128);
-    const size_t size_v_row_padded = hex_round_up(v->ne[0] * 2, 128);
+    const size_t size_k_row_padded = hex_round_up(k->ne[0] * (kparams->is_k_fp32 ? 4 : 2), 128);
+    const size_t size_v_row_padded = hex_round_up(v->ne[0] * (kparams->is_v_fp32 ? 4 : 2), 128);
 
-    kparams->vtcm_size = hvx_fa_compute_vtcm_usage(DK, DV, kparams->is_q_fp32 != 0, mask != nullptr, sess->n_threads);
+    kparams->vtcm_size = hvx_fa_compute_vtcm_usage(DK, DV, kparams->is_q_fp32 != 0, kparams->is_k_fp32 != 0, kparams->is_v_fp32 != 0, mask != nullptr, sess->n_threads);
 
     kparams->u.hvx.size_q_row_padded = size_q_row_padded;
     kparams->u.hvx.size_k_row_padded = size_k_row_padded;
@@ -2115,8 +2119,10 @@ static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_sess
     const struct ggml_tensor * src4 = op->src[4];
     const struct ggml_tensor * dst  = op;
 
-    // Check for F16 support only as requested
-    if ((src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) || src1->type != GGML_TYPE_F16 || src2->type != GGML_TYPE_F16) {
+    // Accept F16 or F32 for Q (src0), K (src1), and V (src2).
+    if ((src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) ||
+        (src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F32) ||
+        (src2->type != GGML_TYPE_F16 && src2->type != GGML_TYPE_F32)) {
         return false;
     }
 

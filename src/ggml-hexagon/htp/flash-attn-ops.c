@@ -75,6 +75,8 @@ struct htp_fa_context {
     uint32_t qrows_per_thread;
 
     bool is_q_fp32;
+    bool is_k_fp32;
+    bool is_v_fp32;
 
     size_t size_q_block;
     size_t size_vkq_acc;
@@ -115,6 +117,8 @@ struct hmx_fa_context {
 
     // Types
     bool         is_q_fp32;
+    bool         is_k_fp32;
+    bool         is_v_fp32;
     bool         is_dst_fp32;
 
     // Dynamic block sizes
@@ -1820,6 +1824,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     factx.g_br           = kparams->u.hmx.g_br;
     factx.n_kv_blocks    = kparams->n_kv_blocks;
     factx.is_q_fp32      = (kparams->is_q_fp32 != 0);
+    factx.is_k_fp32      = (kparams->is_k_fp32 != 0);
+    factx.is_v_fp32      = (kparams->is_v_fp32 != 0);
     factx.is_dst_fp32    = (kparams->is_dst_fp32 != 0);
     factx.pipeline       = (kparams->u.hmx.pipeline != 0);
     factx.mask_broadcast = (kparams->u.hmx.mask_broadcast != 0);
@@ -1858,7 +1864,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // Build the VTCM layout once (shared with the host estimator) and place every
     // scratch buffer at its computed offset.
     struct hmx_fa_vtcm_layout L;
-    hmx_fa_vtcm_layout_build(&L, G, DK, DV, Br, Bc, n_threads, pipeline, factx.is_q_fp32);
+    hmx_fa_vtcm_layout_build(&L, G, DK, DV, Br, Bc, n_threads, pipeline, factx.is_q_fp32, factx.is_k_fp32, factx.is_v_fp32);
 
     if (L.total_bytes > ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
@@ -2338,7 +2344,9 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     const struct htp_tensor * dst  = octx->dst;
 
     // Check support
-    if ((q->type != HTP_TYPE_F16 && q->type != HTP_TYPE_F32) || k->type != HTP_TYPE_F16 || v->type != HTP_TYPE_F16) {
+    if ((q->type != HTP_TYPE_F16 && q->type != HTP_TYPE_F32) ||
+        (k->type != HTP_TYPE_F16 && k->type != HTP_TYPE_F32) ||
+        (v->type != HTP_TYPE_F16 && v->type != HTP_TYPE_F32)) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
@@ -2371,6 +2379,8 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     }
 
     factx.is_q_fp32 = (kparams->is_q_fp32 != 0);
+    factx.is_k_fp32 = (kparams->is_k_fp32 != 0);
+    factx.is_v_fp32 = (kparams->is_v_fp32 != 0);
     factx.size_q_row_padded = kparams->u.hvx.size_q_row_padded;
     factx.size_k_row_padded = kparams->u.hvx.size_k_row_padded;
     factx.size_v_row_padded = kparams->u.hvx.size_v_row_padded;
