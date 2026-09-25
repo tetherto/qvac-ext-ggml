@@ -6808,7 +6808,7 @@ struct test_speech_depthwise : public test_case {
     }
 };
 
-// QVAC-25495 Parakeet attention bias-broadcast add.
+// Parakeet attention bias-broadcast add.
 //
 // Repros the exact op that first produces FLT_MAX / inf on HTP0 in the
 // unfused relative-position MHA path:
@@ -9666,7 +9666,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // QVAC-25495: Parakeet's attention u_bias / v_bias broadcast add. The
+    // Parakeet's attention u_bias / v_bias broadcast add. The
     // exact CTC 0.6b shape is (128, 376, 8, 1) + (128, 1, 8, 1) → see the
     // struct doc above. Also probe head-dim-aligned nearby shapes so any
     // fix can be validated across a small tile window.

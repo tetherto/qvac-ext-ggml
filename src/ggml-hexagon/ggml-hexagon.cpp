@@ -1589,7 +1589,7 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
 
         if (rsp.status != HTP_STATUS_OK) {
-            // QVAC-25495 diagnostic: swallowing a DSP failure leaves the
+            // Swallowing a DSP failure leaves the
             // output tensor uninitialized on the host, which downstream
             // ops silently read as zeros. Dump the failing batch's ops so
             // we can identify which shape/op the DSP could not execute,
@@ -2227,7 +2227,7 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     // types, so every quantized weight passes this gate even when the
     // actual n is not aligned. The HMX 2D kernel (hmx_mm_2d_f32) then
     // refuses at runtime with `n % 32 != 0`, returning INTERNAL_ERROR.
-    // QVAC-25495: check the true ne01 so non-aligned outputs (Parakeet
+    // Check the true ne01 so non-aligned outputs (Parakeet
     // CTC head has ne01=1025) route to HVX, which handles arbitrary N.
     if (ne01_padded % 32 != 0 || ne01 % 32 != 0) {
         return false;
@@ -3779,7 +3779,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             htp_opnode node(n, {}, HTP_OP_INVALID);
             node.opcode = op_remap_to_htp(n);
             if (node.opcode == HTP_OP_INVALID) {
-                // QVAC-25495 Fix A: op_remap_to_htp can return HTP_OP_INVALID
+                // op_remap_to_htp can return HTP_OP_INVALID
                 // for e.g. GGML_UNARY_OP_RELU when the outer unary switch has
                 // no entry. The scheduler is meant to catch these via
                 // supports_op=false, but if one slips through it would be
@@ -4108,7 +4108,7 @@ static bool ggml_hexagon_supported_cpy(const struct ggml_hexagon_session * sess,
     if (!sameshape) return false;
     if (packed_rows) return true;
 
-    // QVAC-25495: permuted / strided f32↔f16 source, same shape but non-packed
+    // Permuted / strided f32↔f16 source, same shape but non-packed
     // rows — handled by the scalar strided conversion kernels in cpy-ops.c.
     return true;
 }

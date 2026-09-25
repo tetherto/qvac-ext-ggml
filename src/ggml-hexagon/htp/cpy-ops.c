@@ -232,7 +232,7 @@ static void cpy_thread_f32_f16_sameshape(unsigned int nth, unsigned int ith, voi
     }
 }
 
-// QVAC-25495: Parakeet's subsampler feeds the pointwise matmul with a
+// Parakeet's subsampler feeds the pointwise matmul with a
 // (permuted) view where dim0 has a huge byte stride (nb00 != elem_size).
 // The row-based sameshape kernels above assume packed inner rows and were
 // dispatched to NO_SUPPORT for this shape. This scalar variant walks every
@@ -349,7 +349,7 @@ int op_cpy(struct htp_ops_context * octx) {
         else
             return HTP_STATUS_NO_SUPPORT;
     } else if (sameshape && !sametype) {
-        // Permuted / strided source with a type conversion (QVAC-25495).
+        // Permuted / strided source with a type conversion.
         // Scalar fallback — see the strided kernels above. Only used when
         // the type differs; same-type strided sources fall through to the
         // existing reshape kernels below.
