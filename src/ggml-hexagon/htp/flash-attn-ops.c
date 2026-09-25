@@ -38,6 +38,87 @@
 // Must be multiple of 32
 #define FLASH_ATTN_BLOCK_SIZE (32 * 2)
 
+// ============================================================================
+// Per-phase HMX FA profiler (opt-in, gated on GGML_HEXAGON_PROFILE=3 / trace mode).
+//
+// When the host is launched with GGML_HEXAGON_PROFILE=3, the DSP context stores
+// HTP_PROF_TRACE in ctx->profiler; this profiler accumulates per-phase pcycle
+// totals during hmx_flash_attn_ext and smuggles them back to the host through
+// the existing trace-event ring (FARF ALWAYS/ERROR does not reach logcat on
+// the target Android build). When profiling is off, START/END compile down to
+// a single cheap `if` on a static bool and add no cycle-counter reads.
+// ============================================================================
+enum fa_prof_phase {
+    FAPROF_K_DMA = 0,     // dma_queue_pop for K (post KV-DMA wait)
+    FAPROF_V_DMA,         // dma_queue_pop for V
+    FAPROF_MASK_DMA,      // dma_queue_pop for mask
+    FAPROF_K_PREP,        // fa_phase_k_interleave (F32/F16 -> HMX tile layout)
+    FAPROF_V_PREP,        // fa_phase_v_interleave
+    FAPROF_Q_LOAD,        // fa_phase_q_load
+    FAPROF_QK_MATMUL,     // hmx_queue_pop after QK-dot push (HMX critical path)
+    FAPROF_SOFTMAX,       // fa_phase_softmax_and_build_d
+    FAPROF_PV_MATMUL,     // hmx_queue_pop after O-update push (HMX critical path)
+    FAPROF_O_NORM,        // final O norm hmx pop
+    FAPROF_O_STORE,       // fa_phase_o_store
+    FAPROF_SLOPES,        // fa_compute_slopes
+    FAPROF_BUILD_D,       // fa_build_d_diag_inv_l (overlapped with HMX in pipeline)
+    FAPROF_TOTAL_FA,      // total wall-clock inside hmx_flash_attn_ext
+    FAPROF_NUM_PHASES
+};
+
+static const char * const g_faprof_names[FAPROF_NUM_PHASES] = {
+    "K_DMA_wait", "V_DMA_wait", "MASK_DMA_wait",
+    "K_PREP", "V_PREP", "Q_LOAD",
+    "QK_MATMUL_wait", "SOFTMAX", "PV_MATMUL_wait",
+    "O_NORM_wait", "O_STORE", "SLOPES", "BUILD_D",
+    "TOTAL_FA",
+};
+
+// Runtime gate: set at hmx_flash_attn_ext entry from octx->ctx->profiler.
+// Zero-cost when off (single load + branch, no rdpcycle).
+static bool     g_faprof_enabled                    = false;
+static uint64_t g_faprof_cycles[FAPROF_NUM_PHASES]  = { 0 };
+static uint64_t g_faprof_calls[FAPROF_NUM_PHASES]   = { 0 };
+static uint64_t g_faprof_op_count                   = 0;
+
+#define FAPROF_START(phase) uint64_t __faprof_c_##phase = g_faprof_enabled ? hex_get_cycles() : 0
+#define FAPROF_END(phase)   do { \
+    if (__builtin_expect(g_faprof_enabled, 0)) { \
+        g_faprof_cycles[phase] += (hex_get_cycles() - __faprof_c_##phase); \
+        g_faprof_calls[phase]  += 1; \
+    } \
+} while (0)
+
+// Dump per-phase totals via the trace-event ring on tr_hvx (thread 0).
+// Host printer (ggml_hexagon_dump_trace_events) prints:
+//   "trace-evt <NAME>: thread <T> info <INFO> <start|stop> <CYCLES>"
+// where NAME is derived from `id` via htp_event_name(). Unknown ids print as
+// "UNKNOWN" — but the `info` field IS printed as a plain decimal, and `cycles`
+// is a raw uint32. So we encode phase+slice into `info` (must stay < 0x8000
+// so it isn't mis-rendered as "stop") and 32-bit slice into `cycles`.
+//
+// Encoding (id = 0x9F00 — renders as "UNKNOWN"):
+//   info = phase * 4 + slice   ; slice: 0=cycles_lo32, 1=cycles_hi32, 2=calls
+//   cycles = the value for that (phase, slice)
+// info stays under 14 phases * 4 = 56 < 0x8000, so bit 15 is 0 -> "start".
+//
+// The last op's dump on tr_hvx is the definitive final total. Parser:
+//   grep 'trace-evt UNKNOWN: thread 0 info' <log> | tail -N
+#define FAPROF_TRACE_ID_MARK 0x9F00
+
+static void faprof_dump_trace(struct htp_thread_trace * tr) {
+    for (int p = 0; p < FAPROF_NUM_PHASES; ++p) {
+        uint64_t c   = g_faprof_cycles[p];
+        uint64_t n   = g_faprof_calls[p];
+        uint32_t lo  = (uint32_t) (c & 0xffffffffULL);
+        uint32_t hi  = (uint32_t) ((c >> 32) & 0xffffffffULL);
+        uint16_t base = (uint16_t) (p * 4);
+        htp_trace_event_raw(tr, FAPROF_TRACE_ID_MARK, (uint16_t) (base + 0), lo);
+        htp_trace_event_raw(tr, FAPROF_TRACE_ID_MARK, (uint16_t) (base + 1), hi);
+        htp_trace_event_raw(tr, FAPROF_TRACE_ID_MARK, (uint16_t) (base + 2), (uint32_t) n);
+    }
+}
+
 // In-place per-row F32 -> F16 conversion for a KV block staged in VTCM.
 // Each row starts at `stride` byte offset; each row has `n` F32 elements at
 // the front, and the converted F16 data (n elements = n*2 bytes) is written
@@ -1800,6 +1881,13 @@ static inline void fa_prefetch_block(dma_queue * dma, const struct htp_tensor * 
 // ============================================================================
 
 int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+    // Per-phase FA profiler gate: enabled only when host launched with
+    // GGML_HEXAGON_PROFILE=3 (HTP_PROF_TRACE). Zero-cost when disabled.
+    g_faprof_enabled = (octx->ctx->profiler == HTP_PROF_TRACE);
+    FAPROF_START(FAPROF_TOTAL_FA);
+    if (g_faprof_enabled) {
+        g_faprof_op_count += 1;
+    }
     struct htp_thread_trace * tr_hvx = &octx->ctx->trace[0];
     struct htp_thread_trace * tr_hmx = &octx->ctx->trace[HTP_MAX_NTHREADS];
     const struct htp_tensor * q    = octx->src[0];
@@ -2018,7 +2106,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 dma_queue_pop(dma);
 
                 // ---- Load Q block & Initialize per-block state ----
+                { FAPROF_START(FAPROF_Q_LOAD);
                 fa_phase_q_load(&factx, q, q_start, kv_head, ib3, n_rows_g);
+                FAPROF_END(FAPROF_Q_LOAD); }
 
                 __fp16 * o_tile_prev = factx.vtcm_o_tiles[0];
                 __fp16 * o_tile_curr = factx.vtcm_o_tiles[1];
@@ -2027,7 +2117,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 size_t buf_idx = 0;
 
                 htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start);
+                { FAPROF_START(FAPROF_SLOPES);
                 fa_compute_slopes(&factx, kv_head, n_rows_g);
+                FAPROF_END(FAPROF_SLOPES); }
                 htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start);
 
                 const size_t k_src_stride = size_k_row_padded / k_elt_size;
@@ -2047,8 +2139,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     }
 
                     // Prep and start QK-dot(0)
-                    void * curr_k0 = dma_queue_pop(dma).dst;
+                    void * curr_k0;
+                    { FAPROF_START(FAPROF_K_DMA);
+                    curr_k0 = dma_queue_pop(dma).dst;
+                    FAPROF_END(FAPROF_K_DMA); }
+                    { FAPROF_START(FAPROF_K_PREP);
                     fa_phase_k_interleave(&factx, kv_rows0, k_src_stride, curr_k0, 0, 0);
+                    FAPROF_END(FAPROF_K_PREP); }
 
                     qk_job[0].q_tiles        = factx.vtcm_q_tiles;
                     qk_job[0].k_tiles        = factx.vtcm_k_tiles[0];
@@ -2066,18 +2163,25 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
 
                         // ---- 1. Pop and run V-prep for current block ----
-                        void * curr_v = dma_queue_pop(dma).dst;
+                        void * curr_v;
+                        { FAPROF_START(FAPROF_V_DMA);
+                        curr_v = dma_queue_pop(dma).dst;
+                        FAPROF_END(FAPROF_V_DMA); }
+                        { FAPROF_START(FAPROF_V_PREP);
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[buf_idx], n_tiles_per_bc, kv_start);
+                        FAPROF_END(FAPROF_V_PREP); }
 
                         // ---- 2. Pop and run mask-prep for current block ----
                         __fp16 * current_mask_vtcm = NULL;
                         if (mask) {
+                            FAPROF_START(FAPROF_MASK_DMA);
                             if (__builtin_expect(factx.mask_broadcast, true)) {
                                 current_mask_vtcm = (__fp16 *) dma_queue_pop(dma).dst;
                             } else {
                                 fa_pop_mask_dma_gqa(dma, G);
                                 current_mask_vtcm = factx.vtcm_mask_buf;
                             }
+                            FAPROF_END(FAPROF_MASK_DMA);
                         }
 
                         // ---- 3. Pop and run K-prep for next block & push next QK-dot ----
@@ -2086,8 +2190,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             const uint32_t next_rows  = hex_smin(Bc, nek1 - next_start);
                             const size_t   next_buf   = 1 - buf_idx;
 
-                            void * next_k = dma_queue_pop(dma).dst;
+                            void * next_k;
+                            { FAPROF_START(FAPROF_K_DMA);
+                            next_k = dma_queue_pop(dma).dst;
+                            FAPROF_END(FAPROF_K_DMA); }
+                            { FAPROF_START(FAPROF_K_PREP);
                             fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k, next_start, next_buf);
+                            FAPROF_END(FAPROF_K_PREP); }
 
                             qk_job[next_buf].q_tiles        = factx.vtcm_q_tiles;
                             qk_job[next_buf].k_tiles        = factx.vtcm_k_tiles[next_buf];
@@ -2101,7 +2210,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // ---- 4. Wait for current block's QK-dot to finish ----
+                        { FAPROF_START(FAPROF_QK_MATMUL);
                         hmx_queue_pop(hmx_q);
+                        FAPROF_END(FAPROF_QK_MATMUL); }
 
                         // ---- 5. Phase 2: softmax + build_D ----
                         fa_softmax_args_t sargs;
@@ -2144,11 +2255,15 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // Run Softmax on HVX (blocking call)
+                        { FAPROF_START(FAPROF_SOFTMAX);
                         fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
+                        FAPROF_END(FAPROF_SOFTMAX); }
 
                         // Wait for HMX O update for block kv_blk - 1 to finish
                         if (kv_blk > 0) {
+                            { FAPROF_START(FAPROF_PV_MATMUL);
                             hmx_queue_pop(hmx_q);
+                            FAPROF_END(FAPROF_PV_MATMUL); }
                             hex_swap_ptr((void **) &o_tile_curr, (void **) &o_tile_prev);
                         }
 
@@ -2180,9 +2295,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                         htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
+                        { FAPROF_START(FAPROF_BUILD_D);
                         fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
+                        FAPROF_END(FAPROF_BUILD_D); }
                         htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
+                        { FAPROF_START(FAPROF_PV_MATMUL);
                         hmx_queue_pop(hmx_q);
+                        FAPROF_END(FAPROF_PV_MATMUL); }
 
                         hex_swap_ptr((void **) &o_tile_curr, (void **) &o_tile_prev);
                     }
@@ -2214,8 +2333,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // Wait for current K DMA and interleave
-                        void * curr_k = dma_queue_pop(dma).dst;
+                        void * curr_k;
+                        { FAPROF_START(FAPROF_K_DMA);
+                        curr_k = dma_queue_pop(dma).dst;
+                        FAPROF_END(FAPROF_K_DMA); }
+                        { FAPROF_START(FAPROF_K_PREP);
                         fa_phase_k_interleave(&factx, kv_rows, k_src_stride, curr_k, kv_start, 0);
+                        FAPROF_END(FAPROF_K_PREP); }
 
                         {
                             qk_job.q_tiles        = factx.vtcm_q_tiles;
@@ -2228,22 +2352,31 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             qk_job.hmx_scales     = factx.vtcm_hmx_scales_qk;
 
                             hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_fa_qk_dot_worker, &qk_job));
+                            FAPROF_START(FAPROF_QK_MATMUL);
                             hmx_queue_pop(ctx->hmx_queue);
+                            FAPROF_END(FAPROF_QK_MATMUL);
                         }
 
                         // Wait for current V DMA and interleave
-                        void * curr_v = dma_queue_pop(dma).dst;
+                        void * curr_v;
+                        { FAPROF_START(FAPROF_V_DMA);
+                        curr_v = dma_queue_pop(dma).dst;
+                        FAPROF_END(FAPROF_V_DMA); }
+                        { FAPROF_START(FAPROF_V_PREP);
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[0], n_tiles_per_bc, kv_start);
+                        FAPROF_END(FAPROF_V_PREP); }
 
                         // ---- Phase 3: softmax + build_D ----
                         __fp16 * current_mask_vtcm = NULL;
                         if (mask) {
+                            FAPROF_START(FAPROF_MASK_DMA);
                             if (__builtin_expect(factx.mask_broadcast, true)) {
                                 current_mask_vtcm = (__fp16 *) dma_queue_pop(dma).dst;
                             } else {
                                 fa_pop_mask_dma_gqa(dma, G);
                                 current_mask_vtcm = factx.vtcm_mask_buf;
                             }
+                            FAPROF_END(FAPROF_MASK_DMA);
                         }
 
                         fa_softmax_args_t sargs;
@@ -2266,7 +2399,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.mask_vtcm            = current_mask_vtcm;
                         sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                         sargs.slopes               = factx.vtcm_slopes;
+                        { FAPROF_START(FAPROF_SOFTMAX);
                         fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
+                        FAPROF_END(FAPROF_SOFTMAX); }
 
                         {
                             ou_job.o_curr           = o_tile_curr;
@@ -2285,10 +2420,14 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             if (kv_blk + 1 == factx.n_kv_blocks) {
                                 // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                                 htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
+                                { FAPROF_START(FAPROF_BUILD_D);
                                 fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
+                                FAPROF_END(FAPROF_BUILD_D); }
                                 htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
                             }
+                            { FAPROF_START(FAPROF_PV_MATMUL);
                             hmx_queue_pop(ctx->hmx_queue);
+                            FAPROF_END(FAPROF_PV_MATMUL); }
 
                             hex_swap_ptr((void **) &o_tile_curr, (void **) &o_tile_prev);
                         }
@@ -2359,13 +2498,25 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     on_job.n_row_tiles_g_br = n_row_tiles_g_br;
                     on_job.DV               = DV;
                     hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_fa_o_norm_worker, &on_job));
+                    { FAPROF_START(FAPROF_O_NORM);
                     hmx_queue_pop(ctx->hmx_queue);
+                    FAPROF_END(FAPROF_O_NORM); }
                 }
 
                 // ---- Store O block ----
+                { FAPROF_START(FAPROF_O_STORE);
                 fa_phase_o_store(&factx, dst, o_tile_curr, q_start, kv_head, ib3, n_rows_g);
+                FAPROF_END(FAPROF_O_STORE); }
             }
         }
+    }
+
+    // Per-phase FA profiler dump (only when enabled). Emits ~42 events on tr_hvx
+    // per op (3 slices * FAPROF_NUM_PHASES). Rolling totals across ops are fine —
+    // the last op's dump on tr_hvx carries the final totals for the graph.
+    FAPROF_END(FAPROF_TOTAL_FA);
+    if (g_faprof_enabled) {
+        faprof_dump_trace(tr_hvx);
     }
 
     return HTP_STATUS_OK;
