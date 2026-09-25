@@ -10575,6 +10575,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 100, 278, 2048, {1, 1}, {1, 1})); // ragged M under the narrow N tile
 
+    // Batched-F32 attention MULs: Parakeet 0.6b encoder has 8 heads x K=128 x M=376 x N in {128,376,751}
+    // and a 2-head/K=64/M=64 shape used by the block-0 attention variant.  These exercise the
+    // batched-F32 HVX matmul path (VTCM src1 pre-copy + per-head DMA-prefetched aa_2x2 dot).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 376, 128, 128, {8, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 376, 376, 128, {8, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 376, 751, 128, {8, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 64, 64, {2, 1}, {1, 1}));
+
 #if 0
     // test the mat-mat path for Metal
     for (int k = 1; k < 512; ++k) {

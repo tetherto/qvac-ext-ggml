@@ -1037,6 +1037,140 @@ static void hvx_mm_2d(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
+// Batched F32xF32 matmul kernel.  Iterates over ne02/ne03 heads inside the DSP kernel,
+// caches all src1 rows (K-major, all heads) in VTCM once, then per head runs the aligned
+// F32 2x2 vec_dot inner loop using DMA-prefetched src0 row pairs.  This replaces the naive
+// hvx_mm_4d path (which was single-row uu_1x1, no VTCM caching) for batched attention MULs.
+static void hvx_mm_2d_batched_f32(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t n_prefetch = kparams->n_prefetch;
+    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
+    const uint32_t prefetch_mask = n_prefetch - 1;
+
+    // Per-head row counts
+    const uint32_t src0_nrows_per_head = ne01;          // rows of A per head
+    const uint32_t src1_nrows_per_head = ne11;          // rows of B per head
+    const uint32_t heads               = ne12 * ne13;   // total (batch2 * batch3)
+
+    // Per-thread partition of A rows within a head
+    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows_per_head);
+    const uint32_t src0_end_row_x2 = src0_start_row + ((src0_end_row - src0_start_row) & ~1U);
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    const size_t dst_row_size  = nb1;
+    const size_t src0_row_size = nb01;
+    const size_t src1_row_size = nb11;
+
+    const size_t src0_vtcm_stride = mmctx->vtcm_src0_stride;
+    const size_t src1_vtcm_stride = mmctx->vtcm_src1_stride;
+    const size_t src1_head_vtcm_stride = src1_vtcm_stride * src1_nrows_per_head;
+
+    uint8_t * restrict vtcm_src0_ptr  = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
+    uint8_t * restrict vtcm_src1_base = mmctx->vtcm_src1;
+
+    const uint32_t r2 = (ne02 > 0) ? (ne12 / ne02) : 1;
+    const uint32_t r3 = (ne03 > 0) ? (ne13 / ne03) : 1;
+
+    // Cooperative pre-copy of all src1 rows (all heads) into VTCM (K-major padded rows).
+    // One 2D DMA descriptor per head keeps descriptor count small and reuses hardware pipelining.
+    // Heads are round-robin across threads.
+    const size_t src1_row_bytes = ne10 * sizeof(float);
+    for (uint32_t head_lin = ith; head_lin < heads; head_lin += nth) {
+        const uint32_t i03 = head_lin / ne12;
+        const uint32_t i02 = head_lin % ne12;
+        const uint8_t * src1_head_src = (const uint8_t *) src1->data + i03 * nb13 + i02 * nb12;
+        uint8_t *       src1_head_dst = vtcm_src1_base + head_lin * src1_head_vtcm_stride;
+        dma_queue_push(dma_queue, dma_make_ptr(src1_head_dst, src1_head_src),
+                       src1_vtcm_stride, src1_row_size, src1_row_bytes, src1_nrows_per_head);
+    }
+    for (uint32_t head_lin = ith; head_lin < heads; head_lin += nth) {
+        (void) dma_queue_pop(dma_queue);
+    }
+
+    // Barrier: every thread must see a fully populated vtcm_src1_base before compute.
+    atomic_fetch_sub(&mmctx->quant_barrier, 1);
+    while (atomic_load(&mmctx->quant_barrier) > 0) {
+        // spin
+    }
+
+    if (src0_start_row >= src0_end_row) {
+        return;
+    }
+
+    // Iterate heads; per head DMA-prefetch this thread's src0 rows and compute.
+    for (uint32_t head_lin = 0; head_lin < heads; ++head_lin) {
+        const uint32_t i03  = head_lin / ne12;
+        const uint32_t i02  = head_lin % ne12;
+        const uint32_t i03s = i03 / r3;
+        const uint32_t i02s = i02 / r2;
+
+        const uint8_t * restrict src0_head = (const uint8_t *) src0->data + i03s * nb03 + i02s * nb02;
+        uint8_t * restrict       dst_head  = (uint8_t *)       dst->data  + i03  * nb3  + i02  * nb2;
+        const uint8_t * restrict src1_head_vtcm = vtcm_src1_base + head_lin * src1_head_vtcm_stride;
+
+        // Prefill src0 rows in VTCM via DMA (row pairs).
+        for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
+            const uint32_t is0 = (ir0 - src0_start_row);
+            if (is0 >= n_prefetch) break;
+            dma_queue_push(dma_queue,
+                           dma_make_ptr(vtcm_src0_ptr + is0 * src0_vtcm_stride, src0_head + ir0 * src0_row_size),
+                           src0_vtcm_stride, src0_row_size, src0_row_size, 2);
+        }
+
+        // Main row-pair loop with 2x2 tiling over src1 pairs.
+        for (uint32_t ir0 = src0_start_row; ir0 < src0_end_row_x2; ir0 += 2) {
+            const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
+            uint32_t ir1 = 0;
+            for (; ir1 + 1 < src1_nrows_per_head; ir1 += 2) {
+                const uint8_t * restrict src1_col0 = src1_head_vtcm + (ir1 + 0) * src1_vtcm_stride;
+                const uint8_t * restrict src1_col1 = src1_head_vtcm + (ir1 + 1) * src1_vtcm_stride;
+                float * restrict dst_row0 = (float *) (dst_head + (ir1 + 0) * dst_row_size);
+                float * restrict dst_row1 = (float *) (dst_head + (ir1 + 1) * dst_row_size);
+                mmctx->vec_dot_2x2(ne00, &dst_row0[ir0], &dst_row1[ir0], ss0, ss0 + src0_vtcm_stride, src1_col0, src1_col1);
+            }
+            for (; ir1 < src1_nrows_per_head; ++ir1) {
+                const uint8_t * restrict src1_col = src1_head_vtcm + ir1 * src1_vtcm_stride;
+                float * restrict dst_row = (float *) (dst_head + ir1 * dst_row_size);
+                mmctx->vec_dot_2x1(ne00, &dst_row[ir0], ss0, ss0 + src0_vtcm_stride, src1_col);
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
+
+            // Prefetch next row-pair.
+            const uint32_t pr0 = ir0 + n_prefetch;
+            const uint32_t is0 = (pr0 - src0_start_row) & prefetch_mask;
+            if (pr0 < src0_end_row_x2) {
+                dma_queue_push(dma_queue,
+                               dma_make_ptr(vtcm_src0_ptr + is0 * src0_vtcm_stride, src0_head + pr0 * src0_row_size),
+                               src0_vtcm_stride, src0_row_size, src0_row_size, 2);
+            }
+        }
+
+        // Tail row (odd row-count).
+        if (src0_end_row != src0_end_row_x2) {
+            uint32_t ir0 = src0_end_row_x2;
+            const uint32_t is0 = (ir0 - src0_start_row) & prefetch_mask;
+            dma_queue_push(dma_queue,
+                           dma_make_ptr(vtcm_src0_ptr + is0 * src0_vtcm_stride, src0_head + ir0 * src0_row_size),
+                           src0_vtcm_stride, src0_row_size, src0_row_size, 1);
+            const uint8_t * ss0 = dma_queue_pop(dma_queue).dst;
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
+            for (uint32_t ir1 = 0; ir1 < src1_nrows_per_head; ++ir1) {
+                const uint8_t * restrict src1_col = src1_head_vtcm + ir1 * src1_vtcm_stride;
+                float * restrict dst_row = (float *) (dst_head + ir1 * dst_row_size);
+                mmctx->vec_dot_1x1(ne00, &dst_row[ir0], ss0, src1_col);
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ir0);
+        }
+    }
+}
+
 static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
@@ -1363,8 +1497,11 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
                         src0->type == HTP_TYPE_Q8_0 || src0->type == HTP_TYPE_IQ4_NL ||
                         src0->type == HTP_TYPE_MXFP4);
 
-    // Compute src0_nrows_per_thread
-    mmctx->src0_nrows_per_thread  = (src0_nrows + octx->n_threads - 1) / octx->n_threads;
+    // Compute src0_nrows_per_thread.  For the batched-F32 kernel we partition rows within
+    // a head (ne01), not across the flattened src0 grid — heads are iterated inside the kernel.
+    const bool is_batched_f32 = (kparams->kernel_type == HTP_MM_KERNEL_HVX_F32_F32_BATCHED);
+    const uint32_t src0_rows_for_split = is_batched_f32 ? ne01 : src0_nrows;
+    mmctx->src0_nrows_per_thread  = (src0_rows_for_split + octx->n_threads - 1) / octx->n_threads;
     if (is_repacked) {
         mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
     } else {
@@ -1467,6 +1604,17 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             src1_row_size          = nb11;
             need_quant             = false;
             matmul_job_func        = hvx_mm_4d;
+            break;
+
+        case HTP_MM_KERNEL_HVX_F32_F32_BATCHED:
+            quant_task_func        = NULL;
+            mmctx->type            = "f32-f32-batched";
+            mmctx->vec_dot_1x1     = vec_dot_f32_f32_aa_1x1;
+            mmctx->vec_dot_2x1     = vec_dot_f32_f32_aa_2x1;
+            mmctx->vec_dot_2x2     = vec_dot_f32_f32_aa_2x2;
+            src1_row_size          = hex_round_up(ne10 * 4, 128);
+            need_quant             = false;
+            matmul_job_func        = hvx_mm_2d_batched_f32;
             break;
 
         case HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT: {
@@ -1578,6 +1726,11 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
     } else {
         mmctx->quant_task_func = NULL;
         mmctx->n_quant_tasks = 0;
+        // Reuse the quant_barrier as a per-matmul thread barrier for the batched F32 kernel
+        // (it performs a cooperative src1 pre-copy before the compute phase).
+        if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F32_F32_BATCHED) {
+            atomic_init(&mmctx->quant_barrier, (unsigned int) octx->n_threads);
+        }
     }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);

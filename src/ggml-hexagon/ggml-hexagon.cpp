@@ -2524,6 +2524,36 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->vtcm_src1_size = L.src1_bytes;
             kparams->vtcm_dst_size = L.dst_bytes;
             kparams->n_prefetch = 16;
+        } else if (is_batched && !is_matmul_id) {
+            // Batched F32 attention MULs (Q@K, P@V, pos_BD): probe the batched-F32 kernel that
+            // caches all src1 rows and per-head src0 pairs in VTCM.  Fall back to the naive
+            // per-row hvx_mm_4d (HVX_F32_F32_DDR) if the layout does not fit.
+            struct htp_mm_hvx_vtcm_layout Lb;
+            htp_mm_hvx_vtcm_layout_build(
+                &Lb, HTP_MM_KERNEL_HVX_F32_F32_BATCHED, wtype, ne10, src1_nrows, sess->n_threads,
+                dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false, false
+            );
+            if (Lb.total_bytes <= vtcm_budget) {
+                kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_BATCHED;
+                kparams->src1_row_size = hex_round_up(ne10 * 4, 128);
+                kparams->vtcm_size = Lb.total_bytes;
+                kparams->vtcm_src0_size = Lb.src0_bytes;
+                kparams->vtcm_src1_size = Lb.src1_bytes;
+                kparams->vtcm_dst_size = Lb.dst_bytes;
+                kparams->n_prefetch = 16;
+            } else {
+                kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_DDR;
+                kparams->src1_row_size = src1->nb[1];
+                htp_mm_hvx_vtcm_layout_build(
+                    &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
+                    dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, 16, false, false, false
+                );
+                kparams->vtcm_size = L.total_bytes;
+                kparams->vtcm_src0_size = L.src0_bytes;
+                kparams->vtcm_src1_size = L.src1_bytes;
+                kparams->vtcm_dst_size = L.dst_bytes;
+                kparams->n_prefetch = 16;
+            }
         } else {
             kparams->kernel_type = HTP_MM_KERNEL_HVX_F32_F32_DDR;
             kparams->src1_row_size = src1->nb[1];
