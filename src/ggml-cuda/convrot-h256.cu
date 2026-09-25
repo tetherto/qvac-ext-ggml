@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "convrot-h256.cuh"
+#include <climits>
 
 // This is the exact radix-4 convention used by ComfyUI ConvRot, not the
 // binary Walsh ordering used by the upstream FWHT helper.
@@ -9,6 +10,7 @@ __global__ void convrot_h256_cuda(const float * src, float * dst, int64_t rows) 
 
     const int tid = threadIdx.x;
     const int64_t row = blockIdx.x;
+    ggml_cuda_pdl_sync();
     if (row >= rows) {
         return;
     }
@@ -41,6 +43,7 @@ bool ggml_cuda_op_convrot_h256(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
 
     const int64_t rows = ggml_nrows(src);
+    GGML_ASSERT(rows <= INT_MAX);
     const auto launch = ggml_cuda_kernel_launch_params(dim3(rows), dim3(256), 0, ctx.stream());
     ggml_cuda_kernel_launch(convrot_h256_cuda, launch, (const float *) src->data, (float *) dst->data, rows);
     return true;
