@@ -27,6 +27,7 @@ if (TARGET ggml-cuda)
         add_dependencies(test-mul-mat-convrot-h256-hint-cuda ggml-cuda)
     endif()
     add_test(NAME test-mul-mat-convrot-h256-hint-cuda COMMAND test-mul-mat-convrot-h256-hint-cuda)
+    set_tests_properties(test-mul-mat-convrot-h256-hint-cuda PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 if (TARGET ggml-metal)
