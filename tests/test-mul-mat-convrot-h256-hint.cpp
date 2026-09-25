@@ -1,9 +1,5 @@
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
-#if defined(GGML_TEST_CONVROT_H256_CUDA)
-#include "ggml-cuda.h"
-#endif
 
 #include <array>
 #include <cmath>
@@ -36,13 +32,22 @@ void convrot_h256(float * values) {
 } // namespace
 
 int main() {
-    ggml_init_params params = { 2 * 1024 * 1024, nullptr,
+    ggml_backend_load_all();
+    ggml_backend_t backend = nullptr;
 #if defined(GGML_TEST_CONVROT_H256_CUDA)
-        true
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0) {
+            backend = ggml_backend_dev_init(dev, nullptr);
+            break;
+        }
+    }
 #else
-        false
+    backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
 #endif
-    };
+    if (!backend) return 1;
+
+    ggml_init_params params = { 2 * 1024 * 1024, nullptr, true };
     ggml_context * ctx = ggml_init(params);
     if (!ctx) return 1;
 
@@ -56,9 +61,6 @@ int main() {
         convrot_h256(basis.data());
         for (int row = 0; row < kH; ++row) {
             h_data[col + row * kH] = basis[row];
-#if !defined(GGML_TEST_CONVROT_H256_CUDA)
-            ((float *) h->data)[col + row * kH] = basis[row];
-#endif
         }
     }
 
@@ -68,9 +70,6 @@ int main() {
     for (int row = 0; row < kRows; ++row) {
         for (int col = 0; col < kH; ++col) {
             x_data[col + row * kH] = ((col * 17 + row * 31) % 97 - 48) * 0.03125f;
-#if !defined(GGML_TEST_CONVROT_H256_CUDA)
-            ((float *) x->data)[col + row * kH] = x_data[col + row * kH];
-#endif
         }
     }
 
@@ -79,39 +78,27 @@ int main() {
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, y);
     std::array<float, kH * kRows> y_data;
-#if defined(GGML_TEST_CONVROT_H256_CUDA)
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
-    ggml_backend_buffer_t buffer = backend ? ggml_backend_alloc_ctx_tensors(ctx, backend) : nullptr;
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buffer) return 2;
     ggml_backend_tensor_set(h, h_data.data(), 0, ggml_nbytes(h));
     ggml_backend_tensor_set(x, x_data.data(), 0, ggml_nbytes(x));
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) return 2;
     ggml_backend_tensor_get(y, y_data.data(), 0, ggml_nbytes(y));
-#else
-    if (ggml_graph_compute_with_ctx(ctx, graph, 4) != GGML_STATUS_SUCCESS) return 2;
-#endif
 
     for (int row = 0; row < kRows; ++row) {
         std::array<float, kH> expected;
         std::memcpy(expected.data(), x_data.data() + row * kH, sizeof(float) * kH);
         convrot_h256(expected.data());
         for (int col = 0; col < kH; ++col) {
-            const float actual =
-#if defined(GGML_TEST_CONVROT_H256_CUDA)
-                y_data[col + row * kH];
-#else
-                ((float *) y->data)[col + row * kH];
-#endif
+            const float actual = y_data[col + row * kH];
             if (std::fabs(actual - expected[col]) > 2e-5f) {
                 std::fprintf(stderr, "mismatch at [%d, %d]: %f != %f\n", col, row, actual, expected[col]);
                 return 3;
             }
         }
     }
-#if defined(GGML_TEST_CONVROT_H256_CUDA)
     ggml_backend_buffer_free(buffer);
     ggml_backend_free(backend);
-#endif
     ggml_free(ctx);
     return 0;
 }
