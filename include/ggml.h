@@ -1567,7 +1567,10 @@ extern "C" {
     // output row) and scales holds one F32 scale per output row.  No
     // requantization happens: the int8 values are copied verbatim and the row
     // scale becomes the F16 scale of every 32-wide Q8_0 block in that row (the
-    // only rounding).  dst must hold at least
+    // only rounding).  F16 has a finite range and loses relative precision
+    // below its 2^-14 normal minimum; callers must check scale fidelity when
+    // deciding whether this packed representation is suitable.  dst must hold
+    // at least
     // ggml_row_size(GGML_TYPE_Q8_0, in_features) * out_features bytes; that
     // size is returned (pass dst == NULL to query it).  in_features must be a
     // multiple of 32.

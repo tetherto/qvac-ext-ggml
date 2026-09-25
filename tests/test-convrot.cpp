@@ -33,11 +33,34 @@ void rotate_block(float * v, int n) {
 
 struct result { bool ok = true; double max_err = 0.0; };
 
+bool test_repack_scale_range() {
+    constexpr int64_t k = 32;
+    const float scales[] = {0.0007f, 0.000001f, 0.000000001f};
+    std::vector<int8_t> weights(k*3, 127);
+    std::vector<uint8_t> packed(ggml_convrot_repack_q8_0(nullptr, nullptr, k, 3, nullptr));
+    ggml_convrot_repack_q8_0(weights.data(), scales, k, 3, packed.data());
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_0, k);
+    float rounded[3];
+    for (int row = 0; row < 3; ++row) {
+        ggml_fp16_t half;
+        std::memcpy(&half, packed.data() + row*row_size, sizeof(half));
+        rounded[row] = ggml_fp16_to_fp32(half);
+    }
+    // Compare against the original F32 scales, not an already-rounded oracle.
+    const double normal_error = std::fabs(rounded[0] - scales[0]) / scales[0];
+    const double subnormal_error = std::fabs(rounded[1] - scales[1]) / scales[1];
+    const bool ok = normal_error < 0.001 && subnormal_error > normal_error &&
+                    rounded[1] > 0.0f && rounded[2] == 0.0f;
+    std::printf("    repack F32-to-F16 scale range: %s (normal %.3g, subnormal %.3g, underflow %.3g)\n",
+                ok ? "ok" : "FAILED", normal_error, subnormal_error, rounded[2]);
+    return ok;
+}
+
 // ---- rotation op alone, on a strided view and in place --------------------
 
-result test_rotation(ggml_backend_t be, bool inplace) {
+result test_rotation(ggml_backend_t be, bool inplace, int32_t group_size, int64_t groups = 2, int64_t rows = 3) {
     result r;
-    const int64_t k = 2*kGroup, rows = 3, planes = 2;
+    const int64_t k = groups*group_size, planes = 2;
     ggml_init_params ip = { 4*1024*1024, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
 
@@ -45,12 +68,12 @@ result test_rotation(ggml_backend_t be, bool inplace) {
     ggml_tensor * storage = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, inplace ? rows : 2*rows, planes);
     ggml_tensor * x = inplace ? storage
         : ggml_view_3d(ctx, storage, k, rows, planes, 2*storage->nb[1], storage->nb[2], 0);
-    ggml_tensor * y = inplace ? ggml_convrot_inplace(ctx, x, kGroup) : ggml_convrot(ctx, x, kGroup);
+    ggml_tensor * y = inplace ? ggml_convrot_inplace(ctx, x, group_size) : ggml_convrot(ctx, x, group_size);
     ggml_cgraph * g = ggml_new_graph(ctx);
     ggml_build_forward_expand(g, y);
 
     if (!ggml_backend_supports_op(be, y)) {
-        std::printf("    rotation%s: not supported, skipped\n", inplace ? " (in place)" : "");
+        std::printf("    rotation group=%d%s: not supported, skipped\n", group_size, inplace ? " (in place)" : "");
         ggml_free(ctx);
         return r;
     }
@@ -68,7 +91,7 @@ result test_rotation(ggml_backend_t be, bool inplace) {
     for (int64_t p = 0; p < planes && r.ok; ++p) for (int64_t row = 0; row < rows; ++row) {
         const int64_t srow = inplace ? row : 2*row;
         std::vector<float> ref(data.begin() + (p*storage->ne[1] + srow)*k, data.begin() + (p*storage->ne[1] + srow)*k + k);
-        for (int64_t k0 = 0; k0 < k; k0 += kGroup) rotate_block(ref.data() + k0, kGroup);
+        for (int64_t k0 = 0; k0 < k; k0 += group_size) rotate_block(ref.data() + k0, group_size);
         for (int64_t i = 0; i < k; ++i) {
             const float got = out[(p*rows + row)*k + i];
             const double err = std::fabs(got - ref[i]) / (1.0 + std::fabs(ref[i]));
@@ -76,7 +99,7 @@ result test_rotation(ggml_backend_t be, bool inplace) {
             if (err > 1e-5) r.ok = false;
         }
     }
-    std::printf("    rotation%s: %s (max rel err %.2e)\n", inplace ? " (in place)" : "", r.ok ? "ok" : "FAILED", r.max_err);
+    std::printf("    rotation group=%d%s: %s (max rel err %.2e)\n", group_size, inplace ? " (in place)" : "", r.ok ? "ok" : "FAILED", r.max_err);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return r;
@@ -175,7 +198,7 @@ result test_linear(ggml_backend_t be, int64_t m) {
 int main() {
     ggml_backend_load_all();
 
-    bool all_ok = true;
+    bool all_ok = test_repack_scale_range();
     int tested = 0;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -183,8 +206,12 @@ int main() {
         if (!be) continue;
         std::printf("backend %s (%s)\n", ggml_backend_name(be), ggml_backend_dev_description(dev));
         bool ok = true;
-        ok = test_rotation(be, false).ok && ok;
-        ok = test_rotation(be, true).ok && ok;
+        for (int32_t group_size : {4, 16, 64, 256, 1024}) {
+            ok = test_rotation(be, false, group_size).ok && ok;
+            ok = test_rotation(be, true, group_size).ok && ok;
+        }
+        // A single row with many groups exercises CPU group-level threading.
+        ok = test_rotation(be, false, 4, 256, 1).ok && ok;
         for (int64_t m : { int64_t(1), int64_t(2), int64_t(48) }) ok = test_linear(be, m).ok && ok;
         all_ok = all_ok && ok;
         ++tested;

@@ -13494,7 +13494,8 @@ void ggml_compute_forward_convrot(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int64_t nr = ggml_nrows(src0);
+    const int64_t groups_per_row = ne00/group_size;
+    const int64_t nr = ggml_nelements(src0)/group_size;
     const int64_t dr = (nr + nth - 1)/nth;
     const int64_t ir0 = dr*ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
@@ -13502,7 +13503,9 @@ void ggml_compute_forward_convrot(
     // each block is staged here before it is written back, so dst may alias src0
     float block[1024];
 
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
+    for (int64_t task = ir0; task < ir1; ++task) {
+        const int64_t ir = task/groups_per_row;
+        const int64_t k0 = (task % groups_per_row)*group_size;
         const int64_t i3 = ir/(ne02*ne01);
         const int64_t i2 = (ir - i3*ne02*ne01)/ne01;
         const int64_t i1 = ir - i3*ne02*ne01 - i2*ne01;
@@ -13510,14 +13513,12 @@ void ggml_compute_forward_convrot(
         const char * src_row = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
               char * dst_row = (      char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3;
 
-        for (int64_t k0 = 0; k0 < ne00; k0 += group_size) {
-            for (int i = 0; i < group_size; ++i) {
-                block[i] = *(const float *) (src_row + (k0 + i)*nb00);
-            }
-            ggml_convrot_block_f32(block, group_size);
-            for (int i = 0; i < group_size; ++i) {
-                *(float *) (dst_row + (k0 + i)*nb0) = block[i];
-            }
+        for (int i = 0; i < group_size; ++i) {
+            block[i] = *(const float *) (src_row + (k0 + i)*nb00);
+        }
+        ggml_convrot_block_f32(block, group_size);
+        for (int i = 0; i < group_size; ++i) {
+            *(float *) (dst_row + (k0 + i)*nb0) = block[i];
         }
     }
 }

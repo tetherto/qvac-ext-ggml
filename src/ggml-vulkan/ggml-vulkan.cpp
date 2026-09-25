@@ -11969,6 +11969,9 @@ static void ggml_vk_mul_mat_convrot(ggml_backend_vk_context * ctx, vk_context& s
 
 static void ggml_vk_convrot(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src = dst->src[0];
+    // Actual offsets are only available after allocation, not in supports_op.
+    GGML_ASSERT(((vk_tensor_offset(src) + src->view_offs) & 3) == 0);
+    GGML_ASSERT(((vk_tensor_offset(dst) + dst->view_offs) & 3) == 0);
     const uint32_t group_size = (uint32_t) ggml_get_op_params_i32(dst, 0);
     const uint32_t total_groups = (uint32_t) (ggml_nelements(src) / group_size);
     const uint32_t max_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
@@ -20923,7 +20926,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
             const uint64_t alignment = device->properties.limits.minStorageBufferOffsetAlignment;
             for (const ggml_tensor * tensor : { src, op }) {
-                if (((vk_tensor_offset(tensor) + tensor->view_offs) & 3) != 0 ||
+                if ((tensor->view_offs & 3) != 0 ||
                     ggml_nbytes(tensor) > device->properties.limits.maxStorageBufferRange - (alignment - 1)) {
                     return false;
                 }
