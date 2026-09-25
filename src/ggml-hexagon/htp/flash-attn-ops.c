@@ -38,6 +38,18 @@
 // Must be multiple of 32
 #define FLASH_ATTN_BLOCK_SIZE (32 * 2)
 
+// In-place per-row F32 -> F16 conversion for a KV block staged in VTCM.
+// Each row starts at `stride` byte offset; each row has `n` F32 elements at
+// the front, and the converted F16 data (n elements = n*2 bytes) is written
+// back to the front of the same row. Row stride is unchanged, so downstream
+// F16 kernels indexing at `stride` continue to work.
+static inline void hvx_fa_convert_kv_block_f32_to_f16(uint8_t * base, size_t stride, uint32_t n_rows, uint32_t n) {
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        uint8_t * row = base + (size_t) r * stride;
+        hvx_copy_f16_f32_aa(row, row, n);
+    }
+}
+
 struct htp_fa_context {
     const struct htp_ops_context * octx;
 
@@ -218,8 +230,8 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
     const uint32_t DV = nev0;
 
     const size_t size_q_row = DK * ((q->type == HTP_TYPE_F32) ? 4 : 2);
-    const size_t size_k_row = DK * sizeof(__fp16);
-    const size_t size_v_row = DV * sizeof(__fp16);
+    const size_t size_k_row = DK * ((k->type == HTP_TYPE_F32) ? 4 : 2);
+    const size_t size_v_row = DV * ((v->type == HTP_TYPE_F32) ? 4 : 2);
 
     // Scratchpad buffers for Q, K, V, Mask, and VKQ32 accumulator
     uint8_t * spad_q = factx->spad_q + factx->size_q_block * ith;
@@ -367,6 +379,15 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             uint8_t * k_base = dma_queue_pop(dma).dst; // K
             uint8_t * v_base = dma_queue_pop(dma).dst; // V
             __fp16  * m_base = mask ? dma_queue_pop(dma).dst : NULL; // M
+
+            // Convert F32 K/V staging in place to F16 packed at the front of each padded row.
+            // Kernel below reads F16 at stride == size_k/v_row_padded (which is F32-sized when input is F32).
+            if (factx->is_k_fp32) {
+                hvx_fa_convert_kv_block_f32_to_f16(k_base, factx->size_k_row_padded, current_block_size, DK);
+            }
+            if (factx->is_v_fp32) {
+                hvx_fa_convert_kv_block_f32_to_f16(v_base, factx->size_v_row_padded, current_block_size, DV);
+            }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_QK, ir);
 
@@ -629,8 +650,13 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
-    hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const __fp16 *) args->curr_k, total_rows, factx->DK,
-                             args->src_stride, start, end);
+    if (factx->is_k_fp32) {
+        hmx_interleave_rows_to_tiles_f32(factx->vtcm_k_tiles[args->buf_idx], (const float *) args->curr_k, total_rows, factx->DK,
+                                 args->src_stride, start, end);
+    } else {
+        hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const __fp16 *) args->curr_k, total_rows, factx->DK,
+                                 args->src_stride, start, end);
+    }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
 }
 
@@ -677,8 +703,13 @@ static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data) 
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
-    hmx_interleave_cols_to_tiles(v_tiles_dst, (const __fp16 *) args->v_src, total_rows, factx->DV,
-                             args->src_stride, (uint32_t) args->n_col_tiles, start, end);
+    if (factx->is_v_fp32) {
+        hmx_interleave_cols_to_tiles_f32(v_tiles_dst, (const float *) args->v_src, total_rows, factx->DV,
+                                 args->src_stride, (uint32_t) args->n_col_tiles, start, end);
+    } else {
+        hmx_interleave_cols_to_tiles(v_tiles_dst, (const __fp16 *) args->v_src, total_rows, factx->DV,
+                                 args->src_stride, (uint32_t) args->n_col_tiles, start, end);
+    }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
 }
 
@@ -1855,9 +1886,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
     // ======== VTCM allocation (GQA-aware) ========
     // K/V row sizes drive the DMA descriptors (not the VTCM layout) and are used
-    // throughout the KV loop below.
-    const size_t size_k_row        = DK * sizeof(__fp16);
-    const size_t size_v_row        = DV * sizeof(__fp16);
+    // throughout the KV loop below. When the input tensor is F32 the DMA staging
+    // rows are wider (sizeof(float)); tile-prep does the F32->F16 downcast when
+    // filling HMX tiles.
+    const size_t k_elt_size        = factx.is_k_fp32 ? sizeof(float) : sizeof(__fp16);
+    const size_t v_elt_size        = factx.is_v_fp32 ? sizeof(float) : sizeof(__fp16);
+    const size_t size_k_row        = DK * k_elt_size;
+    const size_t size_v_row        = DV * v_elt_size;
     const size_t size_k_row_padded = hex_round_up(size_k_row, 128);
     const size_t size_v_row_padded = hex_round_up(size_v_row, 128);
 
@@ -1995,8 +2030,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 fa_compute_slopes(&factx, kv_head, n_rows_g);
                 htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start);
 
-                const size_t k_src_stride = size_k_row_padded / sizeof(__fp16);
-                const size_t v_src_stride = size_v_row_padded / sizeof(__fp16);
+                const size_t k_src_stride = size_k_row_padded / k_elt_size;
+                const size_t v_src_stride = size_v_row_padded / v_elt_size;
 
                 hmx_queue_t hmx_q = ctx->hmx_queue;
 
