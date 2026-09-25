@@ -141,7 +141,12 @@ __global__ void convrot_i8_matvec(const float * x, const int8_t * w, const float
     #pragma unroll
     for (int c = 0; c < Columns; ++c) {
         float sum = (sums[c][0] + sums[c][1]) + (sums[c][2] + sums[c][3]);
-        for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_down_sync(0xffffffff, sum, offset);
+#if defined(GGML_USE_HIP)
+        constexpr uint64_t warp_mask = 0xffffffffffffffffULL;
+#else
+        constexpr uint32_t warp_mask = 0xffffffffU;
+#endif
+        for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_down_sync(warp_mask, sum, offset);
         if (lane == 0 && first_column + c < columns) dst[row + size_t(first_column+c) * n] = sum * scales[row];
     }
 }
