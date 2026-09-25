@@ -469,6 +469,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type == GGML_TYPE_F32 &&
                 op->ne[0] == src1->ne[1] && op->ne[1] == src0->ne[1] &&
                 op->ne[2] == src0->ne[2] && op->ne[3] == src0->ne[3];
+        case GGML_OP_CONVROT:
+            return src0 && src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_convrot_group_size_is_valid(ggml_get_op_params_i32(op, 0)) &&
+                src0->ne[0] % ggml_get_op_params_i32(op, 0) == 0 &&
+                ggml_are_same_shape(src0, op);
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

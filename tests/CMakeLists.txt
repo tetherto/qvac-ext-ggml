@@ -8,6 +8,20 @@ endif()
 
 add_test(NAME test-mul-mat-convrot COMMAND test-mul-mat-convrot)
 
+# ConvRot via rotation op + standard quantized matmul; runs on every registered backend
+add_executable(test-convrot test-convrot.cpp)
+target_link_libraries(test-convrot PRIVATE ggml)
+foreach (backend ggml-cpu ggml-cuda ggml-vulkan ggml-metal)
+    if (TARGET ${backend})
+        if (GGML_BACKEND_DL)
+            add_dependencies(test-convrot ${backend})
+        else()
+            target_link_libraries(test-convrot PRIVATE ${backend})
+        endif()
+    endif()
+endforeach()
+add_test(NAME test-convrot COMMAND test-convrot)
+
 add_executable(test-mul-mat-convrot-h256-hint test-mul-mat-convrot-h256-hint.cpp)
 target_link_libraries(test-mul-mat-convrot-h256-hint PRIVATE ggml)
 if (NOT GGML_BACKEND_DL)

@@ -408,6 +408,52 @@ inline void convrot_i8mm(
     }
 }
 
+// ConvRot rotation of F32 activations: normalized regular 4-way Hadamard over
+// each group_size-wide block along dim 0.  One threadgroup per block; the block
+// is staged in threadgroup memory before being written, so dst may alias src0.
+kernel void kernel_convrot_f32(
+        constant ggml_metal_kargs_convrot & args,
+        device const char * src0,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        uint3  ntg3 [[threads_per_threadgroup]]) {
+    #pragma clang fp reassociate(off) contract(off)
+    threadgroup float values[1024];
+
+    const uint ntg = ntg3.x;
+    const uint g   = (uint) args.group_size;
+    const uint k0 = tgpig.x*g;
+    const uint i1 = tgpig.y;
+    const uint i2 = tgpig.z % args.ne02;
+    const uint i3 = tgpig.z / args.ne02;
+
+    device const char * src_row = src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03;
+    device       char * dst_row = dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3;
+
+    for (uint i = tid; i < g; i += ntg) {
+        values[i] = *(device const float *) (src_row + (k0 + i)*args.nb00);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 1; stride < g; stride *= 4) {
+        // g/4 disjoint butterflies per stage -> in-place with one barrier per stage
+        for (uint b = tid; b < g/4; b += ntg) {
+            const uint j = (b/stride)*(4*stride) + b%stride;
+            const float a = values[j], bb = values[j+stride], c = values[j+2*stride], d = values[j+3*stride];
+            values[j]          = ( a + bb + c - d)*0.5f;
+            values[j+stride]   = ( a + bb - c + d)*0.5f;
+            values[j+2*stride] = ( a - bb + c + d)*0.5f;
+            values[j+3*stride] = (-a + bb + c + d)*0.5f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = tid; i < g; i += ntg) {
+        *(device float *) (dst_row + (k0 + i)*args.nb0) = values[i];
+    }
+}
+
 #define CONVROT_NATIVE_KERNELS(T, suffix) \
 [[host_name("kernel_mul_mat_convrot_rotate_" #suffix)]] \
 kernel void kernel_mul_mat_convrot_rotate_##suffix( \
