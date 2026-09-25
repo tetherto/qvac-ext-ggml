@@ -5,7 +5,11 @@ on:
     types: [created]
   pull_request_target:
     types: [opened, synchronize]
-    branches: [main, master]
+    # `feature*` does not match `feature/foo` (`*` stops at `/`).
+    branches:
+      - main
+      - master
+      - 'feature/**'
 
 permissions:
   contents: read
