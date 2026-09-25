@@ -1963,7 +1963,8 @@ static bool ggml_hexagon_flash_attn_is_hmx_eligible(
         return false;
     }
 
-    if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) {
+    if ((k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32) ||
+        (v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_F32)) {
         return false;
     }
 
@@ -2050,6 +2051,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
                                          kparams->is_q_fp32 != 0, kparams->is_k_fp32 != 0, kparams->is_v_fp32 != 0);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
+            HEX_VERBOSE("ggml-hex: FA kernel=HMX G=%u DK=%u DV=%u neq1=%u nek1=%u Br=%zu Bc=%zu k_fp32=%d v_fp32=%d\n",
+                        (unsigned) G, (unsigned) DK, (unsigned) DV, (unsigned) neq1, (unsigned) nek1,
+                        Br, Bc, (int) kparams->is_k_fp32, (int) kparams->is_v_fp32);
             kparams->Br = Br;
             kparams->Bc = Bc;
             kparams->n_kv_blocks = (nek1 + Bc - 1) / Bc;
@@ -2080,6 +2084,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 
     // Fallback to HVX
     kparams->kernel_type = HTP_FA_KERNEL_HVX;
+    HEX_VERBOSE("ggml-hex: FA kernel=HVX DK=%u DV=%u neq1=%u nek1=%u k_fp32=%d v_fp32=%d\n",
+                (unsigned) DK, (unsigned) DV, (unsigned) neq1, (unsigned) nek1,
+                (int) kparams->is_k_fp32, (int) kparams->is_v_fp32);
     kparams->Br = 1;
     kparams->Bc = 64; // FLASH_ATTN_BLOCK_SIZE
     kparams->n_kv_blocks = (k->ne[1] + 64 - 1) / 64;

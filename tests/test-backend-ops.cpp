@@ -11261,6 +11261,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 376, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 751, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
 
+    // HMX-eligible F32-KV cases: DK=DV=128 (both % 64 == 0), all satisfy the
+    // is_hmx_eligible gate (DK<=128 && neq1<5 false). Chunk-size sizer decides
+    // whether the tile-prep path (hmx_interleave_*_to_tiles_f32) actually runs.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 376, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 128, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 32,  32,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {1, 1}, 128, 32,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
     for (int64_t kv : { 4096, 16384 }) {
