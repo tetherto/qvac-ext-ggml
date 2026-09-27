@@ -1176,9 +1176,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
     "ROPE_FLUX",
     "MUL_MAT_CONVROT",
+    "CONVROT",
 };
 
-static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1305,9 +1306,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "rope_flux(x)",
     "convrot(X,W,S)",
+    "convrot(x)",
 };
 
-static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3520,6 +3522,58 @@ void ggml_mul_mat_convrot_set_f16_compat(
     GGML_ASSERT(a->op == GGML_OP_MUL_MAT_CONVROT);
 
     ggml_set_op_params_i32(a, 1, enabled ? 1 : 0);
+}
+
+// ggml_convrot
+
+bool ggml_convrot_group_size_is_valid(int32_t group_size) {
+    // power of four in [4, 1024]
+    return group_size >= 4 && group_size <= 1024 &&
+        (group_size & (group_size - 1)) == 0 && (group_size & 0x55555555) != 0;
+}
+
+static struct ggml_tensor * ggml_convrot_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               group_size,
+        bool                  inplace) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_convrot_group_size_is_valid(group_size));
+    GGML_ASSERT(a->ne[0] % group_size == 0);
+
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, group_size);
+
+    result->op     = GGML_OP_CONVROT;
+    result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_convrot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               group_size) {
+    return ggml_convrot_impl(ctx, a, group_size, false);
+}
+
+struct ggml_tensor * ggml_convrot_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int32_t               group_size) {
+    return ggml_convrot_impl(ctx, a, group_size, true);
+}
+
+struct ggml_tensor * ggml_convrot_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * activations,
+        int32_t               group_size) {
+    GGML_ASSERT(activations->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->ne[0] == activations->ne[0]);
+
+    return ggml_mul_mat(ctx, weights, ggml_convrot(ctx, activations, group_size));
 }
 
 void ggml_mul_mat_set_prec(
@@ -7530,6 +7584,12 @@ static void ggml_compute_backward(
         case GGML_OP_ROPE_FLUX: {
             GGML_ASSERT(!src0_needs_grads && "backward pass for rope_flux not implemented");
             GGML_ASSERT((!src1 || !src1_needs_grads) && "gradients for rope_flux positional encoding not implemented");
+        } break;
+        case GGML_OP_CONVROT: {
+            if (src0_needs_grads) {
+                // the normalized 4-way Hadamard is symmetric and orthogonal: H^T = H
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_convrot(ctx, grad, ggml_get_op_params_i32(tensor, 0)));
+            }
         } break;
         case GGML_OP_IM2COL: {
             if (src1_needs_grads) {
