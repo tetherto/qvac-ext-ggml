@@ -389,6 +389,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_mul_mat_convrot(ctx, idx);
             } break;
+        case GGML_OP_CONVROT:
+            {
+                n_fuse = ggml_metal_op_convrot(ctx, idx);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 n_fuse = ggml_metal_op_mul_mat_id(ctx, idx);
@@ -2202,6 +2206,46 @@ int ggml_metal_op_mul_mat_convrot(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(ctx->enc,
             (weights->ne[1] + 31)/32, (activations->ne[1] + 63)/64, activations->ne[2]*activations->ne[3], 256, 1, 1);
     }
+    return 1;
+}
+
+int ggml_metal_op_convrot(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * src0 = op->src[0];
+
+    const int32_t group_size = ggml_get_op_params_i32(op, 0);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_convrot_group_size_is_valid(group_size));
+    GGML_ASSERT(src0->ne[0] % group_size == 0);
+
+    ggml_metal_kargs_convrot args = {
+        /* .ne00       = */ (int32_t) src0->ne[0],
+        /* .ne01       = */ (int32_t) src0->ne[1],
+        /* .ne02       = */ (int32_t) src0->ne[2],
+        /* .ne03       = */ (int32_t) src0->ne[3],
+        /* .group_size = */ group_size,
+        /* .nb00       = */ src0->nb[0],
+        /* .nb01       = */ src0->nb[1],
+        /* .nb02       = */ src0->nb[2],
+        /* .nb03       = */ src0->nb[3],
+        /* .nb0        = */ op->nb[0],
+        /* .nb1        = */ op->nb[1],
+        /* .nb2        = */ op->nb[2],
+        /* .nb3        = */ op->nb[3],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_convrot(ctx->lib, op);
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(src0), 1);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op),   2);
+
+    // one threadgroup per group_size-wide block; each stage has group_size/4 butterflies
+    const int ntg = std::min(64, group_size/4);
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc,
+        src0->ne[0]/group_size, src0->ne[1], src0->ne[2]*src0->ne[3], ntg, 1, 1);
+
     return 1;
 }
 
