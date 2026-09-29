@@ -7001,6 +7001,205 @@ struct test_concat : public test_case {
     }
 };
 
+// Bounded subsampler regressions, independently selectable with
+// -p speech_hotspot=. Keep the arithmetic reference in the CPU backend.
+struct test_speech_hotspot_matmul : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+    std::string vars() override { return "speech_hotspot=first_conv," + test_mul_mat::vars(); }
+    double max_nmse_err(ggml_backend_t backend) override {
+        // The Hexagon path accumulates in FP32. Other backends can use their
+        // existing F16 arithmetic, including the small-matrix OpenCL path.
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "HTP") == 0 ? 1e-7 : test_mul_mat::max_nmse_err(backend);
+    }
+};
+
+struct test_speech_hotspot_depthwise : public test_conv_2d_dw {
+    const bool offset;
+
+    test_speech_hotspot_depthwise(std::array<int64_t, 4> ne_input, std::array<int64_t, 4> ne_kernel,
+            ggml_type type_kernel, int stride, int padding, int dilation, bool cwhn, bool offset = false)
+        : test_conv_2d_dw(ne_input, ne_kernel, type_kernel, stride, padding, dilation, cwhn), offset(offset) {}
+
+    std::string vars() override { return "speech_hotspot=depthwise," + test_conv_2d_dw::vars() + "," + VAR_TO_STR(offset); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (!offset) {
+            return test_conv_2d_dw::build_graph(ctx);
+        }
+        // Keep logical storage packed for the CPU reference, while starting
+        // both views away from their aligned allocation base.
+        GGML_ASSERT(!cwhn);
+        const int64_t elements = ne_input[0] * ne_input[1] * ne_input[2] * ne_input[3];
+        ggml_tensor * input_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 1);
+        ggml_set_name(input_storage, "depthwise-offset-input-storage");
+        ggml_tensor * input = ggml_view_4d(ctx, input_storage,
+            ne_input[0], ne_input[1], ne_input[2], ne_input[3],
+            ne_input[0] * sizeof(float), ne_input[0] * ne_input[1] * sizeof(float),
+            ne_input[0] * ne_input[1] * ne_input[2] * sizeof(float), sizeof(float));
+
+        const int64_t weights = ne_kernel[0] * ne_kernel[1] * ne_kernel[2] * ne_kernel[3];
+        const size_t weight_size = ggml_type_size(type_kernel);
+        ggml_tensor * kernel_storage = ggml_new_tensor_1d(ctx, type_kernel, weights + 1);
+        ggml_set_name(kernel_storage, "depthwise-offset-kernel-storage");
+        ggml_tensor * kernel = ggml_view_4d(ctx, kernel_storage,
+            ne_kernel[0], ne_kernel[1], ne_kernel[2], ne_kernel[3],
+            ne_kernel[0] * weight_size, ne_kernel[0] * ne_kernel[1] * weight_size,
+            ne_kernel[0] * ne_kernel[1] * ne_kernel[2] * weight_size, weight_size);
+        ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input,
+            stride, stride, padding, padding, dilation, dilation);
+        ggml_set_name(out, "depthwise-offset-out");
+        return out;
+    }
+};
+
+// Exact neighborhoods from a 20x1500x256 deterministic benchmark where the
+// qf32 accumulator produced enormous values after several initial zero
+// products at the padded left edge. Retain all three failures without
+// allocating the original input.
+struct test_speech_hotspot_depthwise_cancellation : public test_case {
+    std::string vars() override { return "speech_hotspot=depthwise_cancellation"; }
+    double max_nmse_err() override { return 1e-7; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 20, 3, 3, 1);
+        ggml_tensor * kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 1, 3);
+        ggml_set_name(input, "depthwise-cancellation-input");
+        ggml_set_name(kernel, "depthwise-cancellation-kernel");
+        // Each channel contains the three rows around one original output.
+        // Vertical padding is zero so output row zero uses all three rows.
+        ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input, 2, 2, 1, 0, 1, 1);
+        ggml_set_name(out, "depthwise-cancellation-out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        const int channels[] = {112, 112, 140};
+        const int output_rows[] = {105, 614, 343};
+        std::vector<float> inputs(20 * 3 * 3), weights(9 * 3);
+        for (int c = 0; c < 3; ++c) {
+            for (int ky = 0; ky < 3; ++ky) {
+                const int source_y = 2 * output_rows[c] - 1 + ky;
+                for (int x = 0; x < 20; ++x) {
+                    const size_t i = (size_t(channels[c]) * 1500 + source_y) * 20 + x;
+                    inputs[(c * 3 + ky) * 20 + x] = float(int((i * 37 + 17) % 509) - 254) / 257.0f;
+                }
+                for (int kx = 0; kx < 3; ++kx) {
+                    const size_t i = size_t(channels[c]) * 9 + ky * 3 + kx;
+                    weights[c * 9 + ky * 3 + kx] = float(int((i * 19 + 11) % 251) - 125) / 127.0f;
+                }
+            }
+        }
+        ggml_tensor * input = ggml_get_tensor(ctx, "depthwise-cancellation-input");
+        ggml_tensor * kernel = ggml_get_tensor(ctx, "depthwise-cancellation-kernel");
+        GGML_ASSERT(input && kernel);
+        ggml_backend_tensor_set(input, inputs.data(), 0, inputs.size() * sizeof(float));
+        ggml_backend_tensor_set(kernel, weights.data(), 0, weights.size() * sizeof(float));
+    }
+};
+
+struct test_speech_hotspot_concat : public test_concat {
+    using test_concat::test_concat;
+    std::string vars() override { return "speech_hotspot=concat," + test_concat::vars(); }
+    double max_nmse_err() override { return 0.0; }
+};
+
+struct test_speech_hotspot_concat_transposed : public test_case {
+    const ggml_type type;
+    const bool transpose_a;
+    const bool batched;
+
+    test_speech_hotspot_concat_transposed(ggml_type type, bool transpose_a, bool batched)
+        : type(type), transpose_a(transpose_a), batched(batched) {}
+
+    std::string vars() override {
+        return "speech_hotspot=concat_transposed," + VARS_TO_STR3(type, transpose_a, batched);
+    }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t height = 33;
+        const int64_t depth = batched ? 2 : 1;
+        auto make_input = [&](int64_t width, bool transposed, const char * name) {
+            ggml_tensor * input = ggml_new_tensor_4d(ctx, type,
+                transposed ? height : width, transposed ? width : height, depth, 1);
+            ggml_set_name(input, name);
+            return transposed ? ggml_permute(ctx, input, 1, 0, 2, 3) : input;
+        };
+        ggml_tensor * a = make_input(19, transpose_a, "concat-a-storage");
+        ggml_tensor * b = make_input(5, !transpose_a, "concat-b-storage");
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_set_name(out, "concat-transposed-out");
+        return out;
+    }
+};
+
+static void add_speech_hotspot_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        for (int64_t positions : {60000, 96000, 120000, 192000}) {
+            cases.emplace_back(new test_speech_hotspot_matmul(
+                GGML_TYPE_F16, GGML_TYPE_F16, positions, 256, 9, {1, 1}, {1, 1}));
+        }
+        for (int64_t width : {20, 40, 64, 66}) {
+            cases.emplace_back(new test_speech_hotspot_depthwise(
+                {width, 1500, 256, 1}, {3, 3, 1, 256}, GGML_TYPE_F32, 2, 1, 1, false));
+        }
+        cases.emplace_back(new test_speech_hotspot_concat(GGML_TYPE_F32, {65, 1501, 256, 1}, 2, 0, 0));
+        cases.emplace_back(new test_speech_hotspot_concat(GGML_TYPE_F32, {68, 1501, 256, 1}, 2, 1, 0));
+        return;
+    }
+    for (int64_t positions : {1, 31, 32, 33, 63, 64, 65, 127, 257}) {
+        for (int64_t channels : {1, 4, 5, 7, 32, 33, 256}) {
+            cases.emplace_back(new test_speech_hotspot_matmul(
+                GGML_TYPE_F16, GGML_TYPE_F16, positions, channels, 9, {1, 1}, {1, 1}));
+        }
+    }
+    // Strided inputs and batched shapes must retain a correct fallback.
+    cases.emplace_back(new test_speech_hotspot_matmul(
+        GGML_TYPE_F16, GGML_TYPE_F16, 65, 33, 9, {1, 1}, {1, 1}, {0, 1, 2, 3}, 13));
+    cases.emplace_back(new test_speech_hotspot_matmul(
+        GGML_TYPE_F16, GGML_TYPE_F16, 65, 33, 9, {2, 1}, {1, 1}));
+    for (int64_t reduction : {8, 10}) {
+        cases.emplace_back(new test_speech_hotspot_matmul(
+            GGML_TYPE_F16, GGML_TYPE_F16, 65, 5, reduction, {1, 1}, {1, 1}));
+    }
+    cases.emplace_back(new test_speech_hotspot_matmul(
+        GGML_TYPE_F16, GGML_TYPE_F32, 65, 5, 9, {1, 1}, {1, 1}));
+    cases.emplace_back(new test_speech_hotspot_depthwise_cancellation());
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t width : {1, 2, 19, 20, 31, 32, 33, 39, 40, 63, 64, 65, 66}) {
+            for (int pad : {0, 1}) {
+                if (width < 3 && pad == 0) continue;
+                cases.emplace_back(new test_speech_hotspot_depthwise(
+                    {width, 9, 3, 2}, {3, 3, 1, 3}, type, 2, pad, 1, false));
+            }
+        }
+        for (int64_t width : {1, 2, 65}) {
+            cases.emplace_back(new test_speech_hotspot_depthwise(
+                {width, 9, 3, 2}, {3, 3, 1, 3}, type, 2, 2, 1, false, true));
+        }
+        cases.emplace_back(new test_speech_hotspot_depthwise(
+            {65, 9, 3, 2}, {3, 3, 1, 3}, type, 2, 2, 2, false, true));
+        cases.emplace_back(new test_speech_hotspot_depthwise(
+            {33, 9, 3, 2}, {3, 3, 1, 3}, type, 1, 1, 1, false));
+        cases.emplace_back(new test_speech_hotspot_depthwise(
+            {33, 9, 33, 2}, {3, 3, 1, 33}, type, 2, 1, 1, true));
+    }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I32}) {
+        for (int dim = 0; dim < 4; ++dim) {
+            for (int view : {0, 1, 2, 3, 12}) {
+                cases.emplace_back(new test_speech_hotspot_concat(type, {19, 7, 3, 2}, 2, dim, view));
+            }
+        }
+        for (bool transpose_a : {false, true}) {
+            for (bool batched : {false, true}) {
+                cases.emplace_back(new test_speech_hotspot_concat_transposed(type, transpose_a, batched));
+            }
+        }
+    }
+}
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -9249,6 +9448,7 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_speech_hotspot_tests(test_cases, false);
     std::default_random_engine rng(0);
 
     // unary ops
@@ -11452,6 +11652,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_speech_hotspot_tests(test_cases, true);
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
