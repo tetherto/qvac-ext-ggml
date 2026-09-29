@@ -2235,6 +2235,13 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     const int ne12  = src1->ne[2];
     const int wtype = src0->type;
 
+    // Both HMX matmul paths read activations as float, including their
+    // conversion to tiled F16. F16 activations must use the HVX kernels;
+    // interpreting them as F32 also reads beyond the end of their buffer.
+    if (src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+
     // HMX weight tile requires N to be 32-aligned. Checking ne01_padded is
     // pointless because it is always hex_round_up(ne01, 32) for repack
     // types, so every quantized weight passes this gate even when the

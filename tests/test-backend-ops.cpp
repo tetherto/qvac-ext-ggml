@@ -5205,6 +5205,17 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// F16 activations must not enter HMX kernels that interpret src1 as F32.
+// Includes the TDT/EOU pointwise subsampler shape and a batched attention
+// shape, plus F32 controls that should remain eligible for HMX.
+struct test_speech_matmul_activation_type : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override {
+        return "speech_case=matmul_activation_type," + test_mul_mat::vars();
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9670,6 +9681,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // exact CTC 0.6b shape is (128, 376, 8, 1) + (128, 1, 8, 1) → see the
     // struct doc above. Also probe head-dim-aligned nearby shapes so any
     // fix can be validated across a small tile window.
+    for (ggml_type activation_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_speech_matmul_activation_type(
+            GGML_TYPE_F16, activation_type, 24000, 256, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_speech_matmul_activation_type(
+            GGML_TYPE_F16, activation_type, 64, 32, 128, {4, 1}, {1, 1}));
+    }
     test_cases.emplace_back(new test_speech_attn_bcast_add(128, 376, 8));
     test_cases.emplace_back(new test_speech_attn_bcast_add(128,   1, 8));
     test_cases.emplace_back(new test_speech_attn_bcast_add(128,  32, 8));
