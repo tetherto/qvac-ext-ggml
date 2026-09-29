@@ -353,6 +353,8 @@ struct htp_opformat {
                 path = "hvx-flat";
             } else if (type == HTP_MM_KERNEL_HVX_F32_F32_BATCHED) {
                 path = "hvx-batched-f32";
+            } else if (type == HTP_MM_KERNEL_HVX_F16_F16_K9) {
+                path = "hvx-k9";
             }
             snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
         } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {

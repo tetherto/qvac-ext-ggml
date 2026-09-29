@@ -2477,6 +2477,19 @@ static void ggml_hexagon_precompute_hvx_mm_params(
 
     done_quant:;
     } else if (wtype == GGML_TYPE_F16) {
+        // The first 3x3 convolution has thousands of K=9 im2col rows.
+        // Vectorize across these rows instead of reducing a mostly empty
+        // vector per dot product. Keep batching, views and fused adds on the
+        // existing paths; this kernel needs no VTCM allocation.
+        if (!is_matmul_id && src2_row_size == 0 && ne10 == 9 &&
+            src0->ne[0] == 9 && src0->ne[1] >= 64 && ne11 >= 4 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+            kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_K9;
+            return;
+        }
+
         // F16 HVX
         const bool is_batched  = (ne02 > 1) || (ne03 > 1);
         const bool is_permuted = ggml_is_permuted(src0) || ggml_is_permuted(src1);

@@ -3554,8 +3554,66 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     return HTP_STATUS_OK;
 }
 
+// K=9 im2col has very short dot products and many spatial rows. Stage one
+// bounded tile in tap-major order, then reuse it for every output channel.
+// Half inputs are retained exactly and accumulation/output use FP32. This
+// avoids a reduction and a tiny-row DMA transaction for every output value.
+static void hvx_mm_k9_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_ops_context * octx = data;
+    const struct htp_tensor * a = octx->src[0];
+    const struct htp_tensor * b = octx->src[1];
+    const struct htp_tensor * dst = octx->dst;
+    const uint32_t rows = a->ne[1];
+    const uint32_t tiles = (rows + VLEN_FP16 - 1) / VLEN_FP16;
+    const uint32_t first = (uint64_t) tiles * ith / nth;
+    const uint32_t last = (uint64_t) tiles * (ith + 1) / nth;
+    __fp16 tile[9][VLEN_FP16] __attribute__((aligned(128)));
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, first);
+
+    for (uint32_t t = first; t < last; ++t) {
+        const uint32_t row = t * VLEN_FP16;
+        const uint32_t count = MIN(VLEN_FP16, rows - row);
+        const __fp16 * in = (const __fp16 *) a->data + (size_t) row * 9;
+        for (uint32_t k = 0; k < 9; ++k) {
+            for (uint32_t lane = 0; lane < count; ++lane) {
+                tile[k][lane] = in[lane * 9 + k];
+            }
+            for (uint32_t lane = count; lane < VLEN_FP16; ++lane) {
+                tile[k][lane] = 0;
+            }
+            // Half multiply produces even/odd FP32 lanes. Shuffle once so
+            // the resulting vector pair contains consecutive output rows.
+            *(HVX_Vector *) tile[k] = Q6_Vh_vshuff_Vh(*(const HVX_Vector *) tile[k]);
+        }
+        for (uint32_t col = 0; col < b->ne[1]; ++col) {
+            const __fp16 * weights = (const __fp16 *) b->data + (size_t) col * 9;
+            HVX_VectorPair sum = Q6_W_vzero();
+            #pragma unroll(9)
+            for (uint32_t k = 0; k < 9; ++k) {
+                const HVX_Vector w = hvx_vec_splat_f16(weights[k]);
+                sum = hvx_vec_mpyacc_f32_f16(sum, *(const HVX_Vector *) tile[k], w);
+            }
+            float * out = (float *) dst->data + (size_t) col * rows + row;
+            hvx_vec_store_u(out, MIN(count, VLEN_FP32) * sizeof(float), Q6_V_lo_W(sum));
+            if (count > VLEN_FP32) {
+                hvx_vec_store_u(out + VLEN_FP32, (count - VLEN_FP32) * sizeof(float), Q6_V_hi_W(sum));
+            }
+        }
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, first);
+}
+
 int op_matmul(struct htp_ops_context * octx) {
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+
+    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_F16_F16_K9) {
+        if ((octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) || octx->n_threads == 0) {
+            return HTP_STATUS_OK;
+        }
+        worker_pool_run_func(octx->ctx->worker_pool, hvx_mm_k9_thread, octx, octx->n_threads);
+        return HTP_STATUS_OK;
+    }
 
     if (kparams->n_hmx) {
         return hmx_mm_op_matmul(octx, kparams);

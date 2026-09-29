@@ -68,6 +68,9 @@ enum htp_mm_kernel_type {
     HTP_MM_KERNEL_HVX_QUANT_ROW,      // standard row-wise parallel quantization
     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
     HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT, // row-wise fallback flat quantization
+
+    // Small-K convolution lowering: SIMD lanes span independent output rows.
+    HTP_MM_KERNEL_HVX_F16_F16_K9,
 };
 
 // Op-specific struct for precomputed matmul params
