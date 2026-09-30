@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(ggml-package-consumer CXX)
+project(ggml-package-consumer C CXX)
 
 # A downstream project that consumes an installed ggml package the way the
 # speech engines do: ggml::all for the backends the package links statically,

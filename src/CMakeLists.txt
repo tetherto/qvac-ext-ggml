@@ -414,14 +414,15 @@ function(ggml_add_backend_library backend)
         # with cmake-bare
         # add_dependencies(ggml ${backend})
 
+        # Runtime-loaded modules are found by the registry loader, never linked by a
+        # consumer, so they stay out of the exported targets: a package may prune
+        # modules (per-arch CPU tiers) without leaving dangling imported targets.
         if (GGML_BACKEND_DIR)
             install(TARGETS ${backend}
-                    EXPORT ggml-targets
                     LIBRARY DESTINATION ${GGML_BACKEND_DIR}
                     RUNTIME DESTINATION ${GGML_BACKEND_DIR})
         else()
             install(TARGETS ${backend}
-                    EXPORT ggml-targets
                     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
                     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
         endif()

@@ -1110,7 +1110,6 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_upscale_bilinear;
     cl_kernel kernel_concat_f32, kernel_concat_f32_pack;
     cl_kernel kernel_gru_f32;
-    cl_kernel kernel_conv_2d_dw_whcn_f32;
     cl_kernel kernel_zero_upsample_f32;
     cl_kernel kernel_channel_shuffle_f32;
     cl_kernel kernel_affine_prelu_f32;
@@ -3697,22 +3696,6 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program prog =
             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_gru_f32 = clCreateKernel(prog, "kernel_gru_f32", &err), err));
-        CL_CHECK(clReleaseProgram(prog));
-        GGML_LOG_CONT(".");
-    }
-
-    // conv2d_dw
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "conv2d_dw.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("conv2d_dw.cl");
-#endif
-        cl_program prog =
-            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
-        CL_CHECK((backend_ctx->kernel_conv_2d_dw_whcn_f32 = clCreateKernel(prog, "kernel_conv_2d_dw_whcn_f32", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -8625,9 +8608,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] <= GGML_OPENCL_GRU_MAX_H;
-        case GGML_OP_CONV_2D_DW:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]);
         case GGML_OP_ZERO_UPSAMPLE:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]);
@@ -16038,63 +16018,6 @@ static void ggml_cl_gru(ggml_backend_t backend, const ggml_tensor * src0, const 
 
     size_t global_work_size[] = { (size_t) H, (size_t) B, 1 };
     size_t local_work_size[]  = { (size_t) H, 1, 1 };
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
-}
-
-static void ggml_cl_conv_2d_dw(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(src0 && src0->extra);
-    GGML_ASSERT(src1 && src1->extra);
-    GGML_ASSERT(dst && dst->extra);
-
-    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
-
-    ggml_tensor_extra_cl * e0 = (ggml_tensor_extra_cl *)src0->extra;
-    ggml_tensor_extra_cl * e1 = (ggml_tensor_extra_cl *)src1->extra;
-    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *)dst->extra;
-
-    cl_ulong off0 = e0->offset + src0->view_offs;
-    cl_ulong off1 = e1->offset + src1->view_offs;
-    cl_ulong offd = ed->offset + dst->view_offs;
-
-    const int W    = src1->ne[0];
-    const int H    = src1->ne[1];
-    const int C    = src1->ne[2];
-    const int N    = src1->ne[3];
-    const int KW   = src0->ne[0];
-    const int KH   = src0->ne[1];
-    const int Wout = dst->ne[0];
-    const int Hout = dst->ne[1];
-    const int s0   = ggml_get_op_params_i32(dst, 0);
-    const int s1   = ggml_get_op_params_i32(dst, 1);
-    const int p0   = ggml_get_op_params_i32(dst, 2);
-    const int p1   = ggml_get_op_params_i32(dst, 3);
-    const int d0   = ggml_get_op_params_i32(dst, 4);
-    const int d1   = ggml_get_op_params_i32(dst, 5);
-
-    cl_kernel kernel = backend_ctx->kernel_conv_2d_dw_whcn_f32;
-    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &e1->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &off1));
-    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &e0->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &off0));
-    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &ed->data_device));
-    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offd));
-    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &W));
-    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &H));
-    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &KW));
-    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &KH));
-    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &Wout));
-    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &Hout));
-    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &s0));
-    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &s1));
-    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &p0));
-    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &p1));
-    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &d0));
-    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &d1));
-    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &C));
-
-    const size_t gws0 = ((size_t) (Wout + 63) / 64) * 64;
-    size_t global_work_size[] = { gws0, (size_t) Hout, (size_t) (C * N) };
-    size_t local_work_size[]  = { 64, 1, 1 };
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
@@ -27936,12 +27859,6 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_gru;
-            break;
-        case GGML_OP_CONV_2D_DW:
-            if (!any_on_device) {
-                return false;
-            }
-            func = ggml_cl_conv_2d_dw;
             break;
         case GGML_OP_ZERO_UPSAMPLE:
             if (!any_on_device) {
