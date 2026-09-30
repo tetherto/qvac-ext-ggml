@@ -11678,9 +11678,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // A quantized src0 has the scalar fp32 dequant matmul, where keeping src1 in f32 lets
     // the activations reach the shader unclamped. Only opt out when that pipeline exists
-    // for this src0 type, since otherwise the fp16 path is the only one available. This
-    // constrains src1 alone: src0 is a quantized weight here, and the assert above already
-    // requires those to be dim01-contiguous, so x_non_contig is never true for them.
+    // for this src0 type, since otherwise the fp16 path is the only one available.
     const bool keep_src1_f32 = prec == GGML_PREC_F32 && src1->type == GGML_TYPE_F32 &&
                                ggml_is_quantized(src0->type) &&
                                ctx->device->pipeline_dequant_mul_mat_mat_fp32[src0->type] &&
@@ -11701,7 +11699,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
-    const ggml_type x_reformat_type = prec_f32_f32 ? GGML_TYPE_F32 : f16_type;
+    // A non-contiguous quantized src0 is dequantized on the GPU before the matmul. When the
+    // activations stay f32 that copy has to be f32 as well: the f32 x f32 matmul exists on
+    // every device, while coopmat2 never builds an f16 x f32 one.
+    const bool dequant_x_f32 = keep_src1_f32 && !ggml_vk_dim01_contiguous(src0);
+    const ggml_type x_reformat_type = (prec_f32_f32 || dequant_x_f32) ? GGML_TYPE_F32 : f16_type;
     const bool keep_operands_f32 = keep_src1_f32 || x_reformat_type == GGML_TYPE_F32;
     const ggml_type y_reformat_type = keep_operands_f32 ? GGML_TYPE_F32 : f16_type;
 

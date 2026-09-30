@@ -189,6 +189,22 @@ if (GGML_METAL)
 endif()
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+# Installed-package consumer: find_package(ggml) with ggml::all (and the vector
+# index when built), plus the pkg-config metadata against the installed libdir.
+if (NOT GGML_BACKEND_DL OR GGML_CPU_STATIC)
+    set(GGML_CONSUMER_EXPECT_CPU ON)
+else()
+    set(GGML_CONSUMER_EXPECT_CPU OFF)
+endif()
+add_test(NAME test-package-consumer
+    COMMAND ${CMAKE_COMMAND}
+        -DGGML_BUILD_DIR=${CMAKE_BINARY_DIR}
+        -DGGML_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/package-consumer
+        -DGGML_LIB_OUTPUT_PREFIX=${GGML_LIB_OUTPUT_PREFIX}
+        -DGGML_CONSUMER_EXPECT_CPU=${GGML_CONSUMER_EXPECT_CPU}
+        -DGGML_CONSUMER_CONFIG=$<CONFIG>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/package-consumer/run.cmake)
+
 # ggml-opencl flash-attention q-chunking parity against the CPU backend.
 # Self-skipping at runtime when no OpenCL device is present.
 set(TEST_TARGET test-opencl-fa-chunking)

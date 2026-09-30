@@ -12272,6 +12272,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_strided_mul_mat_prec_f32_tests(test_cases);
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 96, 63, 544, true, false));
 
+    // A non-contiguous quantized weight (k_v > k) under GGML_PREC_F32 is dequantized on the
+    // GPU first; the dequantized copy must keep the f32 arithmetic the request asks for, and
+    // the resulting pipeline must exist on coopmat2 devices, which have no f16 x f32 matmul.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 33, 256, {1,1}, {1,1}, {0, 1, 2, 3}, 512, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64,  1, 256, {1,1}, {1,1}, {0, 1, 2, 3}, 512, 1, true));
+    }
+
     // The Adreno gemv splits K across waves, and is only selected once both dimensions
     // reach 384, so every n=1 case above (m=16, k=256) misses it entirely. These reach
     // it: 896x896 is the shape a small LM's attention projections take, narrow enough

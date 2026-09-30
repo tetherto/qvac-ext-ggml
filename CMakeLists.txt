@@ -482,7 +482,7 @@ if (GGML_STANDALONE)
 
     set(GGML_PC_LIBS_PRIVATE "")
     foreach(GGML_PC_BACKEND IN LISTS GGML_AVAILABLE_BACKENDS)
-        list(APPEND GGML_PC_LIBS_PRIVATE "-l${GGML_PC_BACKEND}")
+        list(APPEND GGML_PC_LIBS_PRIVATE "-l${GGML_LIB_OUTPUT_PREFIX}${GGML_PC_BACKEND}")
     endforeach()
     foreach(GGML_PC_TARGET IN ITEMS ggml ggml-base)
         ggml_pc_append_target_private_libs(GGML_PC_LIBS_PRIVATE "${GGML_PC_TARGET}")

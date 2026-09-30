@@ -252,8 +252,14 @@ endif()
 # Rebuild the aggregate here from the backend list recorded at install time.
 if(NOT TARGET ggml::all)
     set(_ggml_all_targets "")
-    if (NOT GGML_BACKEND_DL)
+    # In hybrid mode (GGML_BACKEND_DL + GGML_CPU_STATIC) the CPU backend is still a
+    # static library that consumers link, so it stays in the aggregate.
+    if (NOT GGML_BACKEND_DL OR GGML_CPU_STATIC)
         foreach(_ggml_backend ${GGML_AVAILABLE_BACKENDS})
+            string(REGEX MATCH "^ggml-cpu" _ggml_is_cpu_variant "${_ggml_backend}")
+            if (GGML_BACKEND_DL AND GGML_CPU_STATIC AND NOT _ggml_is_cpu_variant)
+                continue()
+            endif()
             if (TARGET ggml::${_ggml_backend})
                 list(APPEND _ggml_all_targets ggml::${_ggml_backend})
             endif()
@@ -268,7 +274,8 @@ if(NOT TARGET ggml::all)
 endif()
 
 if(GGML_VECTOR_INDEX AND NOT TARGET ggml::ggml-vector-index)
-    find_library(GGML_VECTOR_INDEX_LIBRARY ggml-vector-index
+    find_library(GGML_VECTOR_INDEX_LIBRARY
+        NAMES "${GGML_LIB_OUTPUT_PREFIX}ggml-vector-index" ggml-vector-index
         REQUIRED
         HINTS ${GGML_LIB_DIR}
         NO_CMAKE_FIND_ROOT_PATH)
