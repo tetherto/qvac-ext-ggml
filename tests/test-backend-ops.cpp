@@ -6402,6 +6402,51 @@ struct test_mul_mat_prec_f32 : public test_case {
     }
 };
 
+// mul_mat followed by the add of a row bias, the way a linear layer with a bias is
+// built. Backends may fold the bias into the product (CUDA adds it while converting its
+// half-precision cuBLAS GEMM output to f32), so the whole graph is compared.
+struct test_mul_mat_row_bias : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ROW_BIAS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    test_mul_mat_row_bias(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a, b), bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static void add_strided_mul_mat_prec_f32_tests(std::vector<std::unique_ptr<test_case>> & test_cases) {
     constexpr float overflow_magnitude = test_mul_mat_prec_f32::fp16_overflow_magnitude;
     constexpr float unit_magnitude = test_mul_mat_prec_f32::unit_magnitude;
@@ -12246,6 +12291,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // so a backend that exempts it from its reduced-precision path resolves to nothing.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 33, 129, 257, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    // Small batches of half-precision weights under GGML_PREC_F32 stay on a matrix-vector
+    // kernel that reads the activations as f32, where the default MMA kernel rounds them to
+    // the weight type; the widest batch goes to the f32 GEMM instead. Cover those batch
+    // widths, broadcasting and a permuted weight view.
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int n : {1, 2, 5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 2, 256, {2,3}, {2,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1056, 2, 192, {1,1}, {4,1}, {0, 2, 1, 3}, 0, 1, true));
+    }
     // A quantized weight does have one, via the dequantizing matmul. Models with
     // activations outside fp16 range need fp32 arithmetic here too, and backends may reach
     // it with a different pipeline family than the default one (small/medium/large tile
@@ -12270,6 +12326,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
 
     add_strided_mul_mat_prec_f32_tests(test_cases);
+
+    // batch widths on the matrix-vector, MMF and cuBLAS sides, and a row length no
+    // block size divides
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 8, 32, 257}) {
+            test_cases.emplace_back(new test_mul_mat_row_bias(type_a, 256, n, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_row_bias(type_a, 1027, 96, 256));
+    }
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 96, 63, 544, true, false));
 
     // A non-contiguous quantized weight (k_v > k) under GGML_PREC_F32 is dequantized on the
