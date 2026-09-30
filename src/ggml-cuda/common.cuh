@@ -1042,6 +1042,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ2_0> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR_TQ2_0;
+    static constexpr int qi = QI_TQ2_0;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q3_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR3_K;
@@ -1230,6 +1237,38 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
+    struct owned_buffer {
+        char * data = nullptr;
+        size_t size = 0;
+
+        owned_buffer() = default;
+
+        explicit owned_buffer(size_t size) : size(size) { CUDA_CHECK(cudaMalloc((void **) &data, size)); }
+
+        owned_buffer(const owned_buffer &)             = delete;
+        owned_buffer & operator=(const owned_buffer &) = delete;
+
+        owned_buffer(owned_buffer && other) noexcept : data(other.data), size(other.size) {
+            other.data = nullptr;
+            other.size = 0;
+        }
+
+        owned_buffer & operator=(owned_buffer && other) noexcept {
+            GGML_ASSERT(data == nullptr);
+            data       = other.data;
+            size       = other.size;
+            other.data = nullptr;
+            other.size = 0;
+            return *this;
+        }
+
+        ~owned_buffer() {
+            if (data != nullptr) {
+                CUDA_CHECK(cudaFree(data));
+            }
+        }
+    };
+
     ~ggml_cuda_graph() {
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
@@ -1238,6 +1277,31 @@ struct ggml_cuda_graph {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
     }
+
+    void * reserve_workspace(size_t size, bool update_required) {
+        if (size == 0) {
+            return nullptr;
+        }
+        if (workspace.size >= size) {
+            return workspace.data;
+        }
+        GGML_ASSERT(update_required && pending_workspace.data == nullptr);
+        pending_workspace = owned_buffer(size);
+        return pending_workspace.data;
+    }
+
+    void commit_workspace() {
+        if (pending_workspace.data == nullptr) {
+            return;
+        }
+        owned_buffer old_workspace(std::move(workspace));
+        workspace = std::move(pending_workspace);
+    }
+
+    void discard_pending_workspace() {
+        owned_buffer discarded(std::move(pending_workspace));
+    }
+
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
     size_t num_nodes = 0;
@@ -1253,6 +1317,8 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
+    owned_buffer                 workspace;
+    owned_buffer                 pending_workspace;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1418,7 +1484,9 @@ struct ggml_backend_cuda_context {
     cudaEvent_t copy_event = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
-    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
 
@@ -1495,17 +1563,22 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
-    cublasHandle_t cublas_handle(int device) {
-        if (cublas_handles[device] == nullptr) {
-            ggml_cuda_set_device(device);
-            CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
-        }
-        return cublas_handles[device];
-    }
-
     cublasHandle_t cublas_handle() {
-        return cublas_handle(device);
+        if (cublas_handles[device][curr_stream_no] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+            if (cublas_workspace_sizes[device] == 0) {
+                const int cc = ggml_cuda_info().devices[device].cc;
+                cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
+            }
+            CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+            CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
+#endif
+        }
+        return cublas_handles[device][curr_stream_no];
     }
 
     // pool
@@ -1523,6 +1596,46 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    struct async_upload {
+        ggml_cuda_pool * pool = nullptr;
+        void * data = nullptr;
+        size_t size = 0;
+        size_t actual_size = 0;
+        const void * tensor = nullptr;
+        size_t next = 0;
+
+        bool begin(ggml_cuda_pool & new_pool, const void * new_tensor, size_t new_size) {
+            if (data != nullptr) {
+                return false;
+            }
+            pool = &new_pool;
+            data = pool->alloc(new_size, &actual_size);
+            size = new_size;
+            tensor = new_tensor;
+            next = 0;
+            return true;
+        }
+
+        void release() {
+            if (data != nullptr) {
+                pool->free(data, actual_size);
+            }
+            pool = nullptr;
+            data = nullptr;
+            size = 0;
+            actual_size = 0;
+            tensor = nullptr;
+            next = 0;
+        }
+    };
+
+    async_upload uploads[GGML_CUDA_MAX_STREAMS];
+
+    async_upload & upload_for_stream() {
+        GGML_ASSERT(curr_stream_no >= 0 && curr_stream_no < GGML_CUDA_MAX_STREAMS);
+        return uploads[curr_stream_no];
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
@@ -1536,6 +1649,7 @@ struct ggml_cuda_mm_fusion_args_host {
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
+    const void * gate_scales_linear = nullptr;
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
