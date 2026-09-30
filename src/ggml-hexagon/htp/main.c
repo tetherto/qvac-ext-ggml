@@ -728,6 +728,7 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_NEG:
         case HTP_OP_UNARY_EXP:
         case HTP_OP_UNARY_TANH:
+        case HTP_OP_UNARY_RELU:
         case HTP_OP_L2_NORM:
             return op_unary(octx);
 
@@ -783,6 +784,9 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_IM2COL:
             return op_im2col(octx);
+
+        case HTP_OP_CONV_2D_DW:
+            return op_conv_2d_dw(octx);
 
         case HTP_OP_CONCAT:
             return op_concat(octx);

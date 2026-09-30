@@ -66,13 +66,14 @@ static inline void htp_im2col_vtcm_layout_build(struct htp_im2col_vtcm_layout * 
         const int32_t  p1                       = octx->op_params[3];                                     \
         const int32_t  d0                       = octx->op_params[4];                                     \
         const int32_t  d1                       = octx->op_params[5];                                     \
-        const uint32_t N                        = src1->ne[3];                                            \
-        const uint32_t IC                       = src1->ne[2];                                            \
-        const uint32_t IH                       = src1->ne[1];                                            \
+        const bool is_2D                       = octx->op_params[6] == 1;                                \
+        const uint32_t N                        = src1->ne[is_2D ? 3 : 2];                                \
+        const uint32_t IC                       = src1->ne[is_2D ? 2 : 1];                                \
+        const uint32_t IH                       = is_2D ? src1->ne[1] : 1;                                \
         const uint32_t IW                       = src1->ne[0];                                            \
-        const uint32_t KH                       = octx->src[0]->ne[1];                                    \
+        const uint32_t KH                       = is_2D ? octx->src[0]->ne[1] : 1;                        \
         const uint32_t KW                       = octx->src[0]->ne[0];                                    \
-        const uint32_t OH                       = dst->ne[2];                                             \
+        const uint32_t OH                       = is_2D ? dst->ne[2] : 1;                                 \
         const uint32_t OW                       = dst->ne[1];                                             \
         const uint32_t patch_stride             = IC * KH * KW;                                           \
         const float * restrict src_data         = (const float *) src1->data;                             \
@@ -90,20 +91,20 @@ static inline void htp_im2col_vtcm_layout_build(struct htp_im2col_vtcm_layout * 
             const uint32_t in              = p / (OW * OH);                                               \
             DST_CTYPE * restrict dst_patch = dst_data + (uint64_t) p * patch_stride;                      \
             for (uint32_t iic = 0; iic < IC; iic++) {                                                     \
-                const float * restrict src_plane = src_data + ((uint64_t) in * IC + iic) * IH * IW;       \
+                const float * restrict src_plane = (const float *) ((const uint8_t *) src_data +        \
+                    (uint64_t) in * src1->nb[is_2D ? 3 : 2] + (uint64_t) iic * src1->nb[is_2D ? 2 : 1]); \
                 for (uint32_t ikh = 0; ikh < KH; ikh++) {                                                 \
-                    const int32_t iih            = (int32_t) ioh * s1 + (int32_t) ikh * d1 - p1;          \
+                    const int64_t iih            = (int64_t) ioh * s1 + (int64_t) ikh * d1 - p1;          \
                     DST_CTYPE * restrict out_run = dst_patch + iic * (KH * KW) + ikh * KW;                \
                     if (iih < 0 || iih >= (int32_t) IH) {                                                 \
                         SPLAT_FN(out_run, 0.0f, KW);                                                      \
                         continue;                                                                         \
                     }                                                                                     \
-                    const int32_t iiw0             = (int32_t) iow * s0 - p0;                             \
-                    const float * restrict src_run = src_plane + (uint64_t) iih * IW + iiw0;              \
+                    const int64_t iiw0             = (int64_t) iow * s0 - p0;                             \
                     if (d0 == 1) {                                                                        \
                         /* contiguous source run: [lo,hi) is in-bounds, tails are zero pad */             \
-                        const int32_t lo = iiw0 < 0 ? -iiw0 : 0;                                          \
-                        int32_t       hi = (int32_t) IW - iiw0;                                           \
+                        const int64_t lo = iiw0 < 0 ? -iiw0 : 0;                                          \
+                        int64_t       hi = (int64_t) IW - iiw0;                                           \
                         if (hi > (int32_t) KW) {                                                          \
                             hi = (int32_t) KW;                                                            \
                         }                                                                                 \
@@ -113,7 +114,8 @@ static inline void htp_im2col_vtcm_layout_build(struct htp_im2col_vtcm_layout * 
                             if (lo > 0) {                                                                 \
                                 SPLAT_FN(out_run, 0.0f, (uint32_t) lo);                                   \
                             }                                                                             \
-                            COPY_FN((uint8_t *) (out_run + lo), (const uint8_t *) (src_run + lo),         \
+                            COPY_FN((uint8_t *) (out_run + lo),                                          \
+                                    (const uint8_t *) (src_plane + iih * IW + iiw0 + lo),                \
                                     (uint32_t) (hi - lo));                                                \
                             if (hi < (int32_t) KW) {                                                      \
                                 SPLAT_FN(out_run + hi, 0.0f, (KW - (uint32_t) hi));                       \
@@ -122,7 +124,7 @@ static inline void htp_im2col_vtcm_layout_build(struct htp_im2col_vtcm_layout * 
                         continue;                                                                         \
                     }                                                                                     \
                     for (uint32_t ikw = 0; ikw < KW; ikw++) {                                             \
-                        const int32_t iiw = (int32_t) iow * s0 + (int32_t) ikw * d0 - p0;                 \
+                        const int64_t iiw = (int64_t) iow * s0 + (int64_t) ikw * d0 - p0;                 \
                         out_run[ikw]      = (iiw < 0 || iiw >= (int32_t) IW) ?                            \
                                                 (DST_CTYPE) 0.0f :                                        \
                                                 (DST_CTYPE) src_plane[(uint64_t) iih * IW + iiw];         \
@@ -212,6 +214,12 @@ static bool im2col_use_patchembed_dma(const struct htp_ops_context * octx) {
     if (!is_2D) {
         return false;
     }
+    // This path flattens the image. Strided channel/batch views use the DDR path.
+    const struct htp_tensor * x = octx->src[1];
+    if (x->nb[0] != sizeof(float) || x->nb[1] != x->ne[0] * sizeof(float) ||
+        x->nb[2] != x->ne[1] * x->nb[1] || x->nb[3] != x->ne[2] * x->nb[2]) {
+        return false;
+    }
     if (octx->dst->type != HTP_TYPE_F16 && octx->dst->type != HTP_TYPE_F32) {
         return false;
     }
@@ -266,8 +274,9 @@ int op_im2col(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    const uint32_t N         = src1->ne[3];
-    const uint32_t OH        = dst->ne[2];
+    const bool is_2D        = octx->op_params[6] == 1;
+    const uint32_t N         = src1->ne[is_2D ? 3 : 2];
+    const uint32_t OH        = is_2D ? dst->ne[2] : 1;
     const uint32_t OW        = dst->ne[1];
     const uint32_t npatches  = N * OH * OW;
     const uint32_t n_threads = MIN(octx->n_threads, npatches);

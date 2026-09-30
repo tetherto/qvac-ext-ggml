@@ -141,5 +141,6 @@ int op_solve_tri(struct htp_ops_context * octx);
 int op_gated_delta_net(struct htp_ops_context * octx);
 int op_pad(struct htp_ops_context * octx);
 int op_im2col(struct htp_ops_context * octx);
+int op_conv_2d_dw(struct htp_ops_context * octx);
 
 #endif /* HTP_CTX_H */

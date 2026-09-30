@@ -3149,6 +3149,43 @@ struct test_cont : public test_case {
     }
 };
 
+// A [KW, KH, 1, C] depthwise weight permutation has equal strides on
+// its first two axes but nonpacked inner elements. Exercise CONT and both
+// sides of CPY independently of the convolution that exposed the bug.
+struct test_copy_permuted_rows : public test_case {
+    const ggml_type type;
+    const bool gapped;
+    const int mode; // 0: CONT; 1: strided source; 2: strided destination; 3: both
+
+    test_copy_permuted_rows(ggml_type type, bool gapped, int mode)
+        : type(type), gapped(gapped), mode(mode) {}
+
+    std::string vars() override {
+        return "copy_case=permuted_rows," + VARS_TO_STR3(type, gapped, mode);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto strided = [&]() {
+            if (gapped) {
+                // nb[0] < nb[1] also does not imply packed rows: a later
+                // axis can be the physical innermost one. Add view gaps.
+                ggml_tensor * base = ggml_new_tensor_4d(ctx, type, 5, 33, 3, 2);
+                ggml_tensor * view = ggml_view_4d(ctx, base, 3, 33, 3, 2,
+                    base->nb[1], base->nb[2], base->nb[3], ggml_type_size(type));
+                return ggml_permute(ctx, view, 2, 0, 1, 3);
+            }
+            return ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, 3, 3, 1, 33), 2, 3, 1, 0);
+        };
+        auto packed = [&]() { return ggml_new_tensor_4d(ctx, type, 33, gapped ? 3 : 1, 3, gapped ? 2 : 3); };
+        ggml_tensor * src = mode == 2 ? packed() : strided();
+        if (mode == 0) return ggml_cont(ctx, src);
+        ggml_tensor * dst = mode == 1 ? packed() : strided();
+        return ggml_cpy(ctx, src, dst);
+    }
+};
+
 // GGML_OP_ADD
 // GGML_OP_SUB
 // GGML_OP_MUL
@@ -5168,6 +5205,17 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// F16 activations must not enter HMX kernels that interpret src1 as F32.
+// Includes the TDT/EOU pointwise subsampler shape and a batched attention
+// shape, plus F32 controls that should remain eligible for HMX.
+struct test_speech_matmul_activation_type : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    std::string vars() override {
+        return "speech_case=matmul_activation_type," + test_mul_mat::vars();
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -6727,6 +6775,141 @@ struct test_conv_2d_dw : public test_case {
     }
 };
 
+// FastConformer regression shapes. A distinct parameter tag makes it possible
+// to require this bounded suite on an accelerator without running the large
+// image-model cases. These graphs are compared with the CPU backend by the
+// ordinary test runner; no special tolerance or reference implementation.
+struct test_speech_im2col : public test_case {
+    const bool two_d;
+    const ggml_type output_type;
+    const bool gapped;
+    const int stride;
+    const int dilation;
+    const int64_t channels;
+
+    test_speech_im2col(bool two_d, ggml_type output_type, bool gapped,
+                      int stride, int dilation, int64_t channels)
+        : two_d(two_d), output_type(output_type), gapped(gapped),
+          stride(stride), dilation(dilation), channels(channels) {}
+
+    std::string vars() override {
+        return "speech_case=im2col," + VARS_TO_STR6(two_d, output_type, gapped, stride, dilation, channels);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t width = 37;
+        const int64_t height = two_d ? 7 : channels;
+        const int64_t depth = two_d ? channels : 2;
+        const int64_t batches = two_d ? 2 : 1;
+        ggml_tensor * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+            width + (gapped && !two_d ? 3 : 0),
+            height + (gapped && two_d ? 3 : 0), depth, batches);
+        ggml_set_name(storage, "speech-input-storage");
+        ggml_tensor * input = storage;
+        if (gapped) {
+            // Channel/batch strides exceed the logical extent, and the first
+            // sample has a nonzero offset. Spatial rows stay packed, as
+            // required by GGML's CPU reference.
+            input = ggml_view_4d(ctx, storage, width, height, depth, batches,
+                storage->nb[1], storage->nb[2], storage->nb[3], sizeof(float));
+        }
+        ggml_tensor * kernel = two_d
+            ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, channels, 2)
+            : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 9, channels, 2, 1);
+        ggml_set_name(kernel, "speech-im2col-kernel");
+        ggml_tensor * out = ggml_im2col(ctx, kernel, input, stride, two_d ? stride : 0,
+            two_d ? dilation : 4 * dilation, two_d ? dilation : 0,
+            dilation, two_d ? dilation : 0, two_d, output_type);
+        ggml_set_name(out, "speech-im2col");
+        return out;
+    }
+};
+
+struct test_speech_depthwise : public test_case {
+    const ggml_type weight_type;
+    const bool cwhn;
+    const int64_t channels;
+    const int stride;
+    const int dilation;
+    const bool subsampler;
+
+    test_speech_depthwise(ggml_type weight_type, bool cwhn, int64_t channels,
+                         int stride, int dilation, bool subsampler)
+        : weight_type(weight_type), cwhn(cwhn), channels(channels),
+          stride(stride), dilation(dilation), subsampler(subsampler) {}
+
+    std::string vars() override {
+        return "speech_case=depthwise," + VARS_TO_STR6(weight_type, cwhn, channels, stride, dilation, subsampler);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // 37 positions exercise vector tails; height one is the conformer
+        // temporal convolution, height seven exercises the 2D subsampler.
+        ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 37,
+            subsampler ? 7 : 1, channels, 2);
+        ggml_tensor * kernel = ggml_new_tensor_4d(ctx, weight_type,
+            subsampler ? 3 : 9, subsampler ? 3 : 1, 1, channels);
+        ggml_set_name(input, "speech-depthwise-input");
+        ggml_set_name(kernel, "speech-depthwise-kernel");
+        if (cwhn) {
+            input = ggml_permute(ctx, ggml_cont(ctx, ggml_permute(ctx, input, 1, 2, 0, 3)), 2, 0, 1, 3);
+            kernel = ggml_permute(ctx, ggml_cont(ctx, ggml_permute(ctx, kernel, 2, 3, 1, 0)), 3, 2, 0, 1);
+        }
+        ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input,
+            stride, subsampler ? stride : 1,
+            (subsampler ? 1 : 4) * dilation, subsampler ? dilation : 0,
+            dilation, subsampler ? dilation : 1);
+        ggml_set_name(out, "speech-depthwise");
+        return out;
+    }
+};
+
+// Parakeet attention bias-broadcast add.
+//
+// Repros the exact op that first produces FLT_MAX / inf on HTP0 in the
+// unfused relative-position MHA path:
+//
+//   q_perm  = cont(permute(q, 0,2,1,3))  // shape (HD, T, H, 1) f32
+//   u_bias  = reshape_3d(pos_bias_u, HD, 1, H)  // shape (HD, 1, H, 1) f32
+//   q_u     = ggml_add(q_perm, u_bias)   // broadcast on dim 1
+//
+// For Parakeet CTC 0.6b: HD=128, H=8, T=376. The parity harness measured
+// max_abs(q_u_htp) ≈ 3.402e38 (== FLT_MAX bit pattern 0x7F7FFFFF) while the
+// inputs to the ADD are both well-conditioned (|q_perm| ≤ 0.03, |u_bias|
+// ≤ ~1). This test isolates the failing op from the surrounding graph
+// so the bug can be filed against ggml-hexagon's ADD kernel independently
+// of Parakeet.
+//
+// The test does NOT use the test_bin_bcast pattern because that class
+// permutes / views one operand; we want the exact contiguous
+// (HD, T, H, 1) + (HD, 1, H, 1) case as ggml_backend_sched sees it.
+struct test_speech_attn_bcast_add : public test_case {
+    const int64_t HD;   // head dim
+    const int64_t T;    // frames
+    const int64_t H;    // heads
+
+    test_speech_attn_bcast_add(int64_t HD, int64_t T, int64_t H)
+        : HD(HD), T(T), H(H) {}
+
+    std::string vars() override {
+        return "speech_case=attn_bcast_add," + VARS_TO_STR3(HD, T, H);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q_perm: contiguous (HD, T, H, 1) f32 — matches cont(permute(q)) layout.
+        ggml_tensor * q_perm = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD, T, H, 1);
+        ggml_set_name(q_perm, "speech-attn-q-perm");
+
+        // u_bias: contiguous (HD, 1, H, 1) f32 — matches reshape_3d(pos_bias_u).
+        ggml_tensor * u_bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD, 1, H, 1);
+        ggml_set_name(u_bias, "speech-attn-u-bias");
+
+        ggml_tensor * out = ggml_add(ctx, q_perm, u_bias);
+        ggml_set_name(out, "speech-attn-bcast-add");
+        return out;
+    }
+};
+
 // GGML_OP_CONV_3D
 struct test_conv_3d : public test_case {
     // Logical 5D dimensions
@@ -6862,6 +7045,205 @@ struct test_concat : public test_case {
         return out;
     }
 };
+
+// Bounded subsampler regressions, independently selectable with
+// -p speech_hotspot=. Keep the arithmetic reference in the CPU backend.
+struct test_speech_hotspot_matmul : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+    std::string vars() override { return "speech_hotspot=first_conv," + test_mul_mat::vars(); }
+    double max_nmse_err(ggml_backend_t backend) override {
+        // The Hexagon path accumulates in FP32. Other backends can use their
+        // existing F16 arithmetic, including the small-matrix OpenCL path.
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "HTP") == 0 ? 1e-7 : test_mul_mat::max_nmse_err(backend);
+    }
+};
+
+struct test_speech_hotspot_depthwise : public test_conv_2d_dw {
+    const bool offset;
+
+    test_speech_hotspot_depthwise(std::array<int64_t, 4> ne_input, std::array<int64_t, 4> ne_kernel,
+            ggml_type type_kernel, int stride, int padding, int dilation, bool cwhn, bool offset = false)
+        : test_conv_2d_dw(ne_input, ne_kernel, type_kernel, stride, padding, dilation, cwhn), offset(offset) {}
+
+    std::string vars() override { return "speech_hotspot=depthwise," + test_conv_2d_dw::vars() + "," + VAR_TO_STR(offset); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (!offset) {
+            return test_conv_2d_dw::build_graph(ctx);
+        }
+        // Keep logical storage packed for the CPU reference, while starting
+        // both views away from their aligned allocation base.
+        GGML_ASSERT(!cwhn);
+        const int64_t elements = ne_input[0] * ne_input[1] * ne_input[2] * ne_input[3];
+        ggml_tensor * input_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 1);
+        ggml_set_name(input_storage, "depthwise-offset-input-storage");
+        ggml_tensor * input = ggml_view_4d(ctx, input_storage,
+            ne_input[0], ne_input[1], ne_input[2], ne_input[3],
+            ne_input[0] * sizeof(float), ne_input[0] * ne_input[1] * sizeof(float),
+            ne_input[0] * ne_input[1] * ne_input[2] * sizeof(float), sizeof(float));
+
+        const int64_t weights = ne_kernel[0] * ne_kernel[1] * ne_kernel[2] * ne_kernel[3];
+        const size_t weight_size = ggml_type_size(type_kernel);
+        ggml_tensor * kernel_storage = ggml_new_tensor_1d(ctx, type_kernel, weights + 1);
+        ggml_set_name(kernel_storage, "depthwise-offset-kernel-storage");
+        ggml_tensor * kernel = ggml_view_4d(ctx, kernel_storage,
+            ne_kernel[0], ne_kernel[1], ne_kernel[2], ne_kernel[3],
+            ne_kernel[0] * weight_size, ne_kernel[0] * ne_kernel[1] * weight_size,
+            ne_kernel[0] * ne_kernel[1] * ne_kernel[2] * weight_size, weight_size);
+        ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input,
+            stride, stride, padding, padding, dilation, dilation);
+        ggml_set_name(out, "depthwise-offset-out");
+        return out;
+    }
+};
+
+// Exact neighborhoods from a 20x1500x256 deterministic benchmark where the
+// qf32 accumulator produced enormous values after several initial zero
+// products at the padded left edge. Retain all three failures without
+// allocating the original input.
+struct test_speech_hotspot_depthwise_cancellation : public test_case {
+    std::string vars() override { return "speech_hotspot=depthwise_cancellation"; }
+    double max_nmse_err() override { return 1e-7; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 20, 3, 3, 1);
+        ggml_tensor * kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 1, 3);
+        ggml_set_name(input, "depthwise-cancellation-input");
+        ggml_set_name(kernel, "depthwise-cancellation-kernel");
+        // Each channel contains the three rows around one original output.
+        // Vertical padding is zero so output row zero uses all three rows.
+        ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input, 2, 2, 1, 0, 1, 1);
+        ggml_set_name(out, "depthwise-cancellation-out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        const int channels[] = {112, 112, 140};
+        const int output_rows[] = {105, 614, 343};
+        std::vector<float> inputs(20 * 3 * 3), weights(9 * 3);
+        for (int c = 0; c < 3; ++c) {
+            for (int ky = 0; ky < 3; ++ky) {
+                const int source_y = 2 * output_rows[c] - 1 + ky;
+                for (int x = 0; x < 20; ++x) {
+                    const size_t i = (size_t(channels[c]) * 1500 + source_y) * 20 + x;
+                    inputs[(c * 3 + ky) * 20 + x] = float(int((i * 37 + 17) % 509) - 254) / 257.0f;
+                }
+                for (int kx = 0; kx < 3; ++kx) {
+                    const size_t i = size_t(channels[c]) * 9 + ky * 3 + kx;
+                    weights[c * 9 + ky * 3 + kx] = float(int((i * 19 + 11) % 251) - 125) / 127.0f;
+                }
+            }
+        }
+        ggml_tensor * input = ggml_get_tensor(ctx, "depthwise-cancellation-input");
+        ggml_tensor * kernel = ggml_get_tensor(ctx, "depthwise-cancellation-kernel");
+        GGML_ASSERT(input && kernel);
+        ggml_backend_tensor_set(input, inputs.data(), 0, inputs.size() * sizeof(float));
+        ggml_backend_tensor_set(kernel, weights.data(), 0, weights.size() * sizeof(float));
+    }
+};
+
+struct test_speech_hotspot_concat : public test_concat {
+    using test_concat::test_concat;
+    std::string vars() override { return "speech_hotspot=concat," + test_concat::vars(); }
+    double max_nmse_err() override { return 0.0; }
+};
+
+struct test_speech_hotspot_concat_transposed : public test_case {
+    const ggml_type type;
+    const bool transpose_a;
+    const bool batched;
+
+    test_speech_hotspot_concat_transposed(ggml_type type, bool transpose_a, bool batched)
+        : type(type), transpose_a(transpose_a), batched(batched) {}
+
+    std::string vars() override {
+        return "speech_hotspot=concat_transposed," + VARS_TO_STR3(type, transpose_a, batched);
+    }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t height = 33;
+        const int64_t depth = batched ? 2 : 1;
+        auto make_input = [&](int64_t width, bool transposed, const char * name) {
+            ggml_tensor * input = ggml_new_tensor_4d(ctx, type,
+                transposed ? height : width, transposed ? width : height, depth, 1);
+            ggml_set_name(input, name);
+            return transposed ? ggml_permute(ctx, input, 1, 0, 2, 3) : input;
+        };
+        ggml_tensor * a = make_input(19, transpose_a, "concat-a-storage");
+        ggml_tensor * b = make_input(5, !transpose_a, "concat-b-storage");
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_set_name(out, "concat-transposed-out");
+        return out;
+    }
+};
+
+static void add_speech_hotspot_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        for (int64_t positions : {60000, 96000, 120000, 192000}) {
+            cases.emplace_back(new test_speech_hotspot_matmul(
+                GGML_TYPE_F16, GGML_TYPE_F16, positions, 256, 9, {1, 1}, {1, 1}));
+        }
+        for (int64_t width : {20, 40, 64, 66}) {
+            cases.emplace_back(new test_speech_hotspot_depthwise(
+                {width, 1500, 256, 1}, {3, 3, 1, 256}, GGML_TYPE_F32, 2, 1, 1, false));
+        }
+        cases.emplace_back(new test_speech_hotspot_concat(GGML_TYPE_F32, {65, 1501, 256, 1}, 2, 0, 0));
+        cases.emplace_back(new test_speech_hotspot_concat(GGML_TYPE_F32, {68, 1501, 256, 1}, 2, 1, 0));
+        return;
+    }
+    for (int64_t positions : {1, 31, 32, 33, 63, 64, 65, 127, 257}) {
+        for (int64_t channels : {1, 4, 5, 7, 32, 33, 256}) {
+            cases.emplace_back(new test_speech_hotspot_matmul(
+                GGML_TYPE_F16, GGML_TYPE_F16, positions, channels, 9, {1, 1}, {1, 1}));
+        }
+    }
+    // Strided inputs and batched shapes must retain a correct fallback.
+    cases.emplace_back(new test_speech_hotspot_matmul(
+        GGML_TYPE_F16, GGML_TYPE_F16, 65, 33, 9, {1, 1}, {1, 1}, {0, 1, 2, 3}, 13));
+    cases.emplace_back(new test_speech_hotspot_matmul(
+        GGML_TYPE_F16, GGML_TYPE_F16, 65, 33, 9, {2, 1}, {1, 1}));
+    for (int64_t reduction : {8, 10}) {
+        cases.emplace_back(new test_speech_hotspot_matmul(
+            GGML_TYPE_F16, GGML_TYPE_F16, 65, 5, reduction, {1, 1}, {1, 1}));
+    }
+    cases.emplace_back(new test_speech_hotspot_matmul(
+        GGML_TYPE_F16, GGML_TYPE_F32, 65, 5, 9, {1, 1}, {1, 1}));
+    cases.emplace_back(new test_speech_hotspot_depthwise_cancellation());
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int64_t width : {1, 2, 19, 20, 31, 32, 33, 39, 40, 63, 64, 65, 66}) {
+            for (int pad : {0, 1}) {
+                if (width < 3 && pad == 0) continue;
+                cases.emplace_back(new test_speech_hotspot_depthwise(
+                    {width, 9, 3, 2}, {3, 3, 1, 3}, type, 2, pad, 1, false));
+            }
+        }
+        for (int64_t width : {1, 2, 65}) {
+            cases.emplace_back(new test_speech_hotspot_depthwise(
+                {width, 9, 3, 2}, {3, 3, 1, 3}, type, 2, 2, 1, false, true));
+        }
+        cases.emplace_back(new test_speech_hotspot_depthwise(
+            {65, 9, 3, 2}, {3, 3, 1, 3}, type, 2, 2, 2, false, true));
+        cases.emplace_back(new test_speech_hotspot_depthwise(
+            {33, 9, 3, 2}, {3, 3, 1, 3}, type, 1, 1, 1, false));
+        cases.emplace_back(new test_speech_hotspot_depthwise(
+            {33, 9, 33, 2}, {3, 3, 1, 33}, type, 2, 1, 1, true));
+    }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I32}) {
+        for (int dim = 0; dim < 4; ++dim) {
+            for (int view : {0, 1, 2, 3, 12}) {
+                cases.emplace_back(new test_speech_hotspot_concat(type, {19, 7, 3, 2}, 2, dim, view));
+            }
+        }
+        for (bool transpose_a : {false, true}) {
+            for (bool batched : {false, true}) {
+                cases.emplace_back(new test_speech_hotspot_concat_transposed(type, transpose_a, batched));
+            }
+        }
+    }
+}
 
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
@@ -9111,6 +9493,7 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_speech_hotspot_tests(test_cases, false);
     std::default_random_engine rng(0);
 
     // unary ops
@@ -9518,6 +9901,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32, {1024, 1024, 256, 1}, {3, 3, 256, 1}, 1, 1, 1, 1, 1, 1, true));
 
     test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9},  GGML_TYPE_F32, 1, 0, 1, false));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool two_d : {false, true}) {
+            for (bool gapped : {false, true}) {
+                for (int stride : {1, 2}) {
+                    for (int dilation : {1, 2}) {
+                        test_cases.emplace_back(new test_speech_im2col(two_d, type, gapped, stride, dilation, 3));
+                    }
+                }
+            }
+        }
+        for (bool cwhn : {false, true}) {
+            for (int64_t channels : {1, 31, 32, 33, 64}) {
+                for (bool subsampler : {false, true}) {
+                    test_cases.emplace_back(new test_speech_depthwise(type, cwhn, channels, 1, 1, subsampler));
+                    test_cases.emplace_back(new test_speech_depthwise(type, cwhn, channels, 2, 1, subsampler));
+                    test_cases.emplace_back(new test_speech_depthwise(type, cwhn, channels, 1, 2, subsampler));
+                }
+            }
+        }
+    }
+
+    // Parakeet's attention u_bias / v_bias broadcast add. The
+    // exact CTC 0.6b shape is (128, 376, 8, 1) + (128, 1, 8, 1) → see the
+    // struct doc above. Also probe head-dim-aligned nearby shapes so any
+    // fix can be validated across a small tile window.
+    for (ggml_type activation_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_speech_matmul_activation_type(
+            GGML_TYPE_F16, activation_type, 24000, 256, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_speech_matmul_activation_type(
+            GGML_TYPE_F16, activation_type, 64, 32, 128, {4, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_speech_attn_bcast_add(128, 376, 8));
+    test_cases.emplace_back(new test_speech_attn_bcast_add(128,   1, 8));
+    test_cases.emplace_back(new test_speech_attn_bcast_add(128,  32, 8));
+    test_cases.emplace_back(new test_speech_attn_bcast_add( 64, 376, 8));
+    test_cases.emplace_back(new test_speech_attn_bcast_add(128, 375, 8));  // T not divisible by 8
     test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9},  GGML_TYPE_F32, 1, 0, 1, true));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F32, 2, 1, 1, false));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F32, 2, 1, 1, true));
@@ -9772,6 +10191,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (bool gapped : { false, true }) {
+            for (int mode : { 0, 1, 2, 3 }) {
+                test_cases.emplace_back(new test_copy_permuted_rows(type_dst, gapped, mode));
+            }
+        }
         for (int64_t pad0 : { 1, 3, 374 }) {
             test_cases.emplace_back(new test_cpy_view(GGML_TYPE_F32, type_dst, {37, 11, 3, 2}, pad0));
             test_cases.emplace_back(new test_cpy_view(GGML_TYPE_F16, type_dst, {37, 11, 3, 2}, pad0));
@@ -10433,6 +10857,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, n, 512, {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 100, 278, 2048, {1, 1}, {1, 1})); // ragged M under the narrow N tile
+
+    // Batched-F32 attention MULs: Parakeet 0.6b encoder has 8 heads x K=128 x M=376 x N in {128,376,751}
+    // and a 2-head/K=64/M=64 shape used by the block-0 attention variant.  These exercise the
+    // batched-F32 HVX matmul path (VTCM src1 pre-copy + per-head DMA-prefetched aa_2x2 dot).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 376, 128, 128, {8, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 376, 376, 128, {8, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 376, 751, 128, {8, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 64, 64, {2, 1}, {1, 1}));
 
 #if 0
     // test the mat-mat path for Metal
@@ -11111,6 +11543,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
 
+    // F32-KV cases matching the Parakeet Conformer attention shapes exercised by the
+    // Hexagon backend. Q is F32 by default in this harness; K/V are F32 here.
+    // Smoke shape (small): heads=2, K_dim=64, M=N=32.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {1, 1}, 32, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    // Full Conformer shapes: heads=8, K_dim=128, M=376, N in {128, 376, 751}.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 128, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 376, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 751, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+
+    // HMX-eligible F32-KV cases: DK=DV=128 (both % 64 == 0), all satisfy the
+    // is_hmx_eligible gate (DK<=128 && neq1<5 false). Chunk-size sizer decides
+    // whether the tile-prep path (hmx_interleave_*_to_tiles_f32) actually runs.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 376, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 128, 376, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 32,  32,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {1, 1}, 128, 32,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
     for (int64_t kv : { 4096, 16384 }) {
@@ -11269,6 +11718,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_speech_hotspot_tests(test_cases, true);
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
