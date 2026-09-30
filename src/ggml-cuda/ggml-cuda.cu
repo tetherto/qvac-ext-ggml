@@ -1850,7 +1850,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+    // An explicit GGML_PREC_F32 request requires the activations to survive in f32:
+    // MMQ/MMVQ quantize them to q8_1 whose fp16 block scales/sums overflow past +-65504,
+    // and MMF rounds them to the weight type (f32 weights go through TF32 MMA). Small
+    // batches of half-precision weights stay on MMVF, which keeps f32 activations; the
+    // rest routes to the f32 cuBLAS path instead.
+    const bool prec_f32 = dst->op_params[0] != GGML_PREC_DEFAULT;
+
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) ||
+            (prec_f32 && ggml_cuda_mmvf_supports_prec_f32(src0->type, src0->ne, src0->nb, ne11))) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -1870,13 +1878,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    // An explicit GGML_PREC_F32 request requires the activations to survive in f32:
-    // MMQ/MMVQ quantize them to q8_1 whose fp16 block scales/sums overflow past +-65504,
-    // and MMF computes f32 through TF32 MMA. Route to the f32 cuBLAS path instead.
-    const bool prec_f32 = dst->op_params[0] != GGML_PREC_DEFAULT;
-
-    if ((!prec_f32 || src0->type != GGML_TYPE_F32) &&
-            ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (!prec_f32 && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }

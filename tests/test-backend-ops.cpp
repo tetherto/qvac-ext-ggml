@@ -10296,6 +10296,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // so a backend that exempts it from its reduced-precision path resolves to nothing.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 512, 63, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 33, 129, 257, {2,3}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+    // Small batches of half-precision weights under GGML_PREC_F32 stay on a matrix-vector
+    // kernel that reads the activations as f32, where the default MMA kernel rounds them to
+    // the weight type; the widest batch goes to the f32 GEMM instead. Cover those batch
+    // widths, broadcasting and a permuted weight view.
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int n : {1, 2, 5, 8, 16}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 512, {1,1}, {1,1}, {0, 1, 2, 3}, 0, 1, true));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 2, 256, {2,3}, {2,1}, {0, 1, 2, 3}, 0, 1, true));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1056, 2, 192, {1,1}, {4,1}, {0, 2, 1, 3}, 0, 1, true));
+    }
     // A quantized weight does have one, via the dequantizing matmul. Models with
     // activations outside fp16 range need fp32 arithmetic here too, and backends may reach
     // it with a different pipeline family than the default one (small/medium/large tile
