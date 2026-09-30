@@ -179,6 +179,46 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
 
+# Backends whose device memory shares the host's physical pool must report it
+# through ggml_backend_dev_props.memory_unified.
+set(TEST_TARGET test-unified-memory-props)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+if (GGML_METAL)
+    target_compile_definitions(${TEST_TARGET} PRIVATE GGML_TEST_EXPECT_METAL)
+endif()
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+# ggml-opencl flash-attention q-chunking parity against the CPU backend.
+# Self-skipping at runtime when no OpenCL device is present.
+set(TEST_TARGET test-opencl-fa-chunking)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+if (TARGET ggml-vector-index)
+    set(TEST_TARGET test-vector-index)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml-vector-index)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+    set(TEST_TARGET test-vector-index-hooks)
+    add_executable(${TEST_TARGET} test-vector-index.cpp)
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    target_compile_definitions(${TEST_TARGET} PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml-vector-index-test)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}> --internal-hooks)
+
+    set(TEST_TARGET test-vector-index-faults)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml-vector-index-test)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
+
 #
 # test-adreno-version
 # Pure unit test for src/ggml-adreno.h (Adreno GPU-string parser used by the
