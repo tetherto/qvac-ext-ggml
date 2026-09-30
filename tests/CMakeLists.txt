@@ -203,6 +203,12 @@ if (GGML_OPENCL)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 endif()
 
+if (GGML_METAL)
+    set(TEST_TARGET test-metal-free-memory)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
+
 if (GGML_VULKAN)
     set(TEST_TARGET test-vulkan-status)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
