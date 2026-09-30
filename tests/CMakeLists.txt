@@ -171,11 +171,6 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
-set(TEST_TARGET test-backend-dev-memory)
-add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
-target_link_libraries(${TEST_TARGET} PRIVATE ggml)
-add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
-
 # test-backend-ops
 
 set(TEST_TARGET test-backend-ops)
@@ -204,6 +199,12 @@ set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_
 
 if (GGML_OPENCL)
     set(TEST_TARGET test-opencl-workgroup)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
+
+if (GGML_METAL)
+    set(TEST_TARGET test-metal-free-memory)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 endif()
