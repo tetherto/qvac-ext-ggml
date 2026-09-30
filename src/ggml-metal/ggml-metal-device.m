@@ -3,6 +3,7 @@
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
+#import "ggml-metal-memory.h"
 
 #include <Foundation/Foundation.h>
 
@@ -1187,7 +1188,7 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total = dev->mtl_device.recommendedMaxWorkingSetSize;
-        *free  = *total - dev->mtl_device.currentAllocatedSize;
+        *free  = ggml_metal_free_memory(*total, dev->mtl_device.currentAllocatedSize);
 
         // currentAllocatedSize only counts this process. On unified memory the
         // device budget is the same physical RAM every other process is using,
