@@ -171,6 +171,10 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+set(TEST_TARGET test-opencl-kernel-sources)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}> ${CMAKE_CURRENT_SOURCE_DIR}/../src/ggml-opencl/kernels)
+
 # test-backend-ops
 
 set(TEST_TARGET test-backend-ops)
