@@ -738,6 +738,89 @@ static enum ggml_metal_device_id ggml_metal_device_id_parse(const char * name) {
     return GGML_METAL_DEVICE_GENERIC;
 }
 
+// Runs a compiled probe kernel once on the device queue and reports whether it
+// completed. A compiler that accepts an intrinsic says nothing about the GPU
+// executing it: paravirtualized and Intel/AMD Mac GPUs compile simdgroup code
+// and then hang or return garbage, so the probes below also check the result.
+static bool ggml_metal_probe_dispatch(struct ggml_metal_device * dev, struct ggml_metal_pipeline_with_params ppl,
+                                      NSArray<id<MTLBuffer>> * buffers, MTLSize threads) {
+    id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBuffer];
+    if (cmd_buf == nil) {
+        return false;
+    }
+    id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+    [encoder setComputePipelineState:ppl.pipeline->obj];
+    for (NSUInteger i = 0; i < buffers.count; ++i) {
+        [encoder setBuffer:buffers[i] offset:0 atIndex:i];
+    }
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:threads];
+    [encoder endEncoding];
+
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        (void) cb;
+        dispatch_semaphore_signal(done);
+    }];
+    [cmd_buf commit];
+    const int64_t timeout_ns = 2 * NSEC_PER_SEC;
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeout_ns)) != 0) {
+        GGML_LOG_WARN("%s: probe kernel did not complete within %lld ms\n", __func__, timeout_ns / 1000000);
+        return false;
+    }
+    return cmd_buf.status == MTLCommandBufferStatusCompleted;
+}
+
+static id<MTLBuffer> ggml_metal_probe_buffer(struct ggml_metal_device * dev, const void * data, size_t size) {
+    if (data) {
+        return [dev->mtl_device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
+    }
+    return [dev->mtl_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+}
+
+// simd_sum over 32 ones followed by simd_max must yield 32 in dst[0].
+static bool ggml_metal_probe_simd_reduction_runs(struct ggml_metal_device * dev, struct ggml_metal_pipeline_with_params ppl) {
+    float src[32];
+    for (int i = 0; i < 32; ++i) {
+        src[i] = 1.0f;
+    }
+    id<MTLBuffer> src_buf = ggml_metal_probe_buffer(dev, src, sizeof(src));
+    id<MTLBuffer> dst_buf = ggml_metal_probe_buffer(dev, NULL, sizeof(float));
+    if (src_buf == nil || dst_buf == nil) {
+        return false;
+    }
+    memset(dst_buf.contents, 0, sizeof(float));
+    if (!ggml_metal_probe_dispatch(dev, ppl, @[src_buf, dst_buf], MTLSizeMake(32, 1, 1))) {
+        return false;
+    }
+    const float result = ((const float *) dst_buf.contents)[0];
+    return result == 32.0f;
+}
+
+// An 8x8 product of all-ones half matrices must yield 8 in every element of c.
+static bool ggml_metal_probe_simd_mm_runs(struct ggml_metal_device * dev, struct ggml_metal_pipeline_with_params ppl) {
+    uint16_t ones[64];
+    for (int i = 0; i < 64; ++i) {
+        ones[i] = 0x3C00;
+    }
+    id<MTLBuffer> a_buf = ggml_metal_probe_buffer(dev, ones, sizeof(ones));
+    id<MTLBuffer> b_buf = ggml_metal_probe_buffer(dev, ones, sizeof(ones));
+    id<MTLBuffer> c_buf = ggml_metal_probe_buffer(dev, NULL, 64 * sizeof(float));
+    if (a_buf == nil || b_buf == nil || c_buf == nil) {
+        return false;
+    }
+    memset(c_buf.contents, 0, 64 * sizeof(float));
+    if (!ggml_metal_probe_dispatch(dev, ppl, @[a_buf, b_buf, c_buf], MTLSizeMake(32, 1, 1))) {
+        return false;
+    }
+    const float * c = (const float *) c_buf.contents;
+    for (int i = 0; i < 64; ++i) {
+        if (c[i] != 8.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
 ggml_metal_device_t ggml_metal_device_init(int device) {
     ggml_metal_device_t dev = calloc(1, sizeof(struct ggml_metal_device));
 
@@ -772,8 +855,9 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
 
             // Paravirtualized GPUs on Apple Silicon (e.g. GitHub Actions macos runners)
             // report MTLGPUFamilyApple5 even though the underlying M-series hardware
-            // supports simdgroup intrinsics. Probe the Metal compiler/linker to see
-            // what actually works, and re-enable accordingly.
+            // supports simdgroup intrinsics. Probe by compiling and running a kernel and
+            // re-enable only when the result is right: Intel and AMD Mac GPUs compile the
+            // same kernels and then hang or return garbage.
             {
                 if (!dev->props.has_simdgroup_reduction) {
                     const char * src_simd_red =
@@ -793,7 +877,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                     ggml_metal_library_t lib = ggml_metal_library_init_from_source(dev, src_simd_red, false);
                     if (lib != NULL) {
                         struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_compile_pipeline(lib, "probe_simd_red", "probe_simd_red", nil);
-                        if (ppl.pipeline) {
+                        if (ppl.pipeline && ggml_metal_probe_simd_reduction_runs(dev, ppl)) {
                             GGML_LOG_INFO("%s: simdgroup reduction probe succeeded - enabling\n", __func__);
                             dev->props.has_simdgroup_reduction = true;
                         }
@@ -827,7 +911,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                     ggml_metal_library_t lib = ggml_metal_library_init_from_source(dev, src_simd_mm, false);
                     if (lib != NULL) {
                         struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_compile_pipeline(lib, "probe_simd_mm", "probe_simd_mm", nil);
-                        if (ppl.pipeline) {
+                        if (ppl.pipeline && ggml_metal_probe_simd_mm_runs(dev, ppl)) {
                             GGML_LOG_INFO("%s: simdgroup matrix-mul probe succeeded - enabling\n", __func__);
                             dev->props.has_simdgroup_mm = true;
                         }
