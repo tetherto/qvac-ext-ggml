@@ -42,6 +42,7 @@ add_library(${HTP_LIB} SHARED
     solve-tri-ops.c
     pad-ops.c
     argsort-ops.c
+    argmax-ops.c
     im2col-ops.c
     conv-2d-dw-ops.c
 )

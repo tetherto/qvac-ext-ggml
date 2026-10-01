@@ -102,6 +102,7 @@ enum htp_op_code {
     HTP_OP_IM2COL,
     HTP_OP_CONV_2D_DW,
     HTP_OP_SIN,
+    HTP_OP_ARGMAX,
 
     HTP_OP_INVALID
 };

@@ -3242,6 +3242,21 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
     GGML_UNUSED(sess);
 }
 
+static bool ggml_hexagon_supported_argmax(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * src0 = op->src[0]; // values
+    const struct ggml_tensor * dst  = op;         // indices
+
+    if (src0->type != GGML_TYPE_F32) return false;
+    if (dst->type  != GGML_TYPE_I32) return false;
+    // Inner dimension must be contiguous on both sides (per-row stride is
+    // walked by the DSP kernel in units of the row count, not element stride).
+    if (src0->nb[0] != sizeof(float))   return false;
+    if (dst->nb[0]  != sizeof(int32_t)) return false;
+    return true;
+
+    GGML_UNUSED(sess);
+}
+
 static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0]; // values
     const struct ggml_tensor * dst  = op;         // indices
@@ -3606,6 +3621,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_SET_ROWS:        return HTP_OP_SET_ROWS;
         case GGML_OP_SUM_ROWS:        return HTP_OP_SUM_ROWS;
         case GGML_OP_ARGSORT:         return HTP_OP_ARGSORT;
+        case GGML_OP_ARGMAX:          return HTP_OP_ARGMAX;
         case GGML_OP_NORM:            return HTP_OP_NORM;
         case GGML_OP_L2_NORM:         return HTP_OP_L2_NORM;
         case GGML_OP_RMS_NORM:        return HTP_OP_RMS_NORM;
@@ -4366,6 +4382,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_ARGSORT:
             supp = ggml_hexagon_supported_argsort(sess, op);
+            break;
+
+        case GGML_OP_ARGMAX:
+            supp = ggml_hexagon_supported_argmax(sess, op);
             break;
 
         case GGML_OP_SSM_CONV:
