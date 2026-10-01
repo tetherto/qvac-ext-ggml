@@ -116,6 +116,7 @@ enum htp_op_code {
     HTP_OP_SIN,
     HTP_OP_COS,
     HTP_OP_UPSCALE,
+    HTP_OP_ARGMAX,
 
     HTP_OP_INVALID
 };
