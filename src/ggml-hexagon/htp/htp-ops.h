@@ -70,6 +70,7 @@ enum htp_op_code {
     HTP_OP_UNARY_NEG,
     HTP_OP_UNARY_SOFTPLUS,
     HTP_OP_UNARY_TANH,
+    HTP_OP_UNARY_RELU,
     HTP_OP_GLU_SWIGLU,
     HTP_OP_GLU_SWIGLU_OAI,
     HTP_OP_GLU_GEGLU,
@@ -99,6 +100,7 @@ enum htp_op_code {
     HTP_OP_CONCAT,
     HTP_OP_CLAMP,
     HTP_OP_IM2COL,
+    HTP_OP_CONV_2D_DW,
 
     HTP_OP_INVALID
 };
