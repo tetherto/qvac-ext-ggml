@@ -3627,6 +3627,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_PAD:             return HTP_OP_PAD;
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
         case GGML_OP_CONV_2D_DW:      return HTP_OP_CONV_2D_DW;
+        case GGML_OP_SIN:             return HTP_OP_SIN;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -4293,6 +4294,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
+        case GGML_OP_SIN:
             supp = ggml_hexagon_supported_unary(sess, op);
             break;
 

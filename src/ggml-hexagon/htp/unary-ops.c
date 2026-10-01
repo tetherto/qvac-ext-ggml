@@ -276,6 +276,23 @@ static void sigmoid_f32(const float * restrict src,
     }
 }
 
+// sin(x) elementwise. Backs GGML_OP_SIN; follows the exp_f32 shape rather
+// than sqr's aa-only macro so unaligned rows take a correct unaligned path
+// instead of asserting.
+static void sin_f32(const float * restrict src,
+                    float * restrict dst,
+                    const uint32_t num_rows,
+                    const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_sin_f32(dst_local, src_local, ne0);
+    }
+}
+
 // silu(x) = x * sigmoid(x)
 static void silu_f32(const float * restrict src,
                      float * restrict dst,
@@ -648,6 +665,7 @@ DEFINE_UNARY_TASK(unary_tanh,     false, false, tanh_f32(src0_vtcm, dst_vtcm, bl
 DEFINE_UNARY_TASK(unary_relu,     false, false, relu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(l2_norm,        false, false, l2_norm_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(tri,            false, true,  tri_f32(src0_vtcm, dst_vtcm, block_size, ir, uctx))
+DEFINE_UNARY_TASK(sin,            false, false, sin_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 
 // Apply a pointwise unary op to one column tile that is already in VTCM.
 #define DEFINE_UNARY_TILED_TASK(NAME, IS_TRI, CORE_TILE_EXPR)                                                       \
@@ -894,6 +912,7 @@ DEFINE_UNARY_TILED_TASK(unary_gelu,     false, tile_gelu_f32(dst_vtcm, src_vtcm,
 DEFINE_UNARY_TILED_TASK(unary_softplus, false, tile_unary_softplus_f32(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_tanh,     false, hvx_tanh_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_relu,     false, hvx_relu_f32_aa(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(sin,            false, hvx_sin_f32(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(tri,            true,  tri_apply_tile_f32(src_vtcm, dst_vtcm, tw, col, i01, ne0, tri_ttype))
 
 static int execute_op_unary_f32(struct htp_ops_context * octx) {
@@ -922,6 +941,7 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_RELU:      op_type = "relu-f32";         break;
         case HTP_OP_L2_NORM:         op_type = "l2norm-f32";       break;
         case HTP_OP_TRI:             op_type = "tri-f32";          break;
+        case HTP_OP_SIN:             op_type = "sin-f32";          break;
 
         default:
             FARF(ERROR, "Unsupported unary Op %u\n", octx->op);
@@ -1020,6 +1040,7 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
                 case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_tiled_unary_relu;     break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tiled_tri;            break;
+                case HTP_OP_SIN:             task_func = unary_task_f32_tiled_sin;            break;
                 default:                     break;
             }
         } else {
@@ -1041,6 +1062,7 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_unary_relu;           break;
                 case HTP_OP_L2_NORM:         task_func = unary_task_f32_l2_norm;              break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tri;                  break;
+                case HTP_OP_SIN:             task_func = unary_task_f32_sin;                  break;
                 default:                     break;
             }
         }
