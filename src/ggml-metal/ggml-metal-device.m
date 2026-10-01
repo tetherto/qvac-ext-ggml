@@ -1311,10 +1311,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
-    if (!has_simdgroup_reduction) {
-        return false;
-    }
-
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {
             return false;
