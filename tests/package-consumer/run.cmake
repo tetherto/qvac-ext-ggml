@@ -1,9 +1,10 @@
 # Installs the ggml build into a scratch prefix, builds and runs the consumer
 # project against that install, then checks the pkg-config metadata names
-# libraries that exist in the installed libdir.
+# libraries that exist in the installed libdir and no runtime-loaded backend.
 #
 # Inputs (-D): GGML_BUILD_DIR, GGML_CONSUMER_SOURCE_DIR, GGML_LIB_OUTPUT_PREFIX,
-#              GGML_CONSUMER_EXPECT_CPU, GGML_CONSUMER_CONFIG (multi-config generators)
+#              GGML_CONSUMER_EXPECT_CPU, GGML_CONSUMER_CONFIG (multi-config generators),
+#              GGML_CONSUMER_MODULE_BACKENDS (comma-separated runtime-loaded backends)
 
 set(prefix "${GGML_BUILD_DIR}/package-consumer/prefix")
 set(consumer_build "${GGML_BUILD_DIR}/package-consumer/build")
@@ -66,6 +67,17 @@ function(check_lib_names_exist libs libdir)
     endforeach()
 endfunction()
 
+# Runtime-loaded backends are opened by the registry loader and may be installed
+# outside libdir, so the metadata must not ask a consumer to link them.
+function(check_no_module_backends libs module)
+    string(REPLACE "," ";" module_backends "${GGML_CONSUMER_MODULE_BACKENDS}")
+    foreach(backend IN LISTS module_backends)
+        if (libs MATCHES "-l${GGML_LIB_OUTPUT_PREFIX}${backend}( |$)")
+            message(FATAL_ERROR "${module}.pc links the runtime-loaded backend ${backend}: ${libs}")
+        endif()
+    endforeach()
+endfunction()
+
 function(check_pkg_config)
     find_program(PKG_CONFIG_EXECUTABLE NAMES pkg-config pkgconf)
     if (NOT PKG_CONFIG_EXECUTABLE)
@@ -88,6 +100,7 @@ function(check_pkg_config)
             message(FATAL_ERROR "${module}.pc does not link -l${expected_name}: ${libs}")
         endif()
         check_lib_names_exist("${libs}" "${libdir}")
+        check_no_module_backends("${libs}" "${module}")
     endforeach()
 endfunction()
 
