@@ -730,6 +730,8 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_TANH:
         case HTP_OP_UNARY_RELU:
         case HTP_OP_L2_NORM:
+        case HTP_OP_SIN:
+        case HTP_OP_UNARY_GELU_ERF:
             return op_unary(octx);
 
         case HTP_OP_GLU_SWIGLU:
@@ -763,6 +765,9 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_ARGSORT:
             return op_argsort(octx);
+
+        case HTP_OP_ARGMAX:
+            return op_argmax(octx);
 
         case HTP_OP_SSM_CONV:
             return op_ssm_conv(octx);

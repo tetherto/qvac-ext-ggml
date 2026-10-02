@@ -16,6 +16,7 @@
 #include "hvx-div.h"
 #include "hvx-floor.h"
 #include "hvx-sin-cos.h"
+#include "hvx-erf.h"
 #include "hvx-base.h"
 #include "hvx-pow.h"
 #include "hvx-log.h"

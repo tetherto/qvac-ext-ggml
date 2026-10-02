@@ -71,6 +71,7 @@ enum htp_op_code {
     HTP_OP_UNARY_SOFTPLUS,
     HTP_OP_UNARY_TANH,
     HTP_OP_UNARY_RELU,
+    HTP_OP_UNARY_GELU_ERF,
     HTP_OP_GLU_SWIGLU,
     HTP_OP_GLU_SWIGLU_OAI,
     HTP_OP_GLU_GEGLU,
@@ -101,6 +102,8 @@ enum htp_op_code {
     HTP_OP_CLAMP,
     HTP_OP_IM2COL,
     HTP_OP_CONV_2D_DW,
+    HTP_OP_SIN,
+    HTP_OP_ARGMAX,
 
     HTP_OP_INVALID
 };

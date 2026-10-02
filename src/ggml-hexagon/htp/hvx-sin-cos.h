@@ -87,4 +87,36 @@ static inline HVX_Vector hvx_vec_sin_f32(HVX_Vector x) {
     return hvx_vec_mul_f32_f32(sin_y, sign);
 }
 
+// Row-span wrapper: apply hvx_vec_sin_f32 element-wise over num_elems FP32
+// samples. Handles aligned fast path and unaligned fallback the same way
+// hvx_exp_f32 does, with a partial-vector tail via hvx_vec_store_u.
+static inline void hvx_sin_f32(uint8_t * restrict dst, const uint8_t * restrict src, int num_elems) {
+    const int left_over       = num_elems & (VLEN_FP32 - 1);
+    const int num_elems_whole = num_elems - left_over;
+
+    const int src_aligned = hex_is_aligned((void *) src, VLEN);
+    const int dst_aligned = hex_is_aligned((void *) dst, VLEN);
+
+    if (src_aligned && dst_aligned) {
+        HVX_Vector * p_in  = (HVX_Vector *) src;
+        HVX_Vector * p_out = (HVX_Vector *) dst;
+        #pragma unroll(4)
+        for (int i = 0; i < num_elems_whole; i += VLEN_FP32) {
+            *p_out++ = hvx_vec_sin_f32(*p_in++);
+        }
+    } else {
+        #pragma unroll(4)
+        for (int i = 0; i < num_elems_whole; i += VLEN_FP32) {
+            HVX_Vector in = *(HVX_UVector *) (src + i * SIZEOF_FP32);
+            *(HVX_UVector *) (dst + i * SIZEOF_FP32) = hvx_vec_sin_f32(in);
+        }
+    }
+
+    if (left_over > 0) {
+        HVX_Vector in = *(HVX_UVector *) (src + num_elems_whole * SIZEOF_FP32);
+        HVX_Vector out = hvx_vec_sin_f32(in);
+        hvx_vec_store_u(dst + num_elems_whole * SIZEOF_FP32, left_over * SIZEOF_FP32, out);
+    }
+}
+
 #endif /* HVX_SIN_COS_H */
