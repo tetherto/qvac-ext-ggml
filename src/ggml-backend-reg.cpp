@@ -207,6 +207,9 @@ struct ggml_backend_registry {
     }
 
     void register_device(ggml_backend_dev_t device) {
+        if (device == nullptr) {
+            return;
+        }
         for (auto & dev : devices) {
             if (dev == device) {
                 return;
