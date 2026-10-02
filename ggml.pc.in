@@ -1,10 +1,11 @@
-prefix=@CMAKE_INSTALL_PREFIX@
+prefix=@GGML_PC_PREFIX@
 exec_prefix=${prefix}
-includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
-libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+libdir=@GGML_PC_LIBDIR@
+includedir=@GGML_PC_INCLUDEDIR@
 
 Name: ggml
-Description: The GGML Tensor Library for Machine Learning
+Description: Tensor library for machine learning
 Version: @GGML_VERSION@
+Libs: -L${libdir} -l@GGML_LIB_OUTPUT_PREFIX@ggml -l@GGML_LIB_OUTPUT_PREFIX@ggml-base
+Libs.private: @GGML_PC_LIBS_PRIVATE@
 Cflags: -I${includedir}
-Libs: -L${libdir} -lggml

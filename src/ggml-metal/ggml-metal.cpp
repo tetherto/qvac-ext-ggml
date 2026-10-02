@@ -209,6 +209,14 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
         return NULL;
     }
 
+    // ggml_metal_buffer_init returns NULL on allocation / residency-set failure.
+    // Without this guard the next line dereferences a null pointer at offset 0x10
+    // (the is_shared field), crashing the mmproj graph allocator with
+    // EXC_BAD_ACCESS in ggml_metal_buffer_is_shared.
+    if (res == NULL) {
+        return NULL;
+    }
+
     ggml_backend_buffer_i buf_i = ggml_metal_buffer_is_shared(res)
         ? ggml_backend_metal_buffer_shared_i
         : ggml_backend_metal_buffer_private_i;
@@ -231,6 +239,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_blk(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
+                res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
@@ -595,6 +604,16 @@ static ggml_guid_t ggml_backend_metal_guid(void) {
     return &guid;
 }
 
+static int ggml_backend_metal_default_n_cb(void) {
+    const char * env_n_cb = getenv("GGML_METAL_N_CB");
+    if (env_n_cb != nullptr) {
+        const int n_cb = atoi(env_n_cb);
+        return n_cb > 0 ? n_cb : 1;
+    }
+
+    return 1;
+}
+
 ggml_backend_t ggml_backend_metal_init(void) {
     ggml_backend_reg_t reg = ggml_backend_metal_reg();
     if (reg == NULL || ggml_backend_reg_dev_count(reg) == 0) {
@@ -623,7 +642,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 }
@@ -685,9 +704,13 @@ static enum ggml_backend_dev_type ggml_backend_metal_device_get_type(ggml_backen
 }
 
 static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
     props->name        = ggml_backend_metal_device_get_name(dev);
     props->description = ggml_backend_metal_device_get_description(dev);
     props->type        = ggml_backend_metal_device_get_type(dev);
+
+    props->memory_unified = ggml_metal_device_get_props(ctx_dev)->has_unified_memory;
 
     ggml_backend_metal_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
@@ -697,6 +720,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
         /* .buffer_from_host_ptr = */ true,
         /* .events               = */ true,
         /* .mmap_support         = */ true,
+        /* .copy_stream          = */ false,
     };
 }
 
@@ -718,7 +742,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 
@@ -958,6 +982,7 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
                     GGML_LOG_ERROR("%s: error: failed to init Metal device %d - skipping\n", __func__, i);
                     continue;
                 }
+
                 devs.emplace_back(dev);
 
                 reg_ctx->devices.push_back(dev);
