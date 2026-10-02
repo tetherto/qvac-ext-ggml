@@ -731,6 +731,7 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_RELU:
         case HTP_OP_L2_NORM:
         case HTP_OP_SIN:
+        case HTP_OP_UNARY_GELU_ERF:
             return op_unary(octx);
 
         case HTP_OP_GLU_SWIGLU:
