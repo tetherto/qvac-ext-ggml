@@ -8416,6 +8416,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
+            // Adreno copy kernel aborts on strided src; CONT must handle non-contig itself.
+            if (op->op != GGML_OP_CONT && !ggml_is_contiguous(op->src[0]) &&
+                backend_ctx->adreno_gen != ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
+                return false;
+            }
             switch (op->src[0]->type) {
                 case GGML_TYPE_F32:
                     switch (op->type) {
