@@ -171,6 +171,10 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+set(TEST_TARGET test-opencl-kernel-sources)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}> ${CMAKE_CURRENT_SOURCE_DIR}/../src/ggml-opencl/kernels)
+
 # test-backend-ops
 
 set(TEST_TARGET test-backend-ops)
@@ -178,6 +182,62 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+# Backends whose device memory shares the host's physical pool must report it
+# through ggml_backend_dev_props.memory_unified.
+set(TEST_TARGET test-unified-memory-props)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+if (GGML_METAL)
+    target_compile_definitions(${TEST_TARGET} PRIVATE GGML_TEST_EXPECT_METAL)
+endif()
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+# Installed-package consumer: find_package(ggml) with ggml::all (and the vector
+# index when built), plus the pkg-config metadata against the installed libdir.
+if (NOT GGML_BACKEND_DL OR GGML_CPU_STATIC)
+    set(GGML_CONSUMER_EXPECT_CPU ON)
+else()
+    set(GGML_CONSUMER_EXPECT_CPU OFF)
+endif()
+add_test(NAME test-package-consumer
+    COMMAND ${CMAKE_COMMAND}
+        -DGGML_BUILD_DIR=${CMAKE_BINARY_DIR}
+        -DGGML_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/package-consumer
+        -DGGML_LIB_OUTPUT_PREFIX=${GGML_LIB_OUTPUT_PREFIX}
+        -DGGML_CONSUMER_EXPECT_CPU=${GGML_CONSUMER_EXPECT_CPU}
+        -DGGML_CONSUMER_CONFIG=$<CONFIG>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/package-consumer/run.cmake)
+
+# ggml-opencl flash-attention q-chunking parity against the CPU backend.
+# Self-skipping at runtime when no OpenCL device is present.
+set(TEST_TARGET test-opencl-fa-chunking)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+if (TARGET ggml-vector-index)
+    set(TEST_TARGET test-vector-index)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml-vector-index)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+    set(TEST_TARGET test-vector-index-hooks)
+    add_executable(${TEST_TARGET} test-vector-index.cpp)
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    target_compile_definitions(${TEST_TARGET} PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml-vector-index-test)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}> --internal-hooks)
+
+    set(TEST_TARGET test-vector-index-faults)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml-vector-index-test)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+endif()
 
 #
 # test-adreno-version
