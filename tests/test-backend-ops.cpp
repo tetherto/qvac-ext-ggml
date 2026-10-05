@@ -11431,10 +11431,154 @@ static void add_acestep_tests(std::vector<std::unique_ptr<test_case>> & cases, b
     }
 }
 
+// Supertonic's replicate padding: copy the first and last time step of a
+// transposed [C, T] tensor and concatenate them around it, in one graph.
+struct test_replicate_pad : public test_case {
+    const int64_t channels;
+    const int64_t steps;
+    const int64_t pad;
+
+    std::string vars() override {
+        return VARS_TO_STR3(channels, steps, pad);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_replicate_pad(int64_t channels, int64_t steps, int64_t pad) : channels(channels), steps(steps), pad(pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, steps);
+        ggml_set_name(a, "a");
+        ggml_tensor * x = ggml_cont(ctx, ggml_transpose(ctx, a));
+        ggml_tensor * first = ggml_view_2d(ctx, x, 1, channels, x->nb[1], 0);
+        ggml_tensor * last  = ggml_view_2d(ctx, x, 1, channels, x->nb[1], (steps - 1) * x->nb[0]);
+        ggml_tensor * left  = ggml_repeat(ctx, first, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pad, channels));
+        ggml_tensor * out   = ggml_concat(ctx, left, x, 0);
+        ggml_tensor * right = ggml_repeat(ctx, last, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pad, channels));
+        out = ggml_concat(ctx, out, right, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Depthwise 1D convolution as IM2COL over one input channel followed by
+// MUL_MAT with one kernel row per channel; shape_kernel feeds IM2COL a
+// separate shape-only kernel, as Supertonic's vector estimator does.
+struct test_depthwise_im2col_mul_mat : public test_case {
+    const int64_t length;
+    const int64_t channels;
+    const int64_t taps;
+    const int     dilation;
+    const int     pad;
+    const bool    shape_kernel;
+
+    std::string vars() override {
+        return VARS_TO_STR6(length, channels, taps, dilation, pad, shape_kernel);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_depthwise_im2col_mul_mat(int64_t length, int64_t channels, int64_t taps, int dilation, int pad,
+                                  bool shape_kernel)
+        : length(length), channels(channels), taps(taps), dilation(dilation), pad(pad), shape_kernel(shape_kernel) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, length, 1, channels, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, taps, 1, channels, 1);
+        ggml_set_name(w, "w");
+        ggml_tensor * k = shape_kernel ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, taps, 1, channels, 1) : w;
+        ggml_tensor * cols = ggml_im2col(ctx, k, x, 1, 0, pad, 0, dilation, 0, false, GGML_TYPE_F32);
+        ggml_tensor * out  = ggml_mul_mat(ctx, cols, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// F32 MUL_MAT followed, after a reshape, by a broadcast bias ADD in the same
+// graph, as Supertonic's text encoder emits them; the reshape keeps the two
+// ops unfused so the ADD consumes the matmul output inside one batch.
+struct test_mul_mat_then_bias : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(m, n, k);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mul_mat_then_bias(int64_t m, int64_t n, int64_t k) : m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * mm  = ggml_reshape_2d(ctx, ggml_mul_mat(ctx, a, b), m, n);
+        ggml_tensor * out = ggml_add(ctx, mm, bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+static void add_supertonic_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        cases.emplace_back(new test_unary(GGML_UNARY_OP_GELU_ERF, GGML_TYPE_F32, {192, 2048, 1, 1}));
+        cases.emplace_back(new test_cont(GGML_TYPE_F32, {96, 512, 1, 1}));
+        cases.emplace_back(new test_depthwise_im2col_mul_mat(582, 512, 7, 1, 0, true));
+        cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {96, 2048, 1, 1},
+                                           {1, 2048, 512, 1}, 1, 0, 0, 0, 1, 0, false));
+        return;
+    }
+    const std::array<int64_t, 4> transposes[] = {
+        {96, 512, 1, 1}, {512, 96, 1, 1}, {576, 512, 1, 1}, {107, 64, 1, 1}, {33, 129, 1, 1}, {1, 64, 1, 1},
+    };
+    for (const auto & ne : transposes) {
+        cases.emplace_back(new test_cont(GGML_TYPE_F32, ne));
+    }
+    cases.emplace_back(new test_cont(GGML_TYPE_F32, {96, 130, 3, 2}, false, {1, 0, 2, 3}));
+    const std::array<int64_t, 2> pointwise[] = { {96, 2048}, {576, 2048}, {96, 512}, {107, 33} };
+    for (const auto & in : pointwise) {
+        cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {in[0], in[1], 1, 1},
+                                           {1, in[1], 8, 1}, 1, 0, 0, 0, 1, 0, false));
+    }
+    cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {96, 130, 2, 1},
+                                       {1, 130, 8, 1}, 1, 0, 0, 0, 1, 0, false));
+    const std::array<int64_t, 3> f32_gemms[] = { {194, 2048, 512}, {194, 512, 2048}, {1164, 2048, 512}, {47, 96, 64} };
+    for (const auto & g : f32_gemms) {
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, g[0], g[1], g[2], {1, 1}, {1, 1}));
+    }
+    cases.emplace_back(new test_mul_mat_then_bias(106, 1024, 512));
+    cases.emplace_back(new test_mul_mat_then_bias(96, 1024, 512));
+    cases.emplace_back(new test_mul_mat_then_bias(194, 2048, 512));
+    cases.emplace_back(new test_depthwise_im2col_mul_mat(100, 512, 5, 1, 0, false));
+    cases.emplace_back(new test_depthwise_im2col_mul_mat(100, 512, 5, 1, 0, true));
+    cases.emplace_back(new test_depthwise_im2col_mul_mat(582, 512, 7, 1, 0, true));
+    cases.emplace_back(new test_depthwise_im2col_mul_mat(600, 512, 7, 4, 0, true));
+    cases.emplace_back(new test_depthwise_im2col_mul_mat(37, 33, 3, 2, 1, false));
+    const std::array<int64_t, 4> shapes[] = {
+        {32, 2048, 1, 1}, {106, 1024, 1, 1}, {107, 256, 1, 1}, {192, 2048, 1, 1}, {1, 1, 1, 1},
+    };
+    for (const auto & ne : shapes) {
+        cases.emplace_back(new test_unary(GGML_UNARY_OP_GELU_ERF, GGML_TYPE_F32, ne));
+        cases.emplace_back(new test_unary(GGML_UNARY_OP_GELU_ERF, GGML_TYPE_F32, ne, 1));
+    }
+    cases.emplace_back(new test_replicate_pad(64, 107, 2));
+    cases.emplace_back(new test_replicate_pad(64, 106, 3));
+    cases.emplace_back(new test_replicate_pad(256, 107, 2));
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_speech_hotspot_tests(test_cases, false);
     add_acestep_tests(test_cases, false);
+    add_supertonic_tests(test_cases, false);
     std::default_random_engine rng(0);
 
     // unary ops
@@ -14176,6 +14320,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_speech_hotspot_tests(test_cases, true);
     add_acestep_tests(test_cases, true);
+    add_supertonic_tests(test_cases, true);
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

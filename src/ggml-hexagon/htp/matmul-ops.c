@@ -2824,7 +2824,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
-    if (k % 32 != 0 || (n % 32 != 0 && weight_type != HTP_TYPE_F16)) { return -1; }
+    if (k % 32 != 0 || (n % 32 != 0 && weight_type != HTP_TYPE_F16 && weight_type != HTP_TYPE_F32)) { return -1; }
     if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN)) { return -1; }
 
     size_t row_stride = htp_mm_get_tiled_row_stride(weight_type, k);

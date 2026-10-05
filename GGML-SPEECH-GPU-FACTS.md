@@ -47,8 +47,29 @@ verified mechanisms.
   head (151669/217204 rows) cannot run on HTP0 and the LM stays on CPU or GPU.
   Lifting the cap passes test-backend-ops once but the perf loop aborts with
   `dspqueue_read failed: 0x2e`.
-- HTP matmuls do not honour GGML_PREC_F32: the b_absmax=1e5 stress cases return
-  NaN on HTP0 (test-backend-ops MUL_MAT, 24 failures, same on the base tip).
+- HMX multiplies in F16 and used to ignore GGML_PREC_F32; a MUL_MAT that asks
+  for F32 precision now stays on HVX (ggml_hexagon_matmul_is_hmx_eligible), which
+  fixes the prec_f32=1 bias-epilogue cases. The quantized b_absmax=1e5 stress
+  cases still return NaN (14 MUL_MAT failures, the same on the base tip).
+- Cache maintenance between the ops of one batch (htp-tensor.c lazy dirty
+  ranges) had two holes, both invisible to single-op test-backend-ops cases and
+  hidden by GGML_HEXAGON_OPBATCH<=4: per-line Q6_dccleaninva did not make an
+  op's output visible to the next op (Supertonic's duration REPEAT read stale
+  data; hex_l2flush now uses the QuRT range clean), and only inputs were
+  flushed, so dirty lines of an older tensor in reused memory were written back
+  over a DMA-written output (Supertonic text encoder off by 2%; outputs are now
+  flushed before each op too).
+- ggml_can_fuse requires every fused node to have the same shape, so a
+  shape-changing fusion such as IM2COL+MUL_MAT (depthwise conv1d) checks the use
+  count itself. The allocator may place that MUL_MAT's output over the IM2COL
+  input, so the fused kernel stages every channel in VTCM before writing.
+- F32 transposes (CONT of a transposed view, single-tap IM2COL) ran element by
+  element at about 0.4 GB/s; they now go through VTCM tiles and word gathers
+  (transpose-ops.c). HMX pads a partial 32-row tile for F32 weights as for F16;
+  the padding rows come from the VTCM weight buffer, not from DDR.
+- Measured Supertonic 3 q8_0 stage parity vs CPU (whole graphs, identical
+  inputs): duration 0.9999999, text encoder 0.9999998, vector estimator 0.99995,
+  vocoder 0.9999996; 2.0-2.2x faster than Adreno OpenCL end to end.
 - Binary ops staged whole rows in VTCM and returned VTCM-TOO-SMALL once a row
   exceeded the per-thread budget (an Oobleck VAE row is up to 345600 floats);
   rows that do not fit now stream from DDR (binary-ops.c execute_op_binary_direct).

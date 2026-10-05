@@ -488,6 +488,40 @@ static bool im2col_run_1d_tiled(struct htp_ops_context * octx) {
     return true;
 }
 
+// A 1D im2col with a single tap, unit stride and no padding is a transpose of
+// the [channels, length] input into [length, channels] columns.
+static bool im2col_is_pointwise_f32(const struct htp_ops_context * octx) {
+    const struct htp_tensor * x   = octx->src[1];
+    const struct htp_tensor * dst = octx->dst;
+    return octx->op_params[6] == 0 && octx->src[0]->ne[0] == 1 && octx->op_params[0] == 1 && octx->op_params[2] == 0 &&
+           dst->type == HTP_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[3] == 1 && dst->ne[0] == x->ne[1] &&
+           dst->ne[1] == x->ne[0] && dst->nb[0] == sizeof(float) && dst->nb[1] == dst->ne[0] * sizeof(float);
+}
+
+static bool im2col_run_pointwise(struct htp_ops_context * octx) {
+    if (!im2col_is_pointwise_f32(octx)) {
+        return false;
+    }
+    const struct htp_tensor *      x   = octx->src[1];
+    const struct htp_tensor *      dst = octx->dst;
+    const struct htp_transpose_f32 job = {
+        .octx           = octx,
+        .src            = (const uint8_t *) x->data,
+        .dst            = (uint8_t *) dst->data,
+        .rows           = x->ne[1],
+        .cols           = x->ne[0],
+        .src_row_stride = x->nb[1],
+        .dst_row_stride = dst->nb[1],
+        .batch2         = x->ne[2],
+        .batch3         = 1,
+        .src_stride2    = x->nb[2],
+        .src_stride3    = 0,
+        .dst_stride2    = dst->nb[2],
+        .dst_stride3    = 0,
+    };
+    return htp_transpose_f32(&job);
+}
+
 int op_im2col(struct htp_ops_context * octx) {
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
@@ -512,7 +546,7 @@ int op_im2col(struct htp_ops_context * octx) {
     ictx.octx                      = octx;
     ictx.npatches_per_thread       = (npatches + n_threads - 1) / n_threads;
 
-    if (im2col_run_1d_tiled(octx)) {
+    if (im2col_run_pointwise(octx) || im2col_run_1d_tiled(octx)) {
         return HTP_STATUS_OK;
     }
 

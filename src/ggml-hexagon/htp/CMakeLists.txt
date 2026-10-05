@@ -47,6 +47,8 @@ add_library(${HTP_LIB} SHARED
     timestep-embedding-ops.c
     snake-ops.c
     col2im-1d-ops.c
+    transpose-ops.c
+    depthwise-conv-1d-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE

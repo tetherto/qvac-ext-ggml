@@ -298,6 +298,41 @@ static void cpy_thread_f16_f32_strided(unsigned int nth, unsigned int ith, void 
     }
 }
 
+static bool cpy_dst_is_contiguous(const struct htp_tensor * dst, uint32_t elem_size) {
+    return dst->nb[0] == elem_size && dst->nb[1] == dst->ne[0] * dst->nb[0] && dst->nb[2] == dst->ne[1] * dst->nb[1] &&
+           dst->nb[3] == dst->ne[2] * dst->nb[2];
+}
+
+static bool cpy_is_transpose_f32(const struct htp_tensor * src0, const struct htp_tensor * dst) {
+    return src0->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F32 && src0->ne[0] == dst->ne[0] &&
+           src0->ne[1] == dst->ne[1] && src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3] &&
+           src0->nb[1] == sizeof(float) && src0->nb[0] > sizeof(float) && cpy_dst_is_contiguous(dst, sizeof(float));
+}
+
+static bool cpy_run_transpose(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+    if (!cpy_is_transpose_f32(src0, dst)) {
+        return false;
+    }
+    const struct htp_transpose_f32 job = {
+        .octx           = octx,
+        .src            = (const uint8_t *) src0->data,
+        .dst            = (uint8_t *) dst->data,
+        .rows           = src0->ne[0],
+        .cols           = src0->ne[1],
+        .src_row_stride = src0->nb[0],
+        .dst_row_stride = dst->nb[1],
+        .batch2         = src0->ne[2],
+        .batch3         = src0->ne[3],
+        .src_stride2    = src0->nb[2],
+        .src_stride3    = src0->nb[3],
+        .dst_stride2    = dst->nb[2],
+        .dst_stride3    = dst->nb[3],
+    };
+    return htp_transpose_f32(&job);
+}
+
 int op_cpy(struct htp_ops_context * octx) {
     cpy_preamble;
 
@@ -321,6 +356,10 @@ int op_cpy(struct htp_ops_context * octx) {
     }
 
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
+    }
+
+    if (cpy_run_transpose(octx)) {
         return HTP_STATUS_OK;
     }
 
