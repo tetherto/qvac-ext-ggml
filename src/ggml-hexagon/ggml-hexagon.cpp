@@ -15,7 +15,6 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
-#include <unordered_map>
 #include <regex>
 #include <queue>
 #include <algorithm>
@@ -1152,6 +1151,72 @@ static inline bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backe
     return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;
 }
 
+// Pointer -> tensor index table of one op batch: open addressing over a
+// power-of-two slot array, cleared in O(1) by bumping a generation stamp, so
+// building a batch allocates nothing per tensor. A key may repeat (views share
+// a data pointer); a lookup visits every entry with its key.
+struct htp_pointer_index {
+    struct slot {
+        const void * key;
+        int          value;
+        uint32_t     gen;
+    };
+
+    std::vector<slot> slots;
+    uint32_t          mask = 0;
+    uint32_t          gen  = 1;
+
+    void init(size_t max_entries) {
+        size_t n = 1;
+        while (n < 2 * max_entries) {
+            n <<= 1;
+        }
+        slots.assign(n, slot{ nullptr, 0, 0 });
+        mask = (uint32_t) (n - 1);
+    }
+
+    void clear() {
+        if (++gen == 0) {
+            forget_all();
+        }
+    }
+
+    void forget_all() {
+        for (auto & s : slots) {
+            s.gen = 0;
+        }
+        gen = 1;
+    }
+
+    uint32_t home(const void * key) const {
+        const uint64_t h = (uint64_t) (uintptr_t) key * 0x9E3779B97F4A7C15ull;
+        return (uint32_t) (h >> 32) & mask;
+    }
+
+    bool occupied(uint32_t i) const { return slots[i].gen == gen; }
+
+    void insert(const void * key, int value) {
+        uint32_t i = home(key);
+        while (occupied(i)) {
+            i = (i + 1) & mask;
+        }
+        slots[i] = { key, value, gen };
+    }
+
+    template <typename Accept> int find_if(const void * key, Accept && accept) const {
+        for (uint32_t i = home(key); occupied(i); i = (i + 1) & mask) {
+            if (slots[i].key == key && accept(slots[i].value)) {
+                return slots[i].value;
+            }
+        }
+        return -1;
+    }
+
+    int find(const void * key) const {
+        return find_if(key, [](int) { return true; });
+    }
+};
+
 struct ggml_hexagon_opbatch {
     ggml_hexagon_session*            sess;
 
@@ -1161,9 +1226,8 @@ struct ggml_hexagon_opbatch {
     std::vector<htp_tensor>          h_tens;    // htp tensor descriptors
     std::vector<htp_op_desc>         h_ops;     // htp op descriptors
 
-    std::unordered_map<int, int>                b_map; // buffer fd   to index
-    std::unordered_map<const ggml_tensor*, int> t_map; // tensor ptr  to index
-    std::unordered_multimap<void*, int>         d_map; // tensor data to index
+    htp_pointer_index                t_index;   // tensor ptr  to index
+    htp_pointer_index                d_index;   // tensor data to index
 
 
 
@@ -1183,9 +1247,8 @@ struct ggml_hexagon_opbatch {
         n_ops  = 0;
         b_vmem = 0;
 
-        b_map.clear();
-        t_map.clear();
-        d_map.clear();
+        t_index.clear();
+        d_index.clear();
     }
 
     ggml_hexagon_opbatch(ggml_hexagon_session *sess, size_t batch_size, size_t max_vmem) {
@@ -1203,9 +1266,8 @@ struct ggml_hexagon_opbatch {
         h_tens.resize(n_tens_max);
         h_ops.resize(n_ops_max);
 
-        b_map.reserve(n_bufs_max);
-        t_map.reserve(n_tens_max);
-        d_map.reserve(n_tens_max);
+        t_index.init(n_tens_max);
+        d_index.init(n_tens_max);
 
         GGML_LOG_INFO("ggml-hex: %s op batching: n-bufs %u n-tensors %u n-ops %u vmem %zu\n",
                 sess->c_name(), n_bufs_max, n_tens_max, n_ops_max, b_vmem_max);
@@ -1215,17 +1277,22 @@ struct ggml_hexagon_opbatch {
 
     bool empty() const { return n_ops == 0; }
 
+    // index of the buffer with this fd, or -1
+    int find_buffer(int fd) const {
+        for (unsigned int bi = 0; bi < n_bufs; bi++) {
+            if (h_bufs[bi].fd == fd) { return (int) bi; }
+        }
+        return -1;
+    }
+
     // add buffer and return its index
     int add_buffer(ggml_hexagon_shared_buffer * sbuf) {
-        // Lookup by fd
-        auto it = b_map.find(sbuf->fd);
-        if (it != b_map.end()) { return it->second; }
+        const int found = find_buffer(sbuf->fd);
+        if (found >= 0) { return found; }
 
         // Add new buffer to the batch
         int bi = n_bufs++;
         GGML_ASSERT(n_bufs < HTP_OP_MAX_BUFS);
-
-        b_map.insert({sbuf->fd, bi});
 
         htp_buf_desc &b = h_bufs[bi];
         b.base = (uint64_t) sbuf->base;
@@ -1263,22 +1330,19 @@ struct ggml_hexagon_opbatch {
         auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
 
         // First lookup by tensor data
-        auto range = d_map.equal_range(t->data);
-        for (auto it = range.first; it != range.second; ++it) {
-            htp_tensor * h = &h_tens[it->second];
-            if (same_shape(h, t)) { return it->second; }
-        }
+        const int by_data = d_index.find_if(t->data, [&](int ti) { return same_shape(&h_tens[ti], t); });
+        if (by_data >= 0) { return by_data; }
 
         // Lookup by tensor ptr
-        auto it = t_map.find(t);
-        if (it != t_map.end()) { return it->second; }
+        const int by_ptr = t_index.find(t);
+        if (by_ptr >= 0) { return by_ptr; }
 
         // Add new tensor to the batch
         int ti = n_tens++;
         GGML_ASSERT(n_tens <= n_tens_max);
 
-        t_map.insert({t,       ti});
-        d_map.insert({t->data, ti});
+        t_index.insert(t,       ti);
+        d_index.insert(t->data, ti);
 
         uint64_t t_offset = (uint8_t *) t->data - sbuf->base;
         size_t   t_size   = ggml_nbytes(t);
@@ -1332,11 +1396,11 @@ struct ggml_hexagon_opbatch {
 
         auto fit_tensor = [&](const ggml_tensor *t) {
             if (!t) return;
-            if (!t_map.count(t)) {
+            if (t_index.find(t) < 0) {
                 extra_tens++;
 
                 auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
-                if (!b_map.count(sbuf->fd)) {
+                if (find_buffer(sbuf->fd) < 0) {
                     extra_vmem += sbuf->size;
                     extra_bufs += 1;
                 }
@@ -2655,15 +2719,15 @@ static void ggml_hexagon_precompute_matmul_params(
     ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, 0, kparams);
 }
 
+// The MUL_MAT node, not the ADD, decides the kernel: it carries the requested
+// precision, so a GGML_PREC_F32 product stays on HVX when fused.
 static void ggml_hexagon_precompute_fused_matmul_add_params(
     const struct ggml_hexagon_session * sess,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
+    const struct ggml_tensor * mul_mat,
     const struct ggml_tensor * src2,
-    const struct ggml_tensor * dst,
     struct htp_mm_kernel_params * kparams
 ) {
-    ggml_hexagon_precompute_matmul_params_impl(sess, src0, src1, dst, src2->nb[1], kparams);
+    ggml_hexagon_precompute_matmul_params_impl(sess, mul_mat->src[0], mul_mat->src[1], mul_mat, src2->nb[1], kparams);
 }
 
 static void ggml_hexagon_precompute_unary_params(
@@ -3874,10 +3938,10 @@ static bool try_fuse_node(const ggml_hexagon_session * sess, const ggml_cgraph *
 
     if (n->op == GGML_OP_MUL_MAT && next_node) {
         if (next_node->op == GGML_OP_ADD && op_is_compute(next_node) && ggml_can_fuse(graph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
-            if (next_node->src[0] == n || next_node->src[1] == n) {
+            if ((next_node->src[0] == n || next_node->src[1] == n) && ggml_are_same_shape(n, next_node)) {
                 const struct ggml_tensor * src2 = (next_node->src[0] == n) ? next_node->src[1] : next_node->src[0];
                 struct htp_mm_kernel_params kparams;
-                ggml_hexagon_precompute_fused_matmul_add_params(sess, n->src[0], n->src[1], src2, next_node, &kparams);
+                ggml_hexagon_precompute_fused_matmul_add_params(sess, n, src2, &kparams);
                 const int src1_nrows = n->src[1]->ne[1] * n->src[1]->ne[2] * n->src[1]->ne[3];
                 const bool can_fuse = (kparams.n_hmx > 0) || (src1_nrows == 1);
                 if (can_fuse && (size_t)kparams.vtcm_size <= sess->vtcm_size) {

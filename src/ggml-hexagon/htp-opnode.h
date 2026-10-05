@@ -14,6 +14,33 @@
 #include "htp/flash-attn-ops.h"
 #include "htp/unary-ops.h"
 
+// The inputs or outputs of one HTP op. Fixed capacity: the batch builder
+// queries them for every op, so they must not allocate.
+struct htp_tensor_list {
+    static constexpr int capacity = 2 * GGML_MAX_SRC;
+
+    const ggml_tensor * items[capacity] = {};
+    int                 count           = 0;
+
+    void push_back(const ggml_tensor * t) {
+        if (count < capacity) {
+            items[count++] = t;
+        }
+    }
+
+    bool contains(const ggml_tensor * t) const {
+        return std::find(begin(), end(), t) != end();
+    }
+
+    bool   empty() const { return count == 0; }
+    size_t size() const { return (size_t) count; }
+
+    const ggml_tensor * operator[](size_t i) const { return items[i]; }
+
+    const ggml_tensor * const * begin() const { return items; }
+    const ggml_tensor * const * end() const { return items + count; }
+};
+
 struct htp_opnode {
     ggml_tensor * node = nullptr;
 
@@ -43,8 +70,8 @@ struct htp_opnode {
         }
     }
 
-    std::vector<const ggml_tensor *> get_outputs() const {
-        std::vector<const ggml_tensor *> res;
+    htp_tensor_list get_outputs() const {
+        htp_tensor_list res;
         if (extra_dsts.empty()) {
             res.push_back(dst());
         } else {
@@ -82,7 +109,8 @@ struct htp_opnode {
         return n.src1() == this->src1();
     }
 
-    std::vector<const ggml_tensor *> get_inputs() const {
+    htp_tensor_list get_inputs() const {
+        htp_tensor_list inputs;
         if (fused.empty()) {
             int last_non_null = -1;
             for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -90,35 +118,21 @@ struct htp_opnode {
                     last_non_null = i;
                 }
             }
-            std::vector<const ggml_tensor *> inputs(last_non_null + 1, nullptr);
             for (int i = 0; i <= last_non_null; i++) {
-                inputs[i] = node->src[i];
+                inputs.push_back(node->src[i]);
             }
             return inputs;
         }
 
-        std::vector<const ggml_tensor *> inputs(GGML_MAX_SRC, nullptr);
-        std::vector<const ggml_tensor *> outputs;
+        htp_tensor_list outputs;
         outputs.push_back(node);
         for (const auto * f : fused) {
             outputs.push_back(f);
         }
 
-        auto contains = [&](const std::vector<const ggml_tensor *> & vec, const ggml_tensor * t) {
-            for (const auto * x : vec) {
-                if (x == t) return true;
-            }
-            return false;
-        };
-
-        int count = 0;
         auto add_input = [&](const ggml_tensor * t) {
-            if (t && !contains(outputs, t) && !contains(inputs, t)) {
-                if (count < (int)inputs.size()) {
-                    inputs[count++] = t;
-                } else {
-                    inputs.push_back(t);
-                }
+            if (t && !outputs.contains(t) && !inputs.contains(t)) {
+                inputs.push_back(t);
             }
         };
 
@@ -135,7 +149,6 @@ struct htp_opnode {
             }
         }
 
-        inputs.resize(count);
         return inputs;
     }
 

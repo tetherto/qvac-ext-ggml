@@ -11,6 +11,7 @@
 #include "hex-dma.h"
 #include "hex-fastdiv.h"
 #include "hvx-erf.h"
+#include "hvx-tanh.h"
 #include "hvx-exp.h"
 #include "hvx-sigmoid.h"
 #include "hvx-utils.h"
@@ -293,7 +294,6 @@ static void silu_f32(const float * restrict src,
     }
 }
 
-// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
 static void gelu_f32(const float * restrict src,
                      float * restrict dst,
                      const uint32_t num_rows,
@@ -304,9 +304,7 @@ static void gelu_f32(const float * restrict src,
         const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
 
-        hvx_mul_scalar_f32(dst_local, src_local, 1.702f, ne0);
-        hvx_sigmoid_f32_aa(dst_local, dst_local, ne0);
-        hvx_mul_f32_aaa(dst_local, src_local, dst_local, ne0);
+        hvx_gelu_tanh_f32_aa(dst_local, src_local, ne0);
     }
 }
 
@@ -817,11 +815,8 @@ static inline void tile_silu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, u
     hvx_mul_f32_aaa(dst_vtcm, src_vtcm, dst_vtcm, tw);
 }
 
-// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
 static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
-    hvx_mul_scalar_f32(dst_vtcm, src_vtcm, 1.702f, tw);
-    hvx_sigmoid_f32_aa(dst_vtcm, dst_vtcm, tw);
-    hvx_mul_f32_aaa(dst_vtcm, src_vtcm, dst_vtcm, tw);
+    hvx_gelu_tanh_f32_aa(dst_vtcm, src_vtcm, tw);
 }
 
 // Triangular mask applied to one column tile. Boundary is an absolute column index, so

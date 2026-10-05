@@ -11688,12 +11688,98 @@ static void add_large_stride_tests(std::vector<std::unique_ptr<test_case>> & cas
     cases.emplace_back(new test_col2im_1d(GGML_TYPE_F32, 2, 2, DMA_STRIDE_ROW / 2, 2, 0));
 }
 
+// A unary activation over inputs in [-range, range]: the default +-150 of
+// test_unary hides approximations (GELU against GELU_QUICK) that differ only
+// near zero.
+struct test_unary_narrow : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+    const float range;
+
+    std::string vars() override {
+        return VARS_TO_STR3(op, ne, range);
+    }
+
+    test_unary_narrow(ggml_unary_op op, std::array<int64_t, 4> ne, float range) : op(op), ne(ne), range(range) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_unary(ctx, a, op);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -range, range);
+        }
+    }
+};
+
+// F32 MUL_MAT that requests GGML_PREC_F32 followed by a residual ADD in one
+// graph, over activations beyond the F16 range, as the Parler T5 encoder runs
+// them: a backend that fuses the pair must keep the F32 product.
+struct test_mul_mat_f32_prec_add : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const float activation_range;
+
+    std::string vars() override {
+        return VARS_TO_STR4(m, n, k, activation_range);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mul_mat_f32_prec_add(int64_t m, int64_t n, int64_t k, float activation_range)
+        : m(m), n(n), k(k), activation_range(activation_range) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+        ggml_mul_mat_set_prec(mm, GGML_PREC_F32);
+        ggml_tensor * out = ggml_add(ctx, mm, residual);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const bool activation = strcmp(ggml_get_name(t), "b") == 0;
+            init_tensor_uniform(t, activation ? -activation_range : -1.0f, activation ? activation_range : 1.0f);
+        }
+    }
+};
+
+static void add_parler_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_GELU, {2816, 42, 1, 1}, 4.0f));
+        return;
+    }
+    const std::array<int64_t, 4> gelu_shapes[] = { {2816, 42, 1, 1}, {2816, 30, 1, 1}, {37, 3, 1, 1} };
+    for (const auto & ne : gelu_shapes) {
+        cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_GELU, ne, 4.0f));
+    }
+    cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_GELU_ERF, {128, 32, 1, 1}, 4.0f));
+    cases.emplace_back(new test_mul_mat_f32_prec_add(1024, 42, 1024, 1.0e5f));
+    cases.emplace_back(new test_mul_mat_f32_prec_add(1024, 42, 2816, 1.0e5f));
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_speech_hotspot_tests(test_cases, false);
     add_acestep_tests(test_cases, false);
     add_supertonic_tests(test_cases, false);
     add_large_stride_tests(test_cases);
+    add_parler_tests(test_cases, false);
     std::default_random_engine rng(0);
 
     // unary ops
@@ -14436,6 +14522,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_speech_hotspot_tests(test_cases, true);
     add_acestep_tests(test_cases, true);
     add_supertonic_tests(test_cases, true);
+    add_parler_tests(test_cases, true);
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
