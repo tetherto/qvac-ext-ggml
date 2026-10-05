@@ -59,6 +59,14 @@ verified mechanisms.
   flushed, so dirty lines of an older tensor in reused memory were written back
   over a DMA-written output (Supertonic text encoder off by 2%; outputs are now
   flushed before each op too).
+- From v75 a 2D DMA descriptor holds 24-bit strides and row sizes and a 16-bit
+  row count, and dma_queue_push hands every transfer to one descriptor, so a
+  larger value is truncated (v73's dma_queue_push splits instead). On v79 a
+  stride of exactly 2^24 still lands (the field wraps to 0, which the engine
+  treats as 2^24), 2^24 + 128 aborts the DSP queue (`dspqueue_read failed:
+  0x2e`) and 24 or 32 MiB read or write the wrong rows. The VTCM fast paths copy
+  through dma_queue_copy_rows, which falls back to one 1D descriptor per row;
+  an ACE-Step VAE output row passes 16 MiB beyond about 87 s of 48 kHz audio.
 - ggml_can_fuse requires every fused node to have the same shape, so a
   shape-changing fusion such as IM2COL+MUL_MAT (depthwise conv1d) checks the use
   count itself. The allocator may place that MUL_MAT's output over the IM2COL

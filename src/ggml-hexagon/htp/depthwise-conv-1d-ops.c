@@ -44,9 +44,8 @@ static void dw1d_stage_thread(unsigned int nth, unsigned int ith, void * data) {
     const uint8_t * src = (const uint8_t *) c->x->data + (size_t) c0 * c->x->nb[2];
     dma_queue *     q   = c->octx->ctx->dma[ith];
     hvx_splat_f32_a(in, 0.0f, nc * c->in_pitch);
-    dma_queue_push(q, dma_make_ptr(in + c->pad, src), c->in_pitch * sizeof(float), c->x->nb[2],
-                   c->x->ne[0] * sizeof(float), nc);
-    dma_queue_flush(q);
+    dma_queue_copy_rows(q, dma_make_ptr(in + c->pad, src), c->in_pitch * sizeof(float), c->x->nb[2],
+                        c->x->ne[0] * sizeof(float), nc);
 }
 
 static void dw1d_row(const struct htp_dw1d_context * c, float * out, const float * in, const float * w,
@@ -75,9 +74,8 @@ static void dw1d_compute_thread(unsigned int nth, unsigned int ith, void * data)
     }
     dma_queue * q        = c->octx->ctx->dma[ith];
     uint8_t *   dst_rows = (uint8_t *) dst->data + (size_t) c0 * dst->nb[2];
-    dma_queue_push(q, dma_make_ptr(dst_rows, c->out + (size_t) c0 * c->out_pitch), dst->nb[2],
-                   c->out_pitch * sizeof(float), dst->ne[0] * sizeof(float), nc);
-    dma_queue_flush(q);
+    dma_queue_copy_rows(q, dma_make_ptr(dst_rows, c->out + (size_t) c0 * c->out_pitch), dst->nb[2],
+                        c->out_pitch * sizeof(float), dst->ne[0] * sizeof(float), nc);
 }
 
 int op_depthwise_conv_1d(struct htp_ops_context * octx) {

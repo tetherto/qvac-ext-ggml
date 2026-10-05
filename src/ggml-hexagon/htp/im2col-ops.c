@@ -269,8 +269,8 @@ static bool im2col_patchembed_dma_fits(struct htp_ops_context *    octx,
 // (convolution layers of audio models). One output column gathers a tap from
 // every channel row, so reading DDR directly touches IC rows that sit a whole
 // row pitch apart. Tiles of output positions instead stage each channel's
-// input span in VTCM with one 2D DMA, widen it to F16 with HVX, assemble each
-// column with HVX gathers from VTCM, and DMA the finished rows out.
+// input span in VTCM (dma_queue_copy_rows), widen it to F16 with HVX, assemble
+// each column with HVX gathers from VTCM, and DMA the finished rows out.
 #define IM2COL_1D_MAX_TILE 128
 #define IM2COL_1D_F32_ALIGN 32
 #define IM2COL_1D_F16_ALIGN 64
@@ -397,9 +397,8 @@ static void im2col_1d_stage(const struct htp_im2col_1d_tiled * t, dma_queue * q,
         return;
     }
     const uint8_t * src = (const uint8_t *) x->data + (iw0 + lo) * sizeof(float);
-    dma_queue_push(q, dma_make_ptr(in32 + lo, src), t->stride_f32 * sizeof(float), x->nb[1],
-                   (size_t) (hi - lo) * sizeof(float), IC);
-    dma_queue_flush(q);
+    dma_queue_copy_rows(q, dma_make_ptr(in32 + lo, src), t->stride_f32 * sizeof(float), x->nb[1],
+                        (size_t) (hi - lo) * sizeof(float), IC);
 }
 
 static void im2col_1d_widen(const struct htp_im2col_1d_tiled * t, __fp16 * in16, const float * in32, uint32_t span) {
@@ -454,8 +453,7 @@ static void im2col_1d_tile(const struct htp_im2col_1d_tiled * t, unsigned int it
     im2col_1d_gather_tile(t, tmp, out, in16, tw);
 
     uint8_t * dst_rows = (uint8_t *) dst->data + (size_t) ow0 * dst->nb[1];
-    dma_queue_push(q, dma_make_ptr(dst_rows, out), PS * sizeof(__fp16), PS * sizeof(__fp16), PS * sizeof(__fp16), tw);
-    dma_queue_flush(q);
+    dma_queue_copy_rows(q, dma_make_ptr(dst_rows, out), PS * sizeof(__fp16), PS * sizeof(__fp16), PS * sizeof(__fp16), tw);
 }
 
 static void im2col_1d_tiled_thread(unsigned int nth, unsigned int ith, void * data) {

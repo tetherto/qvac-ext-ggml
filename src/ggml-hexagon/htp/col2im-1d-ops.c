@@ -157,9 +157,8 @@ static void col2im_1d_vtcm_stage(const struct htp_col2im_1d_vtcm * v, dma_queue 
         hvx_splat_f32_a(cols, 0.0f, (uint32_t) (col_end - col_first) * k_oc);
     }
     if (hi > lo) {
-        dma_queue_push(q, dma_make_ptr(cols + (lo - col_first) * k_oc, (const uint8_t *) src->data + lo * src->nb[1]),
-                       k_oc * sizeof(float), src->nb[1], k_oc * sizeof(float), (size_t) (hi - lo));
-        dma_queue_flush(q);
+        dma_queue_copy_rows(q, dma_make_ptr(cols + (lo - col_first) * k_oc, (const uint8_t *) src->data + lo * src->nb[1]),
+                            k_oc * sizeof(float), src->nb[1], k_oc * sizeof(float), (size_t) (hi - lo));
     }
 }
 
@@ -212,9 +211,8 @@ static void col2im_1d_vtcm_band(const struct htp_col2im_1d_vtcm * v, unsigned in
     for (uint32_t oc = 0; oc < v->base.channels; oc++) {
         col2im_1d_vtcm_channel(v, tmp, out + oc * v->band, cols, cols_end, col_first, oc, a0, n);
     }
-    dma_queue_push(q, dma_make_ptr((uint8_t *) dst->data + t0 * sizeof(float), out), dst->nb[1], v->band * sizeof(float),
-                   n * sizeof(float), v->base.channels);
-    dma_queue_flush(q);
+    dma_queue_copy_rows(q, dma_make_ptr((uint8_t *) dst->data + t0 * sizeof(float), out), dst->nb[1], v->band * sizeof(float),
+                        n * sizeof(float), v->base.channels);
 }
 
 static void col2im_1d_vtcm_thread(unsigned int nth, unsigned int ith, void * data) {

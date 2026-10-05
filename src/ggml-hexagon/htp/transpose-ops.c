@@ -9,9 +9,9 @@
 #include "htp-ops.h"
 #include "hvx-utils.h"
 
-// Source rows and columns per tile. Each tile is staged in VTCM with one 2D
-// DMA, transposed with word gathers into a second VTCM tile, and written back
-// with one 2D DMA.
+// Source rows and columns per tile. Each tile is staged in VTCM with
+// dma_queue_copy_rows, transposed with word gathers into a second VTCM tile,
+// and written back the same way.
 #define TRANSPOSE_TILE 128
 #define TRANSPOSE_LANES (VLEN / sizeof(float))
 
@@ -43,8 +43,7 @@ static HVX_Vector transpose_row_offsets(void) {
 
 static void transpose_stage(dma_queue * q, float * in, const uint8_t * src, uint32_t src_row_stride, uint32_t tr,
                             uint32_t tc) {
-    dma_queue_push(q, dma_make_ptr(in, src), TRANSPOSE_TILE * sizeof(float), src_row_stride, tc * sizeof(float), tr);
-    dma_queue_flush(q);
+    dma_queue_copy_rows(q, dma_make_ptr(in, src), TRANSPOSE_TILE * sizeof(float), src_row_stride, tc * sizeof(float), tr);
 }
 
 static void transpose_gather_column(HVX_Vector * tmp, float * out_row, const float * in_col, uint32_t tr,
@@ -68,8 +67,7 @@ static void transpose_gather_tile(HVX_Vector * tmp, float * out, const float * i
 
 static void transpose_write(dma_queue * q, uint8_t * dst, uint32_t dst_row_stride, const float * out, uint32_t tr,
                             uint32_t tc) {
-    dma_queue_push(q, dma_make_ptr(dst, out), dst_row_stride, TRANSPOSE_TILE * sizeof(float), tr * sizeof(float), tc);
-    dma_queue_flush(q);
+    dma_queue_copy_rows(q, dma_make_ptr(dst, out), dst_row_stride, TRANSPOSE_TILE * sizeof(float), tr * sizeof(float), tc);
 }
 
 static void transpose_tile(const struct htp_transpose_run * run, unsigned int ith, uint32_t tile, HVX_Vector offsets,

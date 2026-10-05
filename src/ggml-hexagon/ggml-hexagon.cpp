@@ -2256,7 +2256,7 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     // the batched paths still need the true ne01 32-aligned (the Parakeet CTC
     // head has ne01=1025), which ne01_padded alone cannot tell apart.
     const bool pads_partial_tile = mm_weight_pads_partial_tile((ggml_type) wtype) && !is_batched && !is_matmul_id;
-    if (ne01_padded % 32 != 0 || (ne01 % 32 != 0 && !pads_partial_tile)) {
+    if (ne01_padded % HTP_MM_HMX_TILE_N_COLS != 0 || (ne01 % HTP_MM_HMX_TILE_N_COLS != 0 && !pads_partial_tile)) {
         return false;
     }
 
@@ -2618,7 +2618,7 @@ static void ggml_hexagon_precompute_matmul_params_impl(
     const int wtype = src0->type;
     const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
     const int ne00_padded = is_repack ? hex_round_up(ne00, 32) : ne00;
-    const int ne01_padded = (is_repack || mm_weight_pads_partial_tile((ggml_type) wtype)) ? hex_round_up(ne01, 32) : ne01;
+    const int ne01_padded = (is_repack || mm_weight_pads_partial_tile((ggml_type) wtype)) ? hex_round_up(ne01, HTP_MM_HMX_TILE_N_COLS) : ne01;
     const int ne11_padded = hex_round_up(ne11, 32);
 
     const bool is_matmul_id = (dst->op == GGML_OP_MUL_MAT_ID);
@@ -3719,7 +3719,7 @@ static bool mm_is_hmx_eligible(const ggml_tensor * t) {
     const bool is_matmul_id = (t->op == GGML_OP_MUL_MAT_ID);
     const bool is_batched   = (src0->ne[2] * src0->ne[3] > 1 || src1->ne[2] * src1->ne[3] > 1);
 
-    const int ne01_padded = (is_repack || mm_weight_pads_partial_tile((ggml_type) wtype)) ? hex_round_up(src0->ne[1], 32) : src0->ne[1];
+    const int ne01_padded = (is_repack || mm_weight_pads_partial_tile((ggml_type) wtype)) ? hex_round_up(src0->ne[1], HTP_MM_HMX_TILE_N_COLS) : src0->ne[1];
 
     return ggml_hexagon_matmul_is_hmx_eligible(src0, src1, t, ne01_padded, is_matmul_id, is_batched);
 }
