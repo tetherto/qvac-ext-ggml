@@ -21,6 +21,45 @@ verified mechanisms.
   (backend_registry.h); unit tests pin these rules (test_acestep_units.cpp).
 - Default memory mode loads and frees stage weights per generation
   (engine.cpp:1114); ACESTEP_KEEP_STAGES=1 keeps them resident.
+- Hexagon runs only on an explicit `backend = "hexagon"` request; the automatic
+  GPU walk skips the HTP registry (backend_registry.h gpu_tier_for). On HTP the
+  detokenizer and encoders stay on the NPU and the LM on CPU unless
+  `lm_backend` names another device (stage_placement.h, engine_backends.h).
+
+## ggml-hexagon on Snapdragon 8 Elite (Galaxy S25, Hexagon v79 HTP0)
+
+- HTP computes only on its own session buffers: supports_op rejects any src in a
+  foreign buffer (ggml-hexagon.cpp ggml_hexagon_supported_buffers), so AceSTEP
+  stages upload weights instead of mapping the GGUF (dit_gguf.cpp
+  dit_gguf_backend_maps_weights). Quantized MUL_MAT also requires src0 in the
+  repack buffer type exposed through `ggml_backend_dev_get_extra_bufts`
+  (ggml_hexagon_supported_mul_mat).
+- set/get_tensor repack Q4_0/Q4_1/Q8_0/IQ4_NL/MXFP4 whole-tensor only:
+  GGML_ASSERT(offset == 0) (ggml-hexagon.cpp:944-962). Row-range reads or
+  uploads of a quantized weight (fused q|k|v blocks, a tied-head row slice)
+  abort.
+- With GGML_HEXAGON_HOSTBUF=1 (default) the default buffer type reports is_host
+  while still storing quantized tensors repacked, so ggml_backend_tensor_copy
+  memcpy's repacked bytes to a CPU copy. test-backend-ops CPU references for
+  quantized ops on HTP0 therefore read NaN; run it with GGML_HEXAGON_HOSTBUF=0.
+  A Q8_0 set/get round trip itself is byte-exact up to [1024, 217204].
+- MUL_MAT refuses src0->ne[1] > 32768 ("refuse the lm-head"), so the AceSTEP LM
+  head (151669/217204 rows) cannot run on HTP0 and the LM stays on CPU or GPU.
+  Lifting the cap passes test-backend-ops once but the perf loop aborts with
+  `dspqueue_read failed: 0x2e`.
+- HTP matmuls do not honour GGML_PREC_F32: the b_absmax=1e5 stress cases return
+  NaN on HTP0 (test-backend-ops MUL_MAT, 24 failures, same on the base tip).
+- Binary ops staged whole rows in VTCM and returned VTCM-TOO-SMALL once a row
+  exceeded the per-thread budget (an Oobleck VAE row is up to 345600 floats);
+  rows that do not fit now stream from DDR (binary-ops.c execute_op_binary_direct).
+- The fused MUL_MAT+ADD matvec added the bias with an aligned HVX load at
+  vtcm_src2 + src0_start_row; per-thread start rows are not 32-aligned
+  (2048 / 6 threads), so threads 1-5 added a shifted bias (matmul-ops.c:494,
+  :1269, regression test_matvec_bias). This was the AceSTEP detokenizer's
+  0.987 cosine.
+- Measured AceSTEP stage parity vs CPU (identical inputs): detok 0.99999,
+  text encoder 0.99941, cond 0.99947, DiT 0.989, VAE 0.999992 (Adreno OpenCL on
+  the same phone: 0.99991 / 0.99913 / 0.99924 / 0.958 / 0.999992).
 
 ## ggml-vulkan on AMD Strix Halo (Radeon 8060S, RADV GFX1151, Mesa 25.2.8)
 

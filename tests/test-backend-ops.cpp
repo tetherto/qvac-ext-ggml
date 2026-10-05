@@ -11316,9 +11316,125 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// MUL_MAT with one activation row directly followed by a bias ADD, the pair the
+// Hexagon backend fuses into a single matvec with an epilogue add.
+struct test_matvec_bias : public test_case {
+    const ggml_type type_a;
+    const int64_t   m;
+    const int64_t   k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_a, m, k);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return type_a == GGML_TYPE_F32 ? 1e-7 : 5e-4;
+    }
+
+    test_matvec_bias(ggml_type type_a, int64_t m, int64_t k) : type_a(type_a), m(m), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(b, "b");
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, 1);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a, b), bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// ACE-Step (AudioGen) shapes: DiT attention rows that are not a multiple of the
+// 32-lane HVX width, the DiT timestep embedding, the text-encoder bf16 token
+// lookup, and the Oobleck VAE snake activation and transposed-conv overlap-add.
+static void add_acestep_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        cases.emplace_back(new test_snake(345600, 128));
+        cases.emplace_back(new test_snake(1800, 1024));
+        cases.emplace_back(new test_col2im_1d(GGML_TYPE_F32, 4, 128, 172800, 2, 1));
+        cases.emplace_back(new test_col2im_1d(GGML_TYPE_F32, 20, 1024, 180, 10, 5));
+        cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {171, 90, 16, 1}, true, false, GGML_TYPE_F16));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 345600, 128, 896, {1, 1}, {1, 1}));
+        cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {345600, 128, 1, 1},
+                                           {7, 128, 128, 1}, 1, 0, 27, 0, 9, 0, false));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 43200, 256, 1792, {1, 1}, {1, 1}));
+        return;
+    }
+    for (int64_t cols : {90, 171, 155, 33, 65}) {
+        for (bool mask : {false, true}) {
+            cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {cols, 90, 16, 1}, mask, false, GGML_TYPE_F16));
+        }
+    }
+    cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {171, 90, 16, 1}, true, false, GGML_TYPE_F16, {1, 1}, 0.0883883f));
+    cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {1, 1, 1, 1}, 256, 10000));
+    cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {3, 1, 1, 1}, 255, 10000));
+    for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        cases.emplace_back(new test_get_rows(type, 1024, 4096, 155, 1, 1, 0));
+        cases.emplace_back(new test_get_rows(type, 1024, 4096, 1, 1, 1, 0));
+    }
+    cases.emplace_back(new test_snake(180, 2048));
+    cases.emplace_back(new test_snake(1800, 64));
+    cases.emplace_back(new test_snake(10800, 16));
+    cases.emplace_back(new test_snake(1000, 3));
+    cases.emplace_back(new test_col2im_1d(GGML_TYPE_F32, 20, 64, 180, 10, 5));
+    cases.emplace_back(new test_col2im_1d(GGML_TYPE_F32, 12, 32, 300, 6, 3));
+    cases.emplace_back(new test_col2im_1d(GGML_TYPE_F32, 8, 16, 1000, 4, 2));
+    cases.emplace_back(new test_col2im_1d(GGML_TYPE_F32, 4, 8, 3000, 2, 1));
+    cases.emplace_back(new test_col2im_1d(GGML_TYPE_F16, 8, 16, 1000, 4, 2));
+    // The FSQ detokenizer's first projection is a K=6 F32 matvec whose bias add
+    // the backend fuses; each thread's output slice starts at an unaligned row.
+    for (int64_t m : {2048, 2047, 64}) {
+        cases.emplace_back(new test_matvec_bias(GGML_TYPE_F32, m, 6));
+        cases.emplace_back(new test_matvec_bias(GGML_TYPE_F32, m, 64));
+        cases.emplace_back(new test_matvec_bias(GGML_TYPE_F16, m, 64));
+    }
+    // Oobleck VAE residual-unit convolutions: kernel 7 at dilations 1, 3 and 9
+    // with "same" padding, plus the 1x1 projections, on channel-major input.
+    for (int dilation : {1, 3, 9}) {
+        for (int64_t channels : {128, 64, 17}) {
+            cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {3000, channels, 1, 1},
+                                               {7, channels, channels, 1}, 1, 0, 3 * dilation, 0, dilation, 0, false));
+        }
+    }
+    cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {3000, 128, 1, 1}, {1, 128, 128, 1},
+                                       1, 0, 0, 0, 1, 0, false));
+    cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {180, 64, 1, 1}, {7, 64, 2048, 1},
+                                       1, 0, 3, 0, 1, 0, false));
+    cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {1800, 1024, 1, 1}, {7, 1024, 1024, 1},
+                                       1, 0, 27, 0, 9, 0, false));
+    cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {301, 5, 1, 1}, {4, 5, 5, 1},
+                                       2, 0, 1, 0, 2, 0, false));
+    // Oobleck VAE convolutions as im2col GEMMs: F16 im2col columns are src0
+    // and the F16 kernel is the activation, which the HMX 2D path tiles directly.
+    for (int64_t positions : {4096, 1824}) {
+        for (int64_t k : {896, 1792, 128}) {
+            cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, positions, 128, k, {1, 1}, {1, 1}));
+        }
+    }
+    cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 4096, 2, 896, {1, 1}, {1, 1}));
+    cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1800, 1024, 448, {1, 1}, {1, 1}));
+    // Output widths that are not a multiple of the 32-row HMX weight tile.
+    for (int64_t positions : {1800, 1801, 10800, 180, 47}) {
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, positions, 256, 1024, {1, 1}, {1, 1}));
+        cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, positions, 256, 1024, {1, 1}, {1, 1}));
+    }
+    // VAE rows (one channel's whole time axis) exceed what a binary op can
+    // double-buffer in VTCM per thread, so these take the streaming path.
+    for (auto op : {ggml_add, ggml_mul, ggml_sub, ggml_div}) {
+        cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {1, 16, 1, 1}, {345600, 1, 1, 1}));
+        cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {345600, 4, 1, 1}, {1, 1, 1, 1}));
+        cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {345600, 1, 1, 1}, {1, 4, 1, 1}));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_speech_hotspot_tests(test_cases, false);
+    add_acestep_tests(test_cases, false);
     std::default_random_engine rng(0);
 
     // unary ops
@@ -14059,6 +14175,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_speech_hotspot_tests(test_cases, true);
+    add_acestep_tests(test_cases, true);
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

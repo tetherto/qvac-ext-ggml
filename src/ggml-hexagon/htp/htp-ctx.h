@@ -142,5 +142,8 @@ int op_gated_delta_net(struct htp_ops_context * octx);
 int op_pad(struct htp_ops_context * octx);
 int op_im2col(struct htp_ops_context * octx);
 int op_conv_2d_dw(struct htp_ops_context * octx);
+int op_timestep_embedding(struct htp_ops_context * octx);
+int op_snake(struct htp_ops_context * octx);
+int op_col2im_1d(struct htp_ops_context * octx);
 
 #endif /* HTP_CTX_H */

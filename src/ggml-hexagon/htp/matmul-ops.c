@@ -491,7 +491,7 @@ static void hvx_mv_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void
     if (copy_cnt > 0) {                                                                                                           \
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct_end);                                                                \
         if (src2) {                                                                                                               \
-            hvx_add_f32_uaa((uint8_t *) &dst_col[src0_start_row],                                                                 \
+            hvx_add_f32_uau((uint8_t *) &dst_col[src0_start_row],                                                                 \
                             (const uint8_t *) tmp,                                                                                \
                             (const uint8_t *) ((const float *) mmctx->vtcm_src2 + src0_start_row),                                \
                             copy_cnt);                                                                                            \
@@ -1266,7 +1266,7 @@ static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
     if (copy_cnt > 0) {
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, src0_end_row);
         if (src2) {
-            hvx_add_f32_uaa((uint8_t *) &dst_col[src0_start_row],
+            hvx_add_f32_uau((uint8_t *) &dst_col[src0_start_row],
                             (const uint8_t *) tmp,
                             (const uint8_t *) ((const float *) mmctx->vtcm_src2 + src0_start_row),
                             copy_cnt);
@@ -2610,6 +2610,7 @@ struct activation_transfer_params {
     struct htp_context *          ctx;
     __fp16 *                      dst;
     const float *                 src;
+    const __fp16 *                src_f16;
     int                           n_rows;
     int                           k_block;
     int                           k_stride;
@@ -2621,7 +2622,54 @@ struct activation_transfer_params {
     size_t                        vtcm_f32_act_bytes;
 };
 
+typedef struct {
+    __fp16 *       dst;
+    const __fp16 * src;
+    uint32_t       n_rows;
+    uint32_t       k_block;
+    uint32_t       k_stride;
+    uint32_t       k_valid;
+    uint32_t       n_tasks;
+} activation_f16_transfer_state_t;
+
+// One task per 32-row tile row, so each task writes whole tiles.
+static void transfer_activation_f16_worker_fn(unsigned int n, unsigned int i, void *data) {
+    const activation_f16_transfer_state_t *st = (const activation_f16_transfer_state_t *) data;
+    for (uint32_t task = i; task < st->n_tasks; task += n) {
+        const uint32_t row  = task * HTP_MM_HMX_TILE_N_ROWS;
+        const uint32_t rows = MIN(st->n_rows - row, HTP_MM_HMX_TILE_N_ROWS);
+        transfer_activation_chunk_fp16(st->dst + (size_t) row * st->k_block, st->src + (size_t) row * st->k_stride,
+                                       rows, st->k_block, st->k_stride, st->k_valid);
+    }
+}
+
+static void transfer_activation_chunk_f16_threaded(const struct activation_transfer_params * params) {
+    if (params->n_rows <= 0) {
+        return;
+    }
+    activation_f16_transfer_state_t state = {
+        .dst      = params->dst,
+        .src      = params->src_f16,
+        .n_rows   = (uint32_t) params->n_rows,
+        .k_block  = (uint32_t) params->k_block,
+        .k_stride = (uint32_t) params->k_stride,
+        .k_valid  = (uint32_t) params->k_valid,
+        .n_tasks  = hmx_ceil_div(params->n_rows, HTP_MM_HMX_TILE_N_ROWS),
+    };
+    const int n_threads = hex_smin(params->n_threads, (int) state.n_tasks);
+    if (n_threads <= 1) {
+        transfer_activation_f16_worker_fn(1, 0, &state);
+    } else {
+        worker_pool_run_func(params->ctx->worker_pool, transfer_activation_f16_worker_fn, &state, n_threads);
+    }
+}
+
 static void transfer_activation_chunk_threaded(const struct activation_transfer_params * params) {
+    if (params->src_f16) {
+        transfer_activation_chunk_f16_threaded(params);
+        return;
+    }
+
     struct htp_context *          ctx                = params->ctx;
     __fp16 *                      dst                = params->dst;
     const float *                 src                = params->src;
@@ -2753,6 +2801,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                                   float *restrict dst,
                                   const float *restrict src2,
                                   const float *activation,
+                                  bool activation_f16,
                                   const uint8_t *weight,
                                   int m, int k, int n,
                                   int act_stride,
@@ -2775,7 +2824,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
-    if (k % 32 != 0 || n % 32 != 0) { return -1; }
+    if (k % 32 != 0 || (n % 32 != 0 && weight_type != HTP_TYPE_F16)) { return -1; }
     if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN)) { return -1; }
 
     size_t row_stride = htp_mm_get_tiled_row_stride(weight_type, k);
@@ -2859,7 +2908,8 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
                 .dst = vtcm_f16_act,
-                .src = activation + mr * act_stride,
+                .src = activation_f16 ? NULL : activation + mr * act_stride,
+                .src_f16 = activation_f16 ? (const __fp16 *) activation + mr * act_stride : NULL,
                 .n_rows = (int) n_rows,
                 .k_block = k,
                 .k_stride = act_stride,
@@ -2899,7 +2949,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                 // 2. dequantize A_i
                 dequantize_tiled_weight_chunk_to_fp16_tiles(
                     ctx, vtcm_weight_bufs[i % 2], curr_raw,
-                    n_cols, k, row_stride, weight_type,
+                    hex_align_up(n_cols, HTP_MM_HMX_TILE_N_COLS), k, row_stride, weight_type,
                     n_k_tiles, n_k_tiles_div, dequant_worker_fn, n_threads);
 
                 // 3. push A_{i+2} (if i+2 < n_chunk_cnt)
@@ -2925,7 +2975,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                     const float *src2_chunk = src2 ? (src2 + mr * src2_stride + nc_prev) : NULL;
                     int chunk_dst_cols = dst_cols - (int)nc_prev;
                     if (chunk_dst_cols > 0) {
-                        transfer_output_chunk_threaded(ctx, output_chunk, src2_chunk, vtcm_output_bufs[(i - 1) % 2], n_rows, n_cols_prev, dst_stride, src2_stride, chunk_dst_cols, n_threads);
+                        transfer_output_chunk_threaded(ctx, output_chunk, src2_chunk, vtcm_output_bufs[(i - 1) % 2], n_rows, hex_align_up(n_cols_prev, HTP_MM_HMX_TILE_N_COLS), dst_stride, src2_stride, chunk_dst_cols, n_threads);
                     }
                 }
             }
@@ -2938,7 +2988,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
             const float *src2_chunk = src2 ? (src2 + mr * src2_stride + nc_last) : NULL;
             int chunk_dst_cols = dst_cols - (int)nc_last;
             if (chunk_dst_cols > 0) {
-                transfer_output_chunk_threaded(ctx, output_chunk, src2_chunk, vtcm_output_bufs[(n_chunk_cnt - 1) % 2], n_rows, n_cols_last, dst_stride, src2_stride, chunk_dst_cols, n_threads);
+                transfer_output_chunk_threaded(ctx, output_chunk, src2_chunk, vtcm_output_bufs[(n_chunk_cnt - 1) % 2], n_rows, hex_align_up(n_cols_last, HTP_MM_HMX_TILE_N_COLS), dst_stride, src2_stride, chunk_dst_cols, n_threads);
             }
         }
     } else {
@@ -2950,7 +3000,8 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
             struct activation_transfer_params act_params = {
                 .ctx = ctx,
                 .dst = vtcm_f16_act,
-                .src = activation + mr * act_stride,
+                .src = activation_f16 ? NULL : activation + mr * act_stride,
+                .src_f16 = activation_f16 ? (const __fp16 *) activation + mr * act_stride : NULL,
                 .n_rows = (int) n_rows,
                 .k_block = k,
                 .k_stride = act_stride,
@@ -2981,7 +3032,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                 // B: Weight Dequantize (Threaded)
                 dequantize_tiled_weight_chunk_to_fp16_tiles(
                     ctx, vtcm_scratch0, curr_raw,
-                    n_cols, k, row_stride, weight_type,
+                    hex_align_up(n_cols, HTP_MM_HMX_TILE_N_COLS), k, row_stride, weight_type,
                     n_k_tiles, n_k_tiles_div, dequant_worker_fn, n_threads);
 
                 // Start weight DMA for the next chunk early
@@ -3002,7 +3053,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                 const float *src2_chunk = src2 ? (src2 + mr * src2_stride + nc) : NULL;
                 int chunk_dst_cols = dst_cols - (int)nc;
                 if (chunk_dst_cols > 0) {
-                    transfer_output_chunk_threaded(ctx, output_chunk, src2_chunk, vtcm_output, n_rows, n_cols, dst_stride, src2_stride, chunk_dst_cols, n_threads);
+                    transfer_output_chunk_threaded(ctx, output_chunk, src2_chunk, vtcm_output, n_rows, hex_align_up(n_cols, HTP_MM_HMX_TILE_N_COLS), dst_stride, src2_stride, chunk_dst_cols, n_threads);
                 }
             }
         }
@@ -3058,7 +3109,7 @@ static int hmx_mm_f16_f32_batched_simple(struct htp_context *ctx,
         for (int b2 = 0; b2 < params->ne12 && ret == 0; ++b2) {
             ret = hmx_mm_2d_f32(ctx, hmx_mm_dst_batch_ptr(params, b2, b3),
                                            hmx_mm_src2_batch_ptr(params, b2, b3),
-                                           hmx_mm_activation_batch_ptr(params, b2, b3),
+                                           hmx_mm_activation_batch_ptr(params, b2, b3), false,
                                            (const uint8_t *)hmx_mm_weight_batch_ptr(params, b2, b3),
                                            params->m, params->k, params->n,
                                            params->act_stride, params->weight_stride * (int)sizeof(__fp16),
@@ -3485,7 +3536,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
     int k = (int) src0->ne[0];
     int n = (int) src0->ne[1];
     const int m_total    = (int) src1->ne[1];
-    const int act_stride = (int)(src1->nb[1] / sizeof(float));
+    const int act_stride = (int)(src1->nb[1] / (src1->type == HTP_TYPE_F16 ? sizeof(__fp16) : sizeof(float)));
     const int wgt_stride = (int)(src0->nb[1] / sizeof(__fp16));
 
     const float * src2_ptr = NULL;
@@ -3536,7 +3587,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
                                      kparams->vtcm_size);
     } else {
         ret = hmx_mm_2d_f32(
-            octx->ctx, (float*) dst->data, src2_ptr, (float*) src1->data, (const uint8_t *) src0->data,
+            octx->ctx, (float*) dst->data, src2_ptr, (float*) src1->data, src1->type == HTP_TYPE_F16,
+            (const uint8_t *) src0->data,
             m_total, k, n, act_stride, (int) src0->nb[1], (int) src0->type, (int) src1->ne[0],
             (int)(dst->nb[1] / sizeof(float)), src2_stride, (int)dst->ne[0],
             kparams->m_chunk, kparams->n_chunk, kparams->pipeline, n_threads,
