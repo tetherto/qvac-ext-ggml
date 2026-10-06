@@ -200,12 +200,27 @@ if (NOT GGML_BACKEND_DL OR GGML_CPU_STATIC)
 else()
     set(GGML_CONSUMER_EXPECT_CPU OFF)
 endif()
+function(ggml_collect_module_backends out_var)
+    set(module_backends "")
+    foreach(backend IN LISTS GGML_AVAILABLE_BACKENDS)
+        if (TARGET "${backend}")
+            get_target_property(backend_type "${backend}" TYPE)
+            if (backend_type STREQUAL "MODULE_LIBRARY")
+                list(APPEND module_backends "${backend}")
+            endif()
+        endif()
+    endforeach()
+    string(JOIN "," joined ${module_backends})
+    set(${out_var} "${joined}" PARENT_SCOPE)
+endfunction()
+ggml_collect_module_backends(GGML_CONSUMER_MODULE_BACKENDS)
 add_test(NAME test-package-consumer
     COMMAND ${CMAKE_COMMAND}
         -DGGML_BUILD_DIR=${CMAKE_BINARY_DIR}
         -DGGML_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/package-consumer
         -DGGML_LIB_OUTPUT_PREFIX=${GGML_LIB_OUTPUT_PREFIX}
         -DGGML_CONSUMER_EXPECT_CPU=${GGML_CONSUMER_EXPECT_CPU}
+        -DGGML_CONSUMER_MODULE_BACKENDS=${GGML_CONSUMER_MODULE_BACKENDS}
         -DGGML_CONSUMER_CONFIG=$<CONFIG>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/package-consumer/run.cmake)
 
