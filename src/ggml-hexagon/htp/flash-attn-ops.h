@@ -29,8 +29,38 @@ extern "C" {
 enum htp_fa_kernel_type {
     HTP_FA_KERNEL_UNSUPPORTED = 0,
     HTP_FA_KERNEL_HVX,
-    HTP_FA_KERNEL_HMX
+    HTP_FA_KERNEL_HMX,
+    HTP_FA_KERNEL_HVX_F32
 };
+
+#define HTP_FA_F32_LANES      32
+#define HTP_FA_F32_QUERY_VECS 4
+#define HTP_FA_F32_KEY_TILE   128
+#define HTP_FA_F32_MAX_DIM    256
+
+struct hvx_fa_f32_vtcm_layout {
+    size_t off_qrows;
+    size_t off_qt;
+    size_t off_s;
+    size_t off_ot;
+    size_t off_orow;
+    size_t off_ml;
+    size_t bytes_per_thread;
+    size_t total_bytes;
+};
+
+static inline void hvx_fa_f32_vtcm_layout_build(struct hvx_fa_f32_vtcm_layout * L, size_t DK, size_t DV,
+                                                size_t Bq, size_t Bk, size_t n_threads) {
+    size_t off = 0;
+    VTCM_LAYOUT_ALLOC(off, off_qrows, hex_align_up(Bq * DK * sizeof(float), 128));
+    VTCM_LAYOUT_ALLOC(off, off_qt,    hex_align_up(DK * Bq * sizeof(float), 128));
+    VTCM_LAYOUT_ALLOC(off, off_s,     hex_align_up(Bk * Bq * sizeof(float), 128));
+    VTCM_LAYOUT_ALLOC(off, off_ot,    hex_align_up(DV * Bq * sizeof(float), 128));
+    VTCM_LAYOUT_ALLOC(off, off_orow,  hex_align_up(Bq * DV * sizeof(float), 128));
+    VTCM_LAYOUT_ALLOC(off, off_ml,    (3 * HTP_FA_F32_QUERY_VECS + 1) * 128);
+    L->bytes_per_thread = off;
+    L->total_bytes      = off * n_threads;
+}
 
 struct htp_fa_kernel_params {
     uint8_t  kernel_type;        // enum htp_fa_kernel_type

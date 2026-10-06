@@ -731,6 +731,11 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_EXP:
         case HTP_OP_UNARY_TANH:
         case HTP_OP_UNARY_RELU:
+        case HTP_OP_UNARY_ELU:
+        case HTP_OP_UNARY_ABS:
+        case HTP_OP_LEAKY_RELU:
+        case HTP_OP_SIN:
+        case HTP_OP_COS:
         case HTP_OP_L2_NORM:
             return op_unary(octx);
 
@@ -798,6 +803,9 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_COL2IM_1D:
             return op_col2im_1d(octx);
+
+        case HTP_OP_UPSCALE:
+            return op_upscale(octx);
 
         case HTP_OP_DEPTHWISE_CONV_1D:
             return op_depthwise_conv_1d(octx);

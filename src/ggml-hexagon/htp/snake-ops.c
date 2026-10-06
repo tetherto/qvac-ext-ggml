@@ -39,7 +39,11 @@ static void snake_row(float * restrict y, const float * restrict x, uint32_t n, 
 }
 
 static inline float snake_channel_param(const struct htp_tensor * p, uint32_t c) {
-    return *(const float *) ((const uint8_t *) p->data + c * p->nb[1]);
+    return ((const float *) p->data)[c];
+}
+
+static inline bool snake_channel_params_valid(const struct htp_tensor * p, uint32_t channels) {
+    return p->nb[0] == sizeof(float) && p->ne[0] * p->ne[1] * p->ne[2] * p->ne[3] == channels;
 }
 
 static void snake_thread(unsigned int nth, unsigned int ith, void * data) {
@@ -73,7 +77,8 @@ int op_snake(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
     if (x->nb[0] != sizeof(float) || y->nb[0] != sizeof(float) || x->ne[2] != 1 || x->ne[3] != 1 ||
-        y->ne[0] != x->ne[0] || y->ne[1] != x->ne[1] || alpha->ne[1] != x->ne[1] || inv_beta->ne[1] != x->ne[1]) {
+        y->ne[0] != x->ne[0] || y->ne[1] != x->ne[1] || !snake_channel_params_valid(alpha, x->ne[1]) ||
+        !snake_channel_params_valid(inv_beta, x->ne[1])) {
         return HTP_STATUS_INVAL_PARAMS;
     }
 

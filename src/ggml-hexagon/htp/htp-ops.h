@@ -110,6 +110,12 @@ enum htp_op_code {
     HTP_OP_UNARY_GELU_ERF,
     HTP_OP_DEPTHWISE_CONV_1D,
     HTP_OP_UNARY_GELU_QUICK,
+    HTP_OP_UNARY_ELU,
+    HTP_OP_UNARY_ABS,
+    HTP_OP_LEAKY_RELU,
+    HTP_OP_SIN,
+    HTP_OP_COS,
+    HTP_OP_UPSCALE,
 
     HTP_OP_INVALID
 };
@@ -126,6 +132,9 @@ enum htp_op_code {
 #define HTP_OP_MAX_VMEM_DEFAULT (3355443200u)
 
 #define HTP_MMAP_MAX_VMEM  (2147483648u)
+
+#define HTP_UPSCALE_MAX_FACTOR   32
+#define HTP_UPSCALE_MODE_NEAREST 0      // aka GGML_SCALE_MODE_NEAREST
 
 enum htp_tensor_flags {
     HTP_TENSOR_COMPUTE = (1U << 0), // Tensor buffer temporal compute data (not weights)

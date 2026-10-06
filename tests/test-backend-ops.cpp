@@ -11794,6 +11794,173 @@ static void add_parler_tests(std::vector<std::unique_ptr<test_case>> & cases, bo
     add_parler_f32_prec_add_tests(cases, HTP_UNFUSED_MATMUL_ROWS);
 }
 
+// GGML_OP_SNAKE with one-dimensional per-channel parameters, the layout the
+// CosyVoice3 vocoder keeps its alphas in.
+struct test_snake_channel_vector : public test_case {
+    const int64_t t;
+    const int64_t c;
+
+    std::string vars() override {
+        return VARS_TO_STR2(t, c);
+    }
+
+    test_snake_channel_vector(int64_t t, int64_t c) : t(t), c(c) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, t, c);
+        ggml_tensor * a     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c);
+        ggml_tensor * inv_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c);
+        ggml_set_name(x, "x");
+        return ggml_snake(ctx, x, a, inv_b);
+    }
+};
+
+// A 2D weight times batched activations plus a bias row, as a DiT linear layer
+// runs its classifier-free-guidance batch: the batch rows form one run, so a
+// backend may treat the product as one 2D matmul and fuse the bias into it.
+struct test_mul_mat_bias_batched : public test_case {
+    const ggml_type type_a;
+    const int64_t   m;
+    const int64_t   n;
+    const int64_t   k;
+    const int64_t   batch;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, n, k, batch);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mul_mat_bias_batched(ggml_type type_a, int64_t m, int64_t n, int64_t k, int64_t batch)
+        : type_a(type_a), m(m), n(n), k(k), batch(batch) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, batch);
+        ggml_set_name(x, "x");
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, w, x), bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_PREC_F32 flash attention over attention-sink logits: dimension 0 of
+// every query and key is large, so every logit sits near 1e5 while the keys
+// differ by a few units. An F16 logit tile overflows or rounds these to ties.
+struct test_flash_attn_ext_sink_logits : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t batch;
+    const float   massive;
+    const float   jitter;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, kv, nb, batch, massive, jitter);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_flash_attn_ext_sink_logits(int64_t hs, int64_t nh, int64_t kv, int64_t nb, int64_t batch, float massive,
+                                    float jitter)
+        : hs(hs), nh(nh), kv(kv), nb(nb), batch(batch), massive(massive), jitter(jitter) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, batch);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, kv, nh, batch);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, kv, nh, batch);
+        ggml_set_name(v, "v");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f / sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void set_massive_dimension(ggml_tensor * t, float spread) {
+        std::vector<float> data(ggml_nelements(t));
+        ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+        std::mt19937 rng(0x5eed);
+        std::uniform_real_distribution<float> dist(-spread, spread);
+        for (size_t i = 0; i < data.size(); i += (size_t) hs) {
+            data[i] = massive + dist(rng);
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+            if (strcmp(t->name, "q") == 0) {
+                set_massive_dimension(t, 0.0f);
+            } else if (strcmp(t->name, "k") == 0) {
+                set_massive_dimension(t, jitter);
+            }
+        }
+    }
+};
+
+static void add_cosyvoice_upscale_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    const std::array<int64_t, 4> shapes[][2] = {
+        { { 100, 64, 1, 1 }, {   800, 64, 1, 1 } },
+        { {  64, 32, 1, 1 }, {   320, 32, 1, 1 } },
+        { { 400, 16, 1, 1 }, {  1200, 16, 1, 1 } },
+        { { 3000, 2, 1, 1 }, { 15000,  2, 1, 1 } },
+    };
+    for (const auto & shape : shapes) {
+        cases.emplace_back(new test_interpolate(GGML_TYPE_F32, shape[0], shape[1], GGML_SCALE_MODE_NEAREST));
+    }
+}
+
+static void add_cosyvoice_activation_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 800, 512, 1, 1 }, 0.1f));
+    cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 96001, 2, 1, 1 }, 0.01f));
+    cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_ELU, { 800, 64, 1, 1 }, 4.0f));
+    cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_SOFTPLUS, { 940, 64, 2, 1 }, 30.0f));
+    cases.emplace_back(new test_sin(GGML_TYPE_F32, { 4001, 9, 1, 1 }));
+    cases.emplace_back(new test_cos(GGML_TYPE_F32, { 4001, 9, 1, 1 }));
+    cases.emplace_back(new test_snake_channel_vector(6400, 256));
+    cases.emplace_back(new test_snake_channel_vector(37, 3));
+}
+
+static void add_cosyvoice_matmul_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, 288, 1024, { 1, 1 }, { 2, 1 }));
+        cases.emplace_back(new test_mul_mat_bias_batched(type, 1024, 288, 1024, 2));
+        cases.emplace_back(new test_mul_mat_bias_batched(type, 80, 97, 1024, 2));
+    }
+    cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 896, 324, 4864, { 1, 1 }, { 1, 1 },
+                                        { 0, 1, 2, 3 }, 0, true, true));
+}
+
+static void add_cosyvoice_attention_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    cases.emplace_back(new test_rope(GGML_TYPE_F32, { 1024, 1, 288, 2 }, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f, 0.0f,
+                                     1.0f, false, 1));
+    cases.emplace_back(new test_col2im_1d(GGML_TYPE_F32, 16, 1, 2001, 4, 0));
+    cases.emplace_back(new test_flash_attn_ext_sink_logits(64, 4, 288, 288, 2, 900.0f, 0.05f));
+    cases.emplace_back(new test_flash_attn_ext_sink_logits(64, 2, 113, 75, 1, 900.0f, 0.05f));
+    cases.emplace_back(new test_flash_attn_ext_sink_logits(128, 2, 300, 130, 2, 400.0f, 0.1f));
+}
+
+static void add_cosyvoice_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        cases.emplace_back(new test_flash_attn_ext_sink_logits(64, 16, 940, 940, 2, 900.0f, 0.05f));
+        cases.emplace_back(new test_mul_mat_bias_batched(GGML_TYPE_Q8_0, 3072, 940, 1024, 2));
+        return;
+    }
+    add_cosyvoice_upscale_tests(cases);
+    add_cosyvoice_activation_tests(cases);
+    add_cosyvoice_matmul_tests(cases);
+    add_cosyvoice_attention_tests(cases);
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_speech_hotspot_tests(test_cases, false);
@@ -11801,6 +11968,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_supertonic_tests(test_cases, false);
     add_large_stride_tests(test_cases);
     add_parler_tests(test_cases, false);
+    add_cosyvoice_tests(test_cases, false);
     std::default_random_engine rng(0);
 
     // unary ops
@@ -14544,6 +14712,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_acestep_tests(test_cases, true);
     add_supertonic_tests(test_cases, true);
     add_parler_tests(test_cases, true);
+    add_cosyvoice_tests(test_cases, true);
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

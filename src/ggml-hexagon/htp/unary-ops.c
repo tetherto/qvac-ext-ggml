@@ -13,7 +13,9 @@
 #include "hvx-erf.h"
 #include "hvx-tanh.h"
 #include "hvx-exp.h"
+#include "hvx-log.h"
 #include "hvx-sigmoid.h"
+#include "hvx-sin-cos.h"
 #include "hvx-utils.h"
 #include "unary-ops.h"
 
@@ -429,25 +431,6 @@ static void tri_f32(const float * restrict src,
     }
 }
 
-static void softplus_f32(const float * restrict src,
-                         float * restrict dst,
-                         const uint32_t num_rows,
-                         const struct htp_unary_context * uctx) {
-    htp_unary_op_preamble;
-    // softplus(x) = log(1 + exp(x))
-    // Match CPU reference: ggml_compute_softplus_f32() in ggml-impl.h
-    for (uint32_t ir = 0; ir < num_rows; ir++) {
-        const float * restrict src_f = (const float *)((const uint8_t *)src + (ir * src0_row_size_aligned));
-        float * restrict dst_f       = (float *)((uint8_t *)dst + (ir * dst_row_size_aligned));
-
-        for (uint32_t i = 0; i < ne0; i++) {
-            float x = src_f[i];
-            // For x > 20: softplus(x) ≈ x (avoids exp overflow)
-            dst_f[i] = (x > 20.0f) ? x : logf(1.0f + expf(x));
-        }
-    }
-}
-
 static void l2_norm_f32(const float * restrict src,
                         float * restrict dst,
                         const uint32_t num_rows,
@@ -517,6 +500,94 @@ static void relu_f32(const float * restrict src,
         uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
 
         hvx_relu_f32_aa(dst_local, src_local, ne0);
+    }
+}
+
+static const float SOFTPLUS_LINEAR_FROM = 20.0f;
+
+static inline HVX_Vector hvx_vec_softplus_f32(HVX_Vector x) {
+    const HVX_Vector log1p_exp = hvx_vec_log_f32(hvx_vec_add_f32_f32(hvx_vec_splat_f32(1.0f), hvx_vec_exp_f32(x)));
+    return Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(x, hvx_vec_splat_f32(SOFTPLUS_LINEAR_FROM)), x, log1p_exp);
+}
+
+static inline HVX_Vector hvx_vec_elu_f32(HVX_Vector x) {
+    const HVX_VectorPred positive = Q6_Q_vcmp_gt_VsfVsf(x, Q6_V_vzero());
+    const HVX_Vector     expm1    = hvx_vec_sub_f32_f32(hvx_vec_exp_f32(x), hvx_vec_splat_f32(1.0f));
+    return Q6_V_vmux_QVV(positive, x, expm1);
+}
+
+#define DEFINE_HVX_MAP_F32_AA(NAME, VEC_FN)                                                        \
+static inline void hvx_##NAME##_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src,      \
+                                       uint32_t n) {                                              \
+    const HVX_Vector * restrict vsrc = (const HVX_Vector *) src;                                  \
+    HVX_Vector * restrict       vdst = (HVX_Vector *) dst;                                        \
+    const uint32_t              nvec = n / VLEN_FP32;                                             \
+    const uint32_t              nloe = n % VLEN_FP32;                                             \
+    uint32_t                    i    = 0;                                                         \
+    for (; i < nvec; i++) {                                                                       \
+        vdst[i] = VEC_FN(vsrc[i]);                                                                \
+    }                                                                                             \
+    if (nloe) {                                                                                   \
+        hvx_vec_store_a((void *) &vdst[i], nloe * SIZEOF_FP32, VEC_FN(vsrc[i]));                  \
+    }                                                                                             \
+}
+
+DEFINE_HVX_MAP_F32_AA(softplus, hvx_vec_softplus_f32)
+DEFINE_HVX_MAP_F32_AA(elu, hvx_vec_elu_f32)
+DEFINE_HVX_MAP_F32_AA(abs, hvx_vec_abs_f32)
+DEFINE_HVX_MAP_F32_AA(sin, hvx_vec_sin_f32)
+DEFINE_HVX_MAP_F32_AA(cos, hvx_vec_cos_f32)
+
+static inline float leaky_relu_slope(const int32_t * op_params) {
+    float slope = 0.f;
+    memcpy(&slope, &op_params[0], sizeof(float));
+    return slope;
+}
+
+static inline HVX_Vector hvx_vec_leaky_relu_f32(HVX_Vector x, HVX_Vector slope) {
+    return Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(x, Q6_V_vzero()), x, hvx_vec_mul_f32_f32(x, slope));
+}
+
+static inline void hvx_leaky_relu_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n,
+                                         float slope) {
+    const HVX_Vector * restrict vsrc   = (const HVX_Vector *) src;
+    HVX_Vector * restrict       vdst   = (HVX_Vector *) dst;
+    const HVX_Vector            vslope = hvx_vec_splat_f32(slope);
+    const uint32_t              nvec   = n / VLEN_FP32;
+    const uint32_t              nloe   = n % VLEN_FP32;
+    uint32_t                    i      = 0;
+    for (; i < nvec; i++) {
+        vdst[i] = hvx_vec_leaky_relu_f32(vsrc[i], vslope);
+    }
+    if (nloe) {
+        hvx_vec_store_a((void *) &vdst[i], nloe * SIZEOF_FP32, hvx_vec_leaky_relu_f32(vsrc[i], vslope));
+    }
+}
+
+typedef void (*hvx_map_f32_aa_fn)(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n);
+
+static void map_rows_f32(const float * restrict src,
+                         float * restrict dst,
+                         const uint32_t num_rows,
+                         const struct htp_unary_context * uctx,
+                         hvx_map_f32_aa_fn fn) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        fn((uint8_t *) dst + (ir * dst_row_size_aligned), (const uint8_t *) src + (ir * src0_row_size_aligned), ne0);
+    }
+}
+
+static void leaky_relu_f32(const float * restrict src,
+                           float * restrict dst,
+                           const uint32_t num_rows,
+                           const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+    const float slope = leaky_relu_slope(op_params);
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        hvx_leaky_relu_f32_aa((uint8_t *) dst + (ir * dst_row_size_aligned),
+                              (const uint8_t *) src + (ir * src0_row_size_aligned), ne0, slope);
     }
 }
 
@@ -680,9 +751,14 @@ DEFINE_UNARY_TASK(unary_silu,     false, false, silu_f32(src0_vtcm, dst_vtcm, bl
 DEFINE_UNARY_TASK(unary_gelu,     false, false, gelu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_gelu_quick, false, false, gelu_quick_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_gelu_erf, false, false, gelu_erf_f32(src0_vtcm, dst_vtcm, block_size, uctx))
-DEFINE_UNARY_TASK(unary_softplus, false, false, softplus_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+DEFINE_UNARY_TASK(unary_softplus, false, false, map_rows_f32(src0_vtcm, dst_vtcm, block_size, uctx, hvx_softplus_f32_aa))
 DEFINE_UNARY_TASK(unary_tanh,     false, false, tanh_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_relu,     false, false, relu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+DEFINE_UNARY_TASK(unary_elu,      false, false, map_rows_f32(src0_vtcm, dst_vtcm, block_size, uctx, hvx_elu_f32_aa))
+DEFINE_UNARY_TASK(unary_abs,      false, false, map_rows_f32(src0_vtcm, dst_vtcm, block_size, uctx, hvx_abs_f32_aa))
+DEFINE_UNARY_TASK(sin,            false, false, map_rows_f32(src0_vtcm, dst_vtcm, block_size, uctx, hvx_sin_f32_aa))
+DEFINE_UNARY_TASK(cos,            false, false, map_rows_f32(src0_vtcm, dst_vtcm, block_size, uctx, hvx_cos_f32_aa))
+DEFINE_UNARY_TASK(leaky_relu,     false, false, leaky_relu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(l2_norm,        false, false, l2_norm_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(tri,            false, true,  tri_f32(src0_vtcm, dst_vtcm, block_size, ir, uctx))
 
@@ -823,15 +899,6 @@ static inline void tile_clamp_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, 
     hvx_clamp_scalar_f32(dst_vtcm, src_vtcm, min, max, tw);
 }
 
-static inline void tile_unary_softplus_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
-    const float * restrict sf = (const float *) src_vtcm;
-    float * restrict df       = (float *) dst_vtcm;
-    for (uint32_t i = 0; i < tw; i++) {
-        float x = sf[i];
-        df[i] = (x > 20.0f) ? x : logf(1.0f + expf(x));
-    }
-}
-
 // silu(x) = x * sigmoid(x)
 static inline void tile_silu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
     hvx_sigmoid_f32_aa(dst_vtcm, src_vtcm, tw);
@@ -927,9 +994,14 @@ DEFINE_UNARY_TILED_TASK(unary_silu,     false, tile_silu_f32(dst_vtcm, src_vtcm,
 DEFINE_UNARY_TILED_TASK(unary_gelu,     false, tile_gelu_f32(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_gelu_quick, false, hvx_gelu_quick_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_gelu_erf, false, hvx_gelu_erf_f32_aa(dst_vtcm, src_vtcm, tw))
-DEFINE_UNARY_TILED_TASK(unary_softplus, false, tile_unary_softplus_f32(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(unary_softplus, false, hvx_softplus_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_tanh,     false, hvx_tanh_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_relu,     false, hvx_relu_f32_aa(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(unary_elu,      false, hvx_elu_f32_aa(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(unary_abs,      false, hvx_abs_f32_aa(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(sin,            false, hvx_sin_f32_aa(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(cos,            false, hvx_cos_f32_aa(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(leaky_relu,     false, hvx_leaky_relu_f32_aa(dst_vtcm, src_vtcm, tw, leaky_relu_slope(op_params)))
 DEFINE_UNARY_TILED_TASK(tri,            true,  tri_apply_tile_f32(src_vtcm, dst_vtcm, tw, col, i01, ne0, tri_ttype))
 
 static int execute_op_unary_f32(struct htp_ops_context * octx) {
@@ -958,6 +1030,11 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_SOFTPLUS:  op_type = "softplus-f32";     break;
         case HTP_OP_UNARY_TANH:      op_type = "tanh-f32";         break;
         case HTP_OP_UNARY_RELU:      op_type = "relu-f32";         break;
+        case HTP_OP_UNARY_ELU:       op_type = "elu-f32";          break;
+        case HTP_OP_UNARY_ABS:       op_type = "abs-f32";          break;
+        case HTP_OP_SIN:             op_type = "sin-f32";          break;
+        case HTP_OP_COS:             op_type = "cos-f32";          break;
+        case HTP_OP_LEAKY_RELU:      op_type = "leaky-relu-f32";   break;
         case HTP_OP_L2_NORM:         op_type = "l2norm-f32";       break;
         case HTP_OP_TRI:             op_type = "tri-f32";          break;
 
@@ -1059,6 +1136,11 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_tiled_unary_softplus; break;
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
                 case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_tiled_unary_relu;     break;
+                case HTP_OP_UNARY_ELU:       task_func = unary_task_f32_tiled_unary_elu;      break;
+                case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_tiled_unary_abs;      break;
+                case HTP_OP_SIN:             task_func = unary_task_f32_tiled_sin;            break;
+                case HTP_OP_COS:             task_func = unary_task_f32_tiled_cos;            break;
+                case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_tiled_leaky_relu;     break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tiled_tri;            break;
                 default:                     break;
             }
@@ -1081,6 +1163,11 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_unary_softplus;       break;
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_unary_tanh;           break;
                 case HTP_OP_UNARY_RELU:      task_func = unary_task_f32_unary_relu;           break;
+                case HTP_OP_UNARY_ELU:       task_func = unary_task_f32_unary_elu;            break;
+                case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_unary_abs;            break;
+                case HTP_OP_SIN:             task_func = unary_task_f32_sin;                  break;
+                case HTP_OP_COS:             task_func = unary_task_f32_cos;                  break;
+                case HTP_OP_LEAKY_RELU:      task_func = unary_task_f32_leaky_relu;           break;
                 case HTP_OP_L2_NORM:         task_func = unary_task_f32_l2_norm;              break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tri;                  break;
                 default:                     break;
