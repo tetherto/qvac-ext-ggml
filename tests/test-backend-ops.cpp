@@ -11815,6 +11815,34 @@ struct test_snake_channel_vector : public test_case {
     }
 };
 
+// GGML_OP_SIN and GGML_OP_COS over arguments far beyond [-2pi, 2pi], where a
+// single-step F32 range reduction by pi loses the phase.
+struct test_sin_cos_range : public test_case {
+    const bool    use_cos;
+    const int64_t n;
+    const float   range;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, range);
+    }
+
+    test_sin_cos_range(bool use_cos, int64_t n, float range) : use_cos(use_cos), n(n), range(range) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(a, "a");
+        ggml_tensor * out = use_cos ? ggml_cos(ctx, a) : ggml_sin(ctx, a);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -range, range);
+        }
+    }
+};
+
 // A 2D weight times batched activations plus a bias row, as a DiT linear layer
 // runs its classifier-free-guidance batch: the batch rows form one run, so a
 // backend may treat the product as one 2D matmul and fuse the bias into it.
@@ -11926,6 +11954,11 @@ static void add_cosyvoice_activation_tests(std::vector<std::unique_ptr<test_case
     cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_SOFTPLUS, { 940, 64, 2, 1 }, 30.0f));
     cases.emplace_back(new test_sin(GGML_TYPE_F32, { 4001, 9, 1, 1 }));
     cases.emplace_back(new test_cos(GGML_TYPE_F32, { 4001, 9, 1, 1 }));
+    for (bool use_cos : { false, true }) {
+        for (float range : { 1e3f, 1e5f, 1e8f }) {
+            cases.emplace_back(new test_sin_cos_range(use_cos, 4001, range));
+        }
+    }
     cases.emplace_back(new test_snake_channel_vector(6400, 256));
     cases.emplace_back(new test_snake_channel_vector(37, 3));
 }

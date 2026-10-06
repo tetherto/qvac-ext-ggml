@@ -532,11 +532,39 @@ static inline void hvx_##NAME##_f32_aa(uint8_t * restrict dst, const uint8_t * r
     }                                                                                             \
 }
 
+// The vector sin/cos reduce by pi in one F32 step, accurate to about 1e-4 up
+// to this magnitude; vectors with a lane beyond it (or a non-finite lane) go
+// through libm.
+static const float SIN_COS_VECTOR_LIMIT = 1024.0f;
+
+static HVX_Vector hvx_vec_map_scalar_f32(HVX_Vector x, float (*fn)(float)) {
+    float lanes[VLEN_FP32] __attribute__((aligned(VLEN)));
+    *(HVX_Vector *) lanes = x;
+    for (uint32_t i = 0; i < VLEN_FP32; i++) {
+        lanes[i] = fn(lanes[i]);
+    }
+    return *(const HVX_Vector *) lanes;
+}
+
+static inline bool hvx_vec_any_beyond_f32(HVX_Vector x, float limit) {
+    const HVX_VectorPred within  = Q6_Q_vcmp_gt_VsfVsf(hvx_vec_splat_f32(limit), hvx_vec_abs_f32(x));
+    const HVX_Vector     outside = Q6_V_vmux_QVV(within, Q6_V_vzero(), Q6_V_vsplat_R(1));
+    return hvx_vec_get_i32(hvx_vec_reduce_sum_i32(outside)) != 0;
+}
+
+static inline HVX_Vector hvx_vec_sin_any_f32(HVX_Vector x) {
+    return hvx_vec_any_beyond_f32(x, SIN_COS_VECTOR_LIMIT) ? hvx_vec_map_scalar_f32(x, sinf) : hvx_vec_sin_f32(x);
+}
+
+static inline HVX_Vector hvx_vec_cos_any_f32(HVX_Vector x) {
+    return hvx_vec_any_beyond_f32(x, SIN_COS_VECTOR_LIMIT) ? hvx_vec_map_scalar_f32(x, cosf) : hvx_vec_cos_f32(x);
+}
+
 DEFINE_HVX_MAP_F32_AA(softplus, hvx_vec_softplus_f32)
 DEFINE_HVX_MAP_F32_AA(elu, hvx_vec_elu_f32)
 DEFINE_HVX_MAP_F32_AA(abs, hvx_vec_abs_f32)
-DEFINE_HVX_MAP_F32_AA(sin, hvx_vec_sin_f32)
-DEFINE_HVX_MAP_F32_AA(cos, hvx_vec_cos_f32)
+DEFINE_HVX_MAP_F32_AA(sin, hvx_vec_sin_any_f32)
+DEFINE_HVX_MAP_F32_AA(cos, hvx_vec_cos_any_f32)
 
 static inline float leaky_relu_slope(const int32_t * op_params) {
     float slope = 0.f;
