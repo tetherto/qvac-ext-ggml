@@ -145,6 +145,8 @@ int op_conv_2d_dw(struct htp_ops_context * octx);
 int op_timestep_embedding(struct htp_ops_context * octx);
 int op_snake(struct htp_ops_context * octx);
 int op_col2im_1d(struct htp_ops_context * octx);
+int op_upscale(struct htp_ops_context * octx);
+int op_flash_attn_ext_f32(struct htp_ops_context * octx);
 int op_depthwise_conv_1d(struct htp_ops_context * octx);
 
 // Transposes a batch of row-major F32 matrices: dst row c, column r takes
