@@ -237,16 +237,14 @@ static void binary_job_scalar(unsigned int nth, unsigned int ith, void * data) {
         // src1 indices (broadcast/repeat)
         uint32_t i13 = fastmodulo(i03, ne13, &bctx->src1_dim3_div);
         uint32_t i12 = fastmodulo(i02, ne12, &bctx->src1_dim2_div);
-        uint32_t i11 = fastmodulo(i01, ne11, &bctx->src1_dim1_div);
-
-        uint8_t * src1_ptr = (uint8_t *)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11;
-        uint32_t s1_stride = (ne11 == 1) ? 0 : nb11;
+        uint8_t * src1_plane = (uint8_t *)src1->data + i13 * nb13 + i12 * nb12;
 
         for (uint32_t r = 0; r < current_block_size; r++) {
+            uint32_t i11 = fastmodulo(i01 + r, ne11, &bctx->src1_dim1_div);
+            uint8_t * r_src1 = src1_plane + i11 * nb11;
             uint8_t * r_src0 = s0_spad + r * bctx->src0_row_size_aligned;
             uint8_t * r_dst  = d_spad + r * bctx->dst_row_size_aligned;
-            COMPUTE_SCALAR_OP(r_dst, r_src0, src1_ptr, src0_type, ne00);
-            src1_ptr += s1_stride;
+            COMPUTE_SCALAR_OP(r_dst, r_src0, r_src1, src0_type, ne00);
         }
 
         uint8_t * dst_curr = (uint8_t *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1;

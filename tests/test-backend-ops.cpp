@@ -11949,6 +11949,18 @@ static void add_cosyvoice_attention_tests(std::vector<std::unique_ptr<test_case>
     cases.emplace_back(new test_flash_attn_ext_sink_logits(128, 2, 300, 130, 2, 400.0f, 0.1f));
 }
 
+// A per-row scalar src1 (ne10 == 1) that varies along dim 1 while the src0
+// rows run on into the next dim-3 plane, or repeat src1 only partially.
+static void add_scalar_bcast_row_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (auto op : { ggml_add, ggml_sub, ggml_mul, ggml_div }) {
+            cases.emplace_back(new test_bin_bcast(op, type, { 1, 32, 1, 1 }, { 64, 1, 1, 2 }));
+            cases.emplace_back(new test_bin_bcast(op, type, { 1, 16, 1, 1 }, { 64, 2, 1, 2 }));
+            cases.emplace_back(new test_bin_bcast(op, type, { 1, 7, 1, 1 }, { 33, 5, 1, 3 }));
+        }
+    }
+}
+
 static void add_cosyvoice_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     if (perf) {
         cases.emplace_back(new test_flash_attn_ext_sink_logits(64, 16, 940, 940, 2, 900.0f, 0.05f));
@@ -11969,6 +11981,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_large_stride_tests(test_cases);
     add_parler_tests(test_cases, false);
     add_cosyvoice_tests(test_cases, false);
+    add_scalar_bcast_row_tests(test_cases);
     std::default_random_engine rng(0);
 
     // unary ops
