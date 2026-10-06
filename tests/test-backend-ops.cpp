@@ -11759,18 +11759,39 @@ struct test_mul_mat_f32_prec_add : public test_case {
     }
 };
 
+static constexpr int64_t PARLER_T5_D_MODEL          = 1024;
+static constexpr int64_t PARLER_T5_D_FF             = 2816;
+static constexpr float   PARLER_GELU_RANGE          = 4.0f;
+static constexpr float   PARLER_T5_ACTIVATION_RANGE = 1.0e5f;
+static constexpr int64_t HTP_UNARY_TILED_ROW        = int64_t(1) << 17;
+static constexpr int64_t HTP_FUSED_MATVEC_ROWS      = 1;
+static constexpr int64_t HTP_UNFUSED_MATMUL_ROWS    = 42;
+
+static void add_parler_narrow_unary_tests(std::vector<std::unique_ptr<test_case>> & cases, ggml_unary_op op) {
+    const std::array<int64_t, 4> shapes[] = {
+        {PARLER_T5_D_FF, 42, 1, 1}, {PARLER_T5_D_FF, 30, 1, 1}, {37, 3, 1, 1}, {HTP_UNARY_TILED_ROW, 6, 1, 1},
+    };
+    for (const auto & ne : shapes) {
+        cases.emplace_back(new test_unary_narrow(op, ne, PARLER_GELU_RANGE));
+    }
+}
+
+static void add_parler_f32_prec_add_tests(std::vector<std::unique_ptr<test_case>> & cases, int64_t n) {
+    for (int64_t k : { PARLER_T5_D_MODEL, PARLER_T5_D_FF }) {
+        cases.emplace_back(new test_mul_mat_f32_prec_add(PARLER_T5_D_MODEL, n, k, PARLER_T5_ACTIVATION_RANGE));
+    }
+}
+
 static void add_parler_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     if (perf) {
-        cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_GELU, {2816, 42, 1, 1}, 4.0f));
+        cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_GELU, {PARLER_T5_D_FF, 42, 1, 1}, PARLER_GELU_RANGE));
         return;
     }
-    const std::array<int64_t, 4> gelu_shapes[] = { {2816, 42, 1, 1}, {2816, 30, 1, 1}, {37, 3, 1, 1} };
-    for (const auto & ne : gelu_shapes) {
-        cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_GELU, ne, 4.0f));
-    }
-    cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_GELU_ERF, {128, 32, 1, 1}, 4.0f));
-    cases.emplace_back(new test_mul_mat_f32_prec_add(1024, 42, 1024, 1.0e5f));
-    cases.emplace_back(new test_mul_mat_f32_prec_add(1024, 42, 2816, 1.0e5f));
+    add_parler_narrow_unary_tests(cases, GGML_UNARY_OP_GELU);
+    add_parler_narrow_unary_tests(cases, GGML_UNARY_OP_GELU_QUICK);
+    cases.emplace_back(new test_unary_narrow(GGML_UNARY_OP_GELU_ERF, {128, 32, 1, 1}, PARLER_GELU_RANGE));
+    add_parler_f32_prec_add_tests(cases, HTP_FUSED_MATVEC_ROWS);
+    add_parler_f32_prec_add_tests(cases, HTP_UNFUSED_MATMUL_ROWS);
 }
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {

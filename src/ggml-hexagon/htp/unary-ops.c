@@ -308,6 +308,28 @@ static void gelu_f32(const float * restrict src,
     }
 }
 
+static const float GELU_QUICK_SCALE = 1.702f;
+
+static inline void hvx_gelu_quick_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+    hvx_mul_scalar_f32(dst, src, GELU_QUICK_SCALE, n);
+    hvx_sigmoid_f32_aa(dst, dst, n);
+    hvx_mul_f32_aaa(dst, src, dst, n);
+}
+
+static void gelu_quick_f32(const float * restrict src,
+                           float * restrict dst,
+                           const uint32_t num_rows,
+                           const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+        uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+        hvx_gelu_quick_f32_aa(dst_local, src_local, ne0);
+    }
+}
+
 static void gelu_erf_f32(const float * restrict src,
                          float * restrict dst,
                          const uint32_t num_rows,
@@ -656,6 +678,7 @@ DEFINE_UNARY_TASK(unary_exp,      false, false, exp_f32(src0_vtcm, dst_vtcm, blo
 DEFINE_UNARY_TASK(unary_sigmoid,  false, false, sigmoid_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_silu,     false, false, silu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_gelu,     false, false, gelu_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+DEFINE_UNARY_TASK(unary_gelu_quick, false, false, gelu_quick_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_gelu_erf, false, false, gelu_erf_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_softplus, false, false, softplus_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_tanh,     false, false, tanh_f32(src0_vtcm, dst_vtcm, block_size, uctx))
@@ -902,6 +925,7 @@ DEFINE_UNARY_TILED_TASK(unary_exp,      false, hvx_exp_f32(dst_vtcm, src_vtcm, t
 DEFINE_UNARY_TILED_TASK(unary_sigmoid,  false, hvx_sigmoid_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_silu,     false, tile_silu_f32(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_gelu,     false, tile_gelu_f32(dst_vtcm, src_vtcm, tw))
+DEFINE_UNARY_TILED_TASK(unary_gelu_quick, false, hvx_gelu_quick_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_gelu_erf, false, hvx_gelu_erf_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_softplus, false, tile_unary_softplus_f32(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_tanh,     false, hvx_tanh_f32_aa(dst_vtcm, src_vtcm, tw))
@@ -929,6 +953,7 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_SIGMOID:   op_type = "sigmoid-f32";      break;
         case HTP_OP_UNARY_SILU:      op_type = "silu-f32";         break;
         case HTP_OP_UNARY_GELU:      op_type = "gelu-f32";         break;
+        case HTP_OP_UNARY_GELU_QUICK: op_type = "gelu-quick-f32";  break;
         case HTP_OP_UNARY_GELU_ERF:  op_type = "gelu-erf-f32";     break;
         case HTP_OP_UNARY_SOFTPLUS:  op_type = "softplus-f32";     break;
         case HTP_OP_UNARY_TANH:      op_type = "tanh-f32";         break;
@@ -1029,6 +1054,7 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_tiled_unary_sigmoid;  break;
                 case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_tiled_unary_silu;     break;
                 case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_tiled_unary_gelu;     break;
+                case HTP_OP_UNARY_GELU_QUICK: task_func = unary_task_f32_tiled_unary_gelu_quick; break;
                 case HTP_OP_UNARY_GELU_ERF:  task_func = unary_task_f32_tiled_unary_gelu_erf; break;
                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_tiled_unary_softplus; break;
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
@@ -1050,6 +1076,7 @@ static int execute_op_unary_f32(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_SIGMOID:   task_func = unary_task_f32_unary_sigmoid;        break;
                 case HTP_OP_UNARY_SILU:      task_func = unary_task_f32_unary_silu;           break;
                 case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_unary_gelu;           break;
+                case HTP_OP_UNARY_GELU_QUICK: task_func = unary_task_f32_unary_gelu_quick;    break;
                 case HTP_OP_UNARY_GELU_ERF:  task_func = unary_task_f32_unary_gelu_erf;       break;
                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_unary_softplus;       break;
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_unary_tanh;           break;
