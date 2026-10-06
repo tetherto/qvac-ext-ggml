@@ -11961,6 +11961,14 @@ static void add_scalar_bcast_row_tests(std::vector<std::unique_ptr<test_case>> &
     }
 }
 
+// An F16 weight shared by a group of activation batches whose rows are strided,
+// so the product cannot be flattened into one 2D matmul and the grouped HMX
+// path splits the output columns into several chunks.
+static void add_hmx_grouped_f16_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 288, 1024, { 1, 1 }, { 2, 1 }, { 0, 2, 1, 3 }));
+    cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 64, 2048, { 1, 1 }, { 2, 1 }, { 0, 2, 1, 3 }));
+}
+
 static void add_cosyvoice_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     if (perf) {
         cases.emplace_back(new test_flash_attn_ext_sink_logits(64, 16, 940, 940, 2, 900.0f, 0.05f));
@@ -11982,6 +11990,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_parler_tests(test_cases, false);
     add_cosyvoice_tests(test_cases, false);
     add_scalar_bcast_row_tests(test_cases);
+    add_hmx_grouped_f16_tests(test_cases);
     std::default_random_engine rng(0);
 
     // unary ops
