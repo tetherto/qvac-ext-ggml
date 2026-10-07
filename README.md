@@ -17,6 +17,13 @@ Some of the development is currently happening in the [llama.cpp](https://github
 - No third-party dependencies
 - Zero memory allocations during runtime
 
+Memory planners can query `ggml_backend_sched_get_host_size` for scheduler-owned
+storage and `ggml_backend_sched_get_work_size` for the peak execution workspace of
+each backend's graph splits. CPU workspace queries use the configured thread count
+and work with statically linked or dynamically loaded CPU backends. These queries
+do not allocate tensor buffers or execution workspace. Backend workspace support is
+optional; unsupported backends report zero.
+
 ## Build
 
 ```bash
