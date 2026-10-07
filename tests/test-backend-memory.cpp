@@ -103,9 +103,45 @@ void check_plan(ggml_backend_t cpu, Probe &probe) {
   const size_t many = ggml_backend_graph_get_work_size(cpu, probe.graph);
   check(many == plan(probe.graph, MANY_THREADS, nullptr).work_size,
         "graph workspace query ignores configured threads");
+#if defined(__wasi__) ||                                                       \
+    (defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__))
+  check(many == ordinary,
+        "single-thread planner workspace changed with threads");
+#else
   check(many > ordinary, "probe does not exercise thread-dependent workspace");
+#endif
   check(ggml_backend_get_work_size(cpu) == 0,
         "workspace query allocated scratch");
+}
+
+size_t buffer_metadata_growth(ggml_backend_buffer_type_t *types, int count,
+                              ggml_cgraph *graph) {
+  auto *allocator = ggml_gallocr_new_n(types, count);
+  std::vector<size_t> sizes(count);
+  ggml_gallocr_reserve_n_size(allocator, graph, nullptr, nullptr, sizes.data());
+  const auto measured = ggml_gallocr_get_host_size(allocator);
+  check(ggml_gallocr_get_buffer_size(allocator, 0) == 0,
+        "size-only reservation allocated a compute buffer");
+  check(ggml_gallocr_reserve(allocator, graph),
+        "repeated-buffer reservation failed");
+  check(ggml_gallocr_get_buffer_size(allocator, 0) == sizes[0],
+        "reserved buffer differs from its size projection");
+  if (count > 1)
+    check(ggml_gallocr_get_buffer_size(allocator, 1) == 0,
+          "repeated buffer type does not share its compute buffer");
+  const auto allocated = ggml_gallocr_get_host_size(allocator);
+  check(allocated > measured, "host query omits compute buffer metadata");
+  ggml_gallocr_free(allocator);
+  return allocated - measured;
+}
+
+void check_repeated_buffers(ggml_backend_t cpu) {
+  auto *type = ggml_backend_get_default_buffer_type(cpu);
+  ggml_backend_buffer_type_t types[] = {type, type};
+  Probe probe;
+  const auto single = buffer_metadata_growth(types, 1, probe.graph);
+  const auto repeated = buffer_metadata_growth(types, 2, probe.graph);
+  check(repeated == single, "host query counts shared buffer metadata twice");
 }
 
 void check_execution(ggml_backend_t primary, ggml_backend_t cpu) {
@@ -167,6 +203,7 @@ int main() try {
   check_host(cpu);
   Probe probe;
   check_plan(cpu, probe);
+  check_repeated_buffers(cpu);
   check_execution(cpu, cpu);
   ggml_backend_free(cpu);
   cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);

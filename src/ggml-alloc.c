@@ -1228,6 +1228,15 @@ static bool ggml_gallocr_first_allocator(ggml_gallocr_t galloc, int index) {
   return true;
 }
 
+static bool ggml_gallocr_first_buffer(ggml_gallocr_t galloc, int index) {
+  for (int i = 0; i < index; ++i) {
+    if (galloc->buffers[i] == galloc->buffers[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static size_t ggml_gallocr_allocator_host_size(ggml_gallocr_t galloc) {
   size_t size = 0;
   for (int i = 0; i < galloc->n_buffers; ++i) {
@@ -1235,7 +1244,7 @@ static size_t ggml_gallocr_allocator_host_size(ggml_gallocr_t galloc) {
       size += sizeof(*galloc->buf_tallocs[i]) +
               galloc->buf_tallocs[i]->n_chunks * sizeof(struct tallocr_chunk);
     }
-    if (galloc->buffers[i]) {
+    if (galloc->buffers[i] && ggml_gallocr_first_buffer(galloc, i)) {
       size += sizeof(*galloc->buffers[i]);
     }
   }
