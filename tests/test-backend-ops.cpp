@@ -33,6 +33,7 @@
 #include <ctime>
 #include <future>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -2807,6 +2808,57 @@ struct test_argmax : public test_case {
     double max_nmse_err() override {
         return 0.0;
     }
+};
+
+// GGML_OP_ARGMAX edge cases: ties (CPU picks the LAST occurrence) and a
+// leading NaN that must be overwritten by the first finite value. The random
+// test_argmax above uses unique shuffled values and never exercises either.
+struct test_argmax_edge : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool leading_nan;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, leading_nan);
+    }
+
+    test_argmax_edge(std::array<int64_t, 4> ne = {5, 2, 1, 1}, bool leading_nan = false)
+        : ne(ne), leading_nan(leading_nan) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_argmax(ctx, a);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // Each row carries a tie between two equal maxima and (optionally)
+            // a leading NaN at index 0. CPU reference returns the LAST index
+            // whose value equals the running max; a correct backend must
+            // match: for the non-NaN row this is the second max, and for the
+            // NaN row the NaN must not pin the result to index 0.
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0], -1.0f);
+                // ties: duplicate max at the second-last position too
+                if (t->ne[0] >= 3) {
+                    data[1]           = 9.0f;
+                    data[t->ne[0] - 2] = 9.0f;
+                }
+                if (leading_nan && t->ne[0] >= 2) {
+                    data[0] = std::numeric_limits<float>::quiet_NaN();
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+
+    double max_nmse_err() override { return 0.0; }
 };
 
 // GGML_OP_COUNT_EQUAL
@@ -12620,6 +12672,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // TDT decoder widths: the joint output row and the duration row
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {8198,  2, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5,     4, 1, 1}));
+
+    // Edge cases: ties (CPU returns the LAST max) and leading NaN
+    // (must be overwritten by the first finite value).
+    test_cases.emplace_back(new test_argmax_edge({5, 2, 1, 1}, /*leading_nan=*/false));
+    test_cases.emplace_back(new test_argmax_edge({5, 2, 1, 1}, /*leading_nan=*/true));
+    test_cases.emplace_back(new test_argmax_edge({128, 4, 1, 1}, /*leading_nan=*/false));
+    test_cases.emplace_back(new test_argmax_edge({128, 4, 1, 1}, /*leading_nan=*/true));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));

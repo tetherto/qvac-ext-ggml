@@ -24,20 +24,19 @@ struct htp_argmax_context {
     uint32_t                 nrows_per_thread;
 };
 
-// Scalar argmax over one row of F32 values. Lanes early-return on NaN so the
-// output index matches the CPU reference (ggml_vec_argmax_f32 picks the first
-// finite max; NaN propagates to index 0 under CPU semantics but is rare in
-// decoded logits -- Audio8 sampling masks every out-of-range token to -inf
-// before entering ARGMAX).
+// Scalar argmax over one row of F32 values. Mirrors ggml_vec_argmax_f32:
+//   max = MAX(max, x[i]);          -> (a>b)?a:b, so NaN-propagating-second
+//   if (max == x[i]) { idx = i; }  -> ties pick LAST, NaN never equals NaN
+// so a NaN in src[i] holds idx but does not become the stored max, and a
+// NaN that got into max from an earlier element is overwritten by the next
+// finite value (because `max > v` is false when max is NaN).
 static inline int32_t argmax_scalar_f32(const float * restrict src, uint32_t n) {
+    float   best_val = -INFINITY;
     int32_t best_idx = 0;
-    float   best_val = src[0];
-    for (uint32_t i = 1; i < n; ++i) {
+    for (uint32_t i = 0; i < n; ++i) {
         const float v = src[i];
-        if (v > best_val) {
-            best_val = v;
-            best_idx = (int32_t) i;
-        }
+        if (!(best_val > v)) best_val = v;
+        if (best_val == v)   best_idx = (int32_t) i;
     }
     return best_idx;
 }
