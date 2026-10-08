@@ -7,7 +7,9 @@ dispatch.
 
 The source log is `audio8-raw/hex-profile.log` (not checked into this repository).
 It contains two labelled runs, including the warmup despite its label saying
-"not captured". The captured run contains:
+"not captured". It does not record `OPSTAGE`; therefore it establishes the
+logged dispatch choices, not a validated full-compute performance baseline
+(see the `OPSTAGE` requirement below). The captured run contains:
 
 | Measurement | Captured run |
 | --- | ---: |
@@ -93,23 +95,30 @@ and `ADSP_LIBRARY_PATH` to that directory using the device's existing FastRPC
 setup. Record the device, model hashes, both repository commits, thread count,
 thermal state, and environment alongside the logs.
 
+`GGML_HEXAGON_OPSTAGE` is a bitmask: queueing is bit 0 (`1`), and computation
+is bit 1 (`2`). Use `3` (the default) to execute both. The previously reported
+"tuned" setting `OPSTAGE=1` sets `HTP_OPFLAGS_SKIP_COMPUTE`; it skips arithmetic
+in kernels that honor that flag. Fused and unfused paths do not all handle it
+identically. Timings obtained with `OPSTAGE=1` cannot establish a valid inference
+speedup or correctness baseline. Repeat those measurements with `OPSTAGE=3`.
+
 ```sh
-GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=1 GGML_HEXAGON_OPFUSION=1 \
+GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=3 GGML_HEXAGON_OPFUSION=1 \
   ./test-backend-ops test -b HTP0 -o AUDIO8_MUL_MAT_ADD
 
-GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=1 GGML_HEXAGON_OPFUSION=0 \
+GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=3 GGML_HEXAGON_OPFUSION=0 \
   ./test-backend-ops test -b HTP0 -o AUDIO8_MUL_MAT_ADD
 
-GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=1 GGML_HEXAGON_OPFUSION=1 \
+GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=3 GGML_HEXAGON_OPFUSION=1 \
   GGML_HEXAGON_PROFILE=1 \
   ./test-backend-ops perf -b HTP0 -o AUDIO8_MUL_MAT_ADD > audio8-matmul-profile.log 2>&1
 
-GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=1 GGML_HEXAGON_OPFUSION=1 \
+GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=3 GGML_HEXAGON_OPFUSION=1 \
   GGML_HEXAGON_PROFILE=3 GGML_HEXAGON_OPTRACE=262144 \
   ./test-backend-ops perf -b HTP0 -o AUDIO8_MUL_MAT_ADD \
   -p 'm=96,n=184320,k=96,residual=1' > audio8-matmul-trace.log 2>&1
 
-GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=1 GGML_HEXAGON_OPFUSION=1 \
+GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPSTAGE=3 GGML_HEXAGON_OPFUSION=1 \
   ./test-backend-ops perf -b HTP0 -o AUDIO8_MUL_MAT_ADD > audio8-matmul-perf.log 2>&1
 ```
 
