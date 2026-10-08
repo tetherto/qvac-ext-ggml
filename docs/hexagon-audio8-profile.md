@@ -29,6 +29,35 @@ device correctness or speedup. The measured codec shapes motivating the
 candidate are `[192,192] x [192,71680]`, `[96,96] x [96,143360]`, and
 `[384,384] x [384,17920]` in ggml dimension order.
 
+October 8 isolated-kernel checks on the renewed QDC SM8750/v79 device
+(`57dd7911`) passed all 14 initial independent-oracle cases. Three repeated
+comparisons after an initial trial gave these medians (each test executable
+internally ran 30 iterations for K=96 and 15 for K=192/384):
+
+| K / output channels | Activation rows | Panel off (ms) | Panel on (ms) | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 96 | 184320 | 211.786 | 93.626 | 2.262x |
+| 192 | 92160 | 243.832 | 118.364 | 2.060x |
+| 384 | 23040 | 154.834 | 104.358 | 1.484x |
+
+These large-shape probes use the same channel counts as the current profile
+and the longer activation sequences from the historical fixture. They are
+isolated matmuls, not a measurement of full Audio8 inference. Both variants
+used the same candidate build, `OPPOLL=1`, `OPSTAGE=3`, `OPFUSION=1`,
+`HOSTBUF=1`, and default matmul selection; only `F16_F32_PANEL` changed.
+The repeated order was panel on, then off. Run with:
+
+```sh
+GGML_HEXAGON_F16_F32_PANEL=1 ./test-backend-ops perf -b HTP0 -p audio8_codec_f32=1
+```
+
+Raw evidence is in `hexagon-codec-build/results/device-oracle.log`,
+`device-perf-repeat.log`, and `device-perf-summary.json` beside the checkout.
+The DSP artifact SHA-256 was
+`49b8e8d93f12b19494da69666c47b9f4b766bd08d62aba6dcc5c0b7485fbb041`.
+Model-level fixed-code PCM parity and end-to-end performance are still pending;
+the isolated results do not establish either.
+
 ## Corrected S1 baseline, October 8
 
 On the same QDC Snapdragon 8 Elite, enabling polling reduced median inference
