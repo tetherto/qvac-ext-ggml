@@ -4,7 +4,8 @@
 Only matched start/stop pairs contribute cycles. Trace saturation or missing
 pairs marks coverage incomplete. Cycle deltas use the trace's 32-bit counter:
 a single span must be shorter than one counter period. Host lifetime sums
-include concurrent outstanding batches; pop includes profiling output.
+include concurrent outstanding batches; pop includes profiling output. Host
+records are cumulative snapshots: use host_latest, never sum repeated snapshots.
 """
 import argparse
 import collections
@@ -28,7 +29,7 @@ def summarize(lines):
         return sessions.setdefault(name, dict(batches=0, trace_batches=0, saturated_batches=0,
             unknown_capacity_batches=0, missing_dispatch_pairs=0, duplicate_dispatch_pairs=0,
             invalid_dispatch_indices=0, missing_batch_spans=0, unmatched_starts=0, unmatched_stops=0,
-            stages={}, host=[]))
+            stages={}, host=[], host_latest=None))
 
     def finish(name):
         batch = pending.pop(name, None)
@@ -106,7 +107,9 @@ def summarize(lines):
             fields = body.split()[1:]
             if len(fields) % 2 or any(not v.isdecimal() for v in fields[1::2]):
                 raise ValueError(f'line {lineno}: malformed host totals')
-            out['host'].append(dict(zip(fields[::2], map(int, fields[1::2]))))
+            snapshot = dict(zip(fields[::2], map(int, fields[1::2])))
+            out['host'].append(snapshot)
+            out['host_latest'] = snapshot
     for name in list(pending):
         finish(name)
     for out in sessions.values():
@@ -119,6 +122,7 @@ def summarize(lines):
         'Only matched spans contribute; incomplete/saturated captures provide partial totals.',
         'Each span must be shorter than one 32-bit cycle-counter period.',
         'Host lifetime sums overlap queued batches; host pop includes profile logging.',
+        'Host snapshots are cumulative: use host_latest, do not add repeated snapshots.',
     ], sessions=sessions)
 
 

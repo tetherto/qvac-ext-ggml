@@ -1597,7 +1597,9 @@ struct ggml_hexagon_opqueue {
         }
     }
 
-    ~ggml_hexagon_opqueue() {
+    // A registry-owned session may outlive every backend handle. Emit a
+    // cumulative snapshot on backend release as well as actual queue teardown.
+    void dump_host_profile() const {
         if (opt_profile && prof_batches) {
             GGML_LOG_INFO("ggml-hex: %s profile-host batches %llu ops %llu cache-us %llu pack-us %llu submit-us %llu wait-us %llu pop-us %llu lifetime-sum-us %llu\n",
                 shm_buf->sess->c_name(), (unsigned long long) prof_batches, (unsigned long long) prof_ops,
@@ -1605,6 +1607,10 @@ struct ggml_hexagon_opqueue {
                 (unsigned long long) prof_submit_us, (unsigned long long) prof_wait_us,
                 (unsigned long long) prof_pop_us, (unsigned long long) prof_lifetime_us);
         }
+    }
+
+    ~ggml_hexagon_opqueue() {
+        dump_host_profile();
         delete shm_buf;
     }
 
@@ -3926,6 +3932,12 @@ static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_hexagon_free(ggml_backend_t backend) {
+    if (opt_profile) {
+        auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+        if (sess->op_queue) {
+            sess->op_queue->dump_host_profile();
+        }
+    }
     // we just need to delete the backend here
     // the sessions are allocated & freed as part of the registry
     delete backend;

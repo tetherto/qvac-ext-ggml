@@ -90,6 +90,16 @@ class TestDispatchProfile(unittest.TestCase):
         self.assertEqual(out['host'][0]['lifetime-sum-us'], 180)
         self.assertEqual(out['stages']['OP_EXECUTE']['cycles'], 50)
 
+    def test_repeated_host_snapshots_use_latest_cumulative_totals(self):
+        out = self.read(complete() + [
+            'ggml-hex: HTP0 profile-host batches 2 ops 2 wait-us 90 lifetime-sum-us 180',
+            'ggml-hex: HTP0 profile-host batches 3 ops 4 wait-us 140 lifetime-sum-us 260',
+            'ggml-hex: HTP0 profile-host batches 3 ops 4 wait-us 140 lifetime-sum-us 260'])
+        self.assertEqual(len(out['host']), 3)
+        self.assertEqual(out['host_latest']['batches'], 3)
+        self.assertEqual(out['host_latest']['wait-us'], 140)
+        self.assertEqual(out['host_latest']['lifetime-sum-us'], 260)
+
     def test_malformed_records_fail(self):
         for bad in ('trace-state capacity ??? saturated-mask 0', 'trace-evt OP_SETUP: garbage',
                     'profile-host ops many'):
