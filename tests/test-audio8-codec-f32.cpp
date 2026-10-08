@@ -23,22 +23,33 @@ struct shape {
 };
 
 static const shape cases[] = {
-    {"k64-odd",       64,  7,  5, 1, false, false, true},
-    {"k96-odd",       96,  7,  5, 1, false, false, true},
-    {"k96-views",     96,  7,  5, 1, true,  false, true},
-    {"k192-odd",     192, 11,  9, 1, false, false, true},
-    {"k384-views",   384,  9,  7, 1, true,  false, true},
+    // Small inputs fit VTCM and must retain the existing activation narrowing.
+    {"vtcm-k64-odd",       64,  7,  5, 1, false, false, false},
+    {"vtcm-k96-odd",       96,  7,  5, 1, false, false, false},
+    {"vtcm-k96-views",     96,  7,  5, 1, true,  false, false},
+    {"vtcm-k192-odd",     192, 11,  9, 1, false, false, false},
+    {"vtcm-k384-views",   384,  9,  7, 1, true,  false, false},
     // M>1 explicit-F32 MUL_MAT cannot fuse with ADD on the current backend;
-    // the standalone panel product must still feed the normal bias operation.
-    {"separate-bias",  96,  7,  5, 1, false, true,  true},
-    {"channels96",    96, 96, 33, 1, false, false, true},
-    {"channels192",  192,192, 33, 1, false, false, true},
-    {"channels384",  384,384, 33, 1, false, false, true},
+    // the standalone VTCM product must still feed the normal bias operation.
+    {"vtcm-separate-bias", 96,  7,  5, 1, false, true,  false},
+    {"vtcm-channels96",   96, 96, 33, 1, false, false, false},
+    {"vtcm-channels192", 192,192, 33, 1, false, false, false},
+    {"vtcm-channels384", 384,384, 33, 1, false, false, false},
     // Independent values along every axis expose lane/row permutations that
     // the deliberately repeated cancellation pattern cannot distinguish.
-    {"varied-k96",    96,  9,  7, 1, true,  false, true, true},
-    {"varied-k192",  192,  7, 11, 1, false, false, true, true},
-    {"varied-k384",  384, 11,  9, 1, true,  false, true, true},
+    {"vtcm-varied-k96",   96,  9,  7, 1, true,  false, false, true},
+    {"vtcm-varied-k192", 192,  7, 11, 1, false, false, false, true},
+    {"vtcm-varied-k384", 384, 11,  9, 1, true,  false, false, true},
+    // The target Snapdragon 8 Elite has 8 MiB VTCM. These odd row counts
+    // exceed that budget in padded F16 activation staging alone (256, 384,
+    // and 768 bytes/row); no test-only routing override is needed. Few output
+    // channels bound CPU oracle work while retaining odd panel remainders.
+    {"ddr-k96",          96,  7, 32769, 1, true,  false, true},
+    {"ddr-k192",        192,  5, 21847, 1, false, false, true},
+    {"ddr-k384",        384,  3, 10923, 1, true,  false, true},
+    {"ddr-varied-k96",   96,  9, 32769, 1, true,  false, true, true},
+    {"ddr-varied-k192", 192,  7, 21847, 1, false, false, true, true},
+    {"ddr-varied-k384", 384,  5, 10923, 1, true,  false, true, true},
     // Ineligible shapes retain the existing F16-activation arithmetic.
     {"guard-k32",     32,  7,  5, 1, false, false, false},
     {"guard-batched", 96,  7,  5, 2, false, false, false},
