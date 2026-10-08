@@ -96,6 +96,25 @@ does not make these products eligible. Any future precision change would need
 separate application-level correctness evidence and must not silently override
 `GGML_PREC_F32` in the backend.
 
+A fresh S3 trace after both correctness fixes, with `OPSTAGE=3`, `OPPOLL=1`,
+and `PROFILE=1`, also records zero `MUL_MAT+ADD` calls. It generated 70 frames.
+The three largest groups were:
+
+| Weight shape K:N | Activation shape K:M | Kernel | Share of leaf cycles |
+| --- | --- | --- | ---: |
+| 192:192 | 192:71680 | `hvx-flat` | 34.22% |
+| 96:96 | 96:143360 | `hvx-flat` | 28.00% |
+| 384:384 | 384:17920 | `hvx-flat` | 19.77% |
+
+These groups account for about 82% of the 29,765,246,194 leaf cycles. Inclusive
+batch cycles were 30,285,894,686 and must not be added to leaf cycles. Codec
+synthesis took 13,132.9 ms of the reported 21,078.9 ms inference time. Logging
+affects these timings; use the unprofiled S1 measurements above for the baseline.
+The trace identifies current F32 codec matmuls as follow-up profiling targets;
+it does not establish cross-backend parity or justify changing precision.
+Local evidence is `results/hex-corrected-S3-profile.log` and its parsed
+`results/hex-corrected-S3-profile.json` under the build directory above.
+
 ## Historical October 7 profile
 
 The older profile labels every `MUL_MAT+ADD` call `hmx-tiled`. This shows that
