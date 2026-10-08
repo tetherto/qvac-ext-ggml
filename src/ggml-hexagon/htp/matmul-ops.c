@@ -301,6 +301,100 @@ static void hvx_mm_4d(unsigned int nth, unsigned int ith, void * data) {
 #include "hvx-mm-kernels-tiled.h"
 #include "hvx-mm-kernels-flat.h"
 
+// Unbatched DDR panels: partition pairs along the larger output dimension,
+// so thread boundaries never split a 2x2 tile. All loads are unaligned-safe;
+// odd rows/columns use the same F32 arithmetic with a 1x1 remainder.
+static void hvx_mm_f16_f32_panel(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+    const uint32_t mpairs = (ne01 + 1) / 2;
+    const uint32_t npairs = (ne11 + 1) / 2;
+    const bool split_m = mpairs > npairs;
+    const uint32_t pairs = split_m ? mpairs : npairs;
+    const uint32_t per_thread = (pairs + nth - 1) / nth;
+    const uint32_t begin = MIN(ith * per_thread, pairs);
+    const uint32_t end = MIN(begin + per_thread, pairs);
+    if (begin == end) return;
+    const uint32_t m_begin = split_m ? 2 * begin : 0;
+    const uint32_t m_end = split_m ? MIN(2 * end, ne01) : ne01;
+    const uint32_t n_begin = split_m ? 0 : 2 * begin;
+    const uint32_t n_end = split_m ? ne11 : MIN(2 * end, ne11);
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+    for (uint32_t n = n_begin; n < n_end; n += 2) {
+        const uint8_t * a0 = (const uint8_t *) src1->data + n * nb11;
+        float * d0 = (float *) ((uint8_t *) dst->data + n * nb1);
+        if (n + 1 < n_end) {
+            const uint8_t * a1 = a0 + nb11;
+            float * d1 = (float *) ((uint8_t *) d0 + nb1);
+            uint32_t m = m_begin;
+            for (; m + 1 < m_end; m += 2) {
+                const uint8_t * w0 = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_uu_2x2(ne00, d0 + m, d1 + m, w0, w0 + nb01, a0, a1);
+            }
+            if (m < m_end) {
+                const uint8_t * w = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_panel_1x1(ne00, d0 + m, w, a0);
+                vec_dot_f16_f32_panel_1x1(ne00, d1 + m, w, a1);
+            }
+        } else {
+            for (uint32_t m = m_begin; m < m_end; ++m) {
+                const uint8_t * w = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_panel_1x1(ne00, d0 + m, w, a0);
+            }
+        }
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+}
+
+// Experimental wider panel. Partition complete 4x2 tiles; the existing
+// 2x2/1x1 helpers cover only the final channel/activation remainders.
+static void hvx_mm_f16_f32_panel_4x2(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+    const uint32_t mtiles = (ne01 + 3) / 4;
+    const uint32_t ntiles = (ne11 + 1) / 2;
+    const bool split_m = mtiles > ntiles;
+    const uint32_t tiles = split_m ? mtiles : ntiles;
+    const uint32_t per_thread = (tiles + nth - 1) / nth;
+    const uint32_t begin = MIN(ith * per_thread, tiles);
+    const uint32_t end = MIN(begin + per_thread, tiles);
+    if (begin == end) return;
+    const uint32_t m_begin = split_m ? 4 * begin : 0;
+    const uint32_t m_end = split_m ? MIN(4 * end, ne01) : ne01;
+    const uint32_t n_begin = split_m ? 0 : 2 * begin;
+    const uint32_t n_end = split_m ? ne11 : MIN(2 * end, ne11);
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+    for (uint32_t n = n_begin; n < n_end; n += 2) {
+        const uint8_t * a0 = (const uint8_t *) src1->data + n * nb11;
+        float * d0 = (float *) ((uint8_t *) dst->data + n * nb1);
+        if (n + 1 < n_end) {
+            const uint8_t * a1 = a0 + nb11;
+            float * d1 = (float *) ((uint8_t *) d0 + nb1);
+            uint32_t m = m_begin;
+            for (; m + 3 < m_end; m += 4) {
+                const uint8_t * w0 = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_uu_4x2(ne00, d0 + m, d1 + m,
+                                      w0, w0 + nb01, w0 + 2 * nb01, w0 + 3 * nb01, a0, a1);
+            }
+            for (; m + 1 < m_end; m += 2) {
+                const uint8_t * w0 = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_uu_2x2(ne00, d0 + m, d1 + m, w0, w0 + nb01, a0, a1);
+            }
+            if (m < m_end) {
+                const uint8_t * w = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_panel_1x1(ne00, d0 + m, w, a0);
+                vec_dot_f16_f32_panel_1x1(ne00, d1 + m, w, a1);
+            }
+        } else {
+            for (uint32_t m = m_begin; m < m_end; ++m) {
+                const uint8_t * w = (const uint8_t *) src0->data + m * nb01;
+                vec_dot_f16_f32_panel_1x1(ne00, d0 + m, w, a0);
+            }
+        }
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, n_begin);
+}
+
 // Specialized repacked matmul macros
 #define MATMUL_2D_REPACKED_IMPL(SUFFIX, TILE_SIZE, DOT_2X2, DOT_2X1)                                                              \
 static void hvx_mm_2d_repacked_##SUFFIX(unsigned int nth, unsigned int ith, void * data) {                                        \
@@ -1562,6 +1656,17 @@ static int hvx_mm_matmul(struct htp_ops_context * octx) {
             mmctx->type            = "f16-f32";
             mmctx->vec_dot_1x1     = vec_dot_f16_f32_uu_1x1;
             matmul_job_func        = hvx_mm_4d;
+            if ((kparams->tile_size == HTP_MM_F16_F32_PANEL_2X2 ||
+                 kparams->tile_size == HTP_MM_F16_F32_PANEL_4X2) && !src2 &&
+                ne00 >= 64 && ne00 % 32 == 0 && ne00 == ne10 && ne01 >= 2 && ne11 >= 2 &&
+                ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ne2 == 1 && ne3 == 1 &&
+                src0->type == HTP_TYPE_F16 && src1->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F32 &&
+                nb00 == 2 && nb10 == 4 && nb0 == 4 &&
+                nb01 >= ne00 * 2 && nb11 >= ne10 * 4 && nb1 >= ne01 * 4) {
+                mmctx->type = "f16-f32-panel";
+                matmul_job_func = kparams->tile_size == HTP_MM_F16_F32_PANEL_4X2
+                    ? hvx_mm_f16_f32_panel_4x2 : hvx_mm_f16_f32_panel;
+            }
             mmctx->mm_div_ne12_ne1 = kparams->div_ne12_ne1;
             mmctx->mm_div_ne1      = kparams->div_ne1;
             mmctx->mm_div_r2       = kparams->div_r2;

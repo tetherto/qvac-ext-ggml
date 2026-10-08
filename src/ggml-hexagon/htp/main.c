@@ -947,6 +947,9 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
 }
 
 static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
+    struct htp_thread_trace * trace = &octx->ctx->trace[0];
+    // Setup includes coherence; execute is inclusive of the kernel's own traces.
+    htp_trace_event_start(trace, HTP_TRACE_EVT_OP_SETUP, idx);
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     memcpy(octx->kernel_params, op->kernel_params, sizeof(octx->kernel_params));
     octx->flags = op->flags;
@@ -993,8 +996,12 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     // back over a DMA-written output, so the outputs are flushed as well.
     htp_tensor_flush_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
+    htp_trace_event_stop(trace, HTP_TRACE_EVT_OP_SETUP, idx);
+    htp_trace_event_start(trace, HTP_TRACE_EVT_OP_EXECUTE, idx);
     int status = execute_op(octx);
+    htp_trace_event_stop(trace, HTP_TRACE_EVT_OP_EXECUTE, idx);
 
+    htp_trace_event_start(trace, HTP_TRACE_EVT_OP_RETIRE, idx);
     htp_tensor_dirty_all(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
 
     octx->src0_spad.src = NULL;
@@ -1002,6 +1009,7 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     octx->src2_spad.src = NULL;
     octx->src3_spad.src = NULL;
     octx->dst_spad.src  = NULL;
+    htp_trace_event_stop(trace, HTP_TRACE_EVT_OP_RETIRE, idx);
 
     return status;
 }
@@ -1058,17 +1066,21 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     prep_op_bufs(ctx, bufs, n_bufs);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
 
+    htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_TENSOR_PREP, 0);
     prep_tensors(ctx, bufs, tens, n_tens);
+    htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_TENSOR_PREP, 0);
 
     struct htp_ops_context *octx = &ctx->octx;
     memset(octx, 0, sizeof(*octx));
     octx->n_threads = ctx->n_threads;
     octx->ctx       = ctx;
 
+    htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_WORKER_WAKE, 0);
     work_queue_wakeup(ctx->work_queue);
     if (ctx->hmx_queue) {
         hmx_queue_wakeup(ctx->hmx_queue);
     }
+    htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_WORKER_WAKE, 0);
 
     int op_status = HTP_STATUS_OK;
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
@@ -1091,11 +1103,13 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         }
     }
 
+    htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_WORKER_SUSPEND, 0);
     if (ctx->hmx_queue) {
         hmx_queue_suspend(ctx->hmx_queue);
         hmx_queue_flush(ctx->hmx_queue);
     }
     work_queue_suspend(ctx->work_queue);
+    htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_WORKER_SUSPEND, 0);
 
     // Flush remaining dirty tensors at the end of the batch
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);

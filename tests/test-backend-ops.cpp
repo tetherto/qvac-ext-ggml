@@ -6547,6 +6547,84 @@ struct test_mul_mat_row_bias : public test_case {
     }
 };
 
+// Audio8's profiled fused products are F16 vocoder convolutions. Their ADD
+// operand is either a broadcast bias or the full F32 partial convolution;
+// exercising both keeps the output-conversion epilogue in the measured graph.
+struct test_audio8_mul_mat_add : public test_mul_mat_row_bias {
+    const bool residual;
+
+    test_audio8_mul_mat_add(int64_t m, int64_t n, int64_t k, bool residual)
+        : test_mul_mat_row_bias(GGML_TYPE_F16, m, n, k), residual(residual) {}
+
+    std::string vars() override {
+        return "audio8_matmul_add=1," + test_mul_mat_row_bias::vars() + "," + VAR_TO_STR(residual);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "AUDIO8_MUL_MAT_ADD";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "audio8_weight");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "audio8_activation");
+        ggml_tensor * add = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, residual ? n : 1);
+        ggml_set_name(add, residual ? "audio8_partial_conv" : "audio8_bias");
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a, b), add);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+static void add_audio8_matmul_add_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    for (bool residual : {false, true}) {
+        if (perf) {
+            // Exact dominant shapes from the captured Audio8 DSP profile.
+            cases.emplace_back(new test_audio8_mul_mat_add( 96, 184320,  96, residual));
+            cases.emplace_back(new test_audio8_mul_mat_add(192,  92160, 192, residual));
+            cases.emplace_back(new test_audio8_mul_mat_add(384,  23040, 384, residual));
+            cases.emplace_back(new test_audio8_mul_mat_add(768,   2880, 768, residual));
+        } else {
+            // Keep correctness runs small while covering the HVX/HMX row
+            // boundary, an incomplete activation tile, and output-column tails.
+            for (int64_t n : {1, 4, 5, 33}) {
+                cases.emplace_back(new test_audio8_mul_mat_add(96, n, 96, residual));
+            }
+            cases.emplace_back(new test_audio8_mul_mat_add( 97, 65,  96, residual));
+            cases.emplace_back(new test_audio8_mul_mat_add(192, 65, 192, residual));
+            cases.emplace_back(new test_audio8_mul_mat_add(384, 33, 384, residual));
+            cases.emplace_back(new test_audio8_mul_mat_add(768, 33, 768, residual));
+        }
+    }
+}
+
+// Current codec products explicitly request F32 precision. Keep these perf
+// cases separate from the historical default-precision MUL_MAT+ADD probes.
+// Sensitive-input correctness uses test-audio8-codec-f32: the ordinary CPU
+// F16 matmul reference here rounds F32 activations to F16.
+struct test_audio8_codec_f32 : public test_mul_mat_prec_f32 {
+    test_audio8_codec_f32(int64_t channels, int64_t rows)
+        : test_mul_mat_prec_f32(GGML_TYPE_F16, channels, rows, channels,
+                               false, false, unit_magnitude, unit_magnitude) {}
+
+    std::string vars() override {
+        return "audio8_codec_f32=1," + test_mul_mat_prec_f32::vars();
+    }
+};
+
+static void add_audio8_codec_f32_perf_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    // QVAC-26714's complete S1 trace: the three dominant F32-required DDR
+    // families. Keep the longer historical probes below for scaling checks.
+    cases.emplace_back(new test_audio8_codec_f32(96, 135168));
+    cases.emplace_back(new test_audio8_codec_f32(192, 67584));
+    cases.emplace_back(new test_audio8_codec_f32(384, 16896));
+    cases.emplace_back(new test_audio8_codec_f32(96, 184320));
+    cases.emplace_back(new test_audio8_codec_f32(192, 92160));
+    cases.emplace_back(new test_audio8_codec_f32(384, 23040));
+}
+
 static void add_strided_mul_mat_prec_f32_tests(std::vector<std::unique_ptr<test_case>> & test_cases) {
     constexpr float overflow_magnitude = test_mul_mat_prec_f32::fp16_overflow_magnitude;
     constexpr float unit_magnitude = test_mul_mat_prec_f32::unit_magnitude;
@@ -12068,6 +12146,7 @@ static void add_cosyvoice_tests(std::vector<std::unique_ptr<test_case>> & cases,
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_audio8_matmul_add_tests(test_cases, false);
     add_speech_hotspot_tests(test_cases, false);
     add_acestep_tests(test_cases, false);
     add_supertonic_tests(test_cases, false);
@@ -14822,6 +14901,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    add_audio8_matmul_add_tests(test_cases, true);
+    add_audio8_codec_f32_perf_tests(test_cases);
     add_speech_hotspot_tests(test_cases, true);
     add_acestep_tests(test_cases, true);
     add_supertonic_tests(test_cases, true);

@@ -47,6 +47,7 @@
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "htp-opnode.h"
+#include "htp-opcache.h"
 #include "htp-ops.h"
 #include "htp/matmul-ops.h"
 #include "htp/flash-attn-ops.h"
@@ -70,6 +71,8 @@ static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static int    opt_hostbuf = 1; // hostbuf ON by default
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
+static int    opt_f16_f32_panel = 1; // DDR F32 activation panels; preserve VTCM routing
+static int    opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_2X2;
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -82,7 +85,7 @@ static int opt_opstage  = HTP_OPSTAGE_QUEUE | HTP_OPSTAGE_COMPUTE;
 static int opt_opbatch  = 1024; // max number of ops in a batch
 static int opt_opqueue  = 16;   // max number of pending batches
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
-static int opt_oppoll   = 0;    // polling for batch completions
+static int opt_oppoll   = 1;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
@@ -143,6 +146,12 @@ static const char * htp_event_name(uint16_t id) {
         case HTP_TRACE_EVT_L2FLUSH:        return "L2FLUSH";
         case HTP_TRACE_EVT_INIT:           return "INIT";
         case HTP_TRACE_EVT_BUFF:           return "BUFF";
+        case HTP_TRACE_EVT_TENSOR_PREP:    return "TENSOR_PREP";
+        case HTP_TRACE_EVT_WORKER_WAKE:    return "WORKER_WAKE";
+        case HTP_TRACE_EVT_WORKER_SUSPEND: return "WORKER_SUSPEND";
+        case HTP_TRACE_EVT_OP_SETUP:       return "OP_SETUP";
+        case HTP_TRACE_EVT_OP_EXECUTE:     return "OP_EXECUTE";
+        case HTP_TRACE_EVT_OP_RETIRE:      return "OP_RETIRE";
         default:                           return "UNKNOWN";
     }
 }
@@ -192,6 +201,14 @@ static void ggml_hexagon_dump_trace_events(const std::string & sess_name, const 
             valid_cnt[t] = count > n_traces ? n_traces : count;
         }
 
+        uint32_t saturated = 0;
+        for (uint32_t t = 0; t <= HTP_MAX_NTHREADS; t++) {
+            if (n_traces && rsp.n_traces[t] >= n_traces) {
+                saturated |= 1u << t;
+            }
+        }
+        GGML_LOG_DEBUG("ggml-hex: %s trace-state capacity %u saturated-mask %u\n",
+                       sess_name.c_str(), n_traces, saturated);
         for (uint32_t t = 0; t <= HTP_MAX_NTHREADS; t++) {
             for (uint32_t idx = 0; idx < valid_cnt[t]; idx++) {
                 const auto & e = trace_events[t * n_traces + idx];
@@ -978,6 +995,13 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
+    // CPU fallback and backend copies read host buffers directly. Only the
+    // non-host (repack) buffers may store the DSP's tiled quantized layout.
+    if (ggml_backend_buffer_is_host(buffer)) {
+        memcpy((char *) tensor->data + offset, data, size);
+        return;
+    }
+
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
             GGML_ASSERT(offset == 0);
@@ -1025,6 +1049,11 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
     auto sess = sbuf->sess;
 
     HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
+
+    if (ggml_backend_buffer_is_host(buffer)) {
+        memcpy(data, (const char *) tensor->data + offset, size);
+        return;
+    }
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
@@ -1531,11 +1560,13 @@ struct ggml_hexagon_opqueue {
     ggml_hexagon_shared_buffer *shm_buf;
     size_t                      shm_blk_size;
 
-    using opvec = std::vector<htp_opnode>;
-
     std::queue<unsigned int>    done;           // completed batch ids
-    std::vector<opvec>          op_cache;       // per batch op cache
-    std::vector<uint64_t>       start_usec;     // per batch start time
+    htp_op_cache               op_cache;       // live metadata per outstanding batch
+    std::vector<uint64_t>       start_usec;     // profiled capture-to-response lifetime
+    // PROFILE-only aggregates. Lifetime overlaps queued batches; pop includes
+    // profile formatting/output, so these fields must not be summed as compute.
+    uint64_t prof_batches = 0, prof_ops = 0, prof_cache_us = 0, prof_pack_us = 0;
+    uint64_t prof_submit_us = 0, prof_wait_us = 0, prof_pop_us = 0, prof_lifetime_us = 0;
 
     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) {
         size_t n_bufs    = HTP_OP_MAX_BUFS;
@@ -1567,7 +1598,20 @@ struct ggml_hexagon_opqueue {
         }
     }
 
+    // A registry-owned session may outlive every backend handle. Emit a
+    // cumulative snapshot on backend release as well as actual queue teardown.
+    void dump_host_profile() const {
+        if (opt_profile && prof_batches) {
+            GGML_LOG_INFO("ggml-hex: %s profile-host batches %llu ops %llu cache-us %llu pack-us %llu submit-us %llu wait-us %llu pop-us %llu lifetime-sum-us %llu\n",
+                shm_buf->sess->c_name(), (unsigned long long) prof_batches, (unsigned long long) prof_ops,
+                (unsigned long long) prof_cache_us, (unsigned long long) prof_pack_us,
+                (unsigned long long) prof_submit_us, (unsigned long long) prof_wait_us,
+                (unsigned long long) prof_pop_us, (unsigned long long) prof_lifetime_us);
+        }
+    }
+
     ~ggml_hexagon_opqueue() {
+        dump_host_profile();
         delete shm_buf;
     }
 
@@ -1587,8 +1631,15 @@ struct ggml_hexagon_opqueue {
         req.n_tensors = op_batch->n_tens;
         req.n_ops     = op_batch->n_ops;
 
-        op_cache[req.id]   = op_batch->ops;
-        start_usec[req.id] = ggml_time_us();
+        const uint64_t cache_start = opt_profile ? ggml_time_us() : 0;
+        op_cache.capture(req.id, op_batch->ops, req.n_ops);
+        const uint64_t pack_start = opt_profile ? ggml_time_us() : 0;
+        if (opt_profile) {
+            prof_cache_us += pack_start - cache_start;
+            start_usec[req.id] = cache_start;
+            prof_batches++;
+            prof_ops += req.n_ops;
+        }
 
         const size_t b_size = sizeof(htp_buf_desc)  * req.n_bufs;
         const size_t t_size = sizeof(htp_tensor)    * req.n_tensors;
@@ -1640,6 +1691,9 @@ struct ggml_hexagon_opqueue {
             }
         }
 
+        if (opt_profile) {
+            prof_pack_us += ggml_time_us() - pack_start;
+        }
         return true;
     }
 
@@ -1696,6 +1750,7 @@ struct ggml_hexagon_opqueue {
 
 // Flush HTP response queue i.e wait for all outstanding requests to complete
 void ggml_hexagon_session::flush_pending(bool all) {
+    uint64_t wait_start = opt_profile ? ggml_time_us() : 0;
     while (this->op_pending) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -1743,7 +1798,17 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_ABORT("ggml-hex: %s aborting on DSP failure (see op dump above)\n", this->c_name());
         }
 
+        const uint64_t pop_start = opt_profile ? ggml_time_us() : 0;
+        if (opt_profile) {
+            op_queue->prof_wait_us += pop_start - wait_start;
+            GGML_ASSERT(rsp.id < op_queue->start_usec.size());
+            op_queue->prof_lifetime_us += pop_start - op_queue->start_usec[rsp.id];
+        }
         op_queue->pop(rsp, dbuf);
+        if (opt_profile) {
+            wait_start = ggml_time_us();
+            op_queue->prof_pop_us += wait_start - pop_start;
+        }
 
         this->op_pending--;  // atomic dec
 
@@ -1769,7 +1834,11 @@ void ggml_hexagon_session::flush_batch() {
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
+    const uint64_t submit_start = opt_profile ? ggml_time_us() : 0;
     int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
+    if (opt_profile) {
+        op_queue->prof_submit_us += ggml_time_us() - submit_start;
+    }
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
@@ -2699,6 +2768,23 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->vtcm_dst_size = L.dst_bytes;
             kparams->n_prefetch = 16;
         } else {
+            // Preserve F32 activations and reuse an output panel (2x2 by default).
+            // Keep the existing VTCM 2x2 path whenever it fits: it reuses staged
+            // activations and prefetched weights more efficiently for smaller graphs.
+            if (opt_f16_f32_panel && !is_matmul_id && src2_row_size == 0 &&
+                ne10 >= 64 && ne10 % 32 == 0 && src0->ne[1] >= 2 && ne11 >= 2 &&
+                ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+                dst->ne[2] == 1 && dst->ne[3] == 1 &&
+                src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                src0->nb[0] == 2 && src1->nb[0] == 4 && dst->nb[0] == 4 &&
+                src0->nb[1] >= size_t(ne10) * 2 && src1->nb[1] >= size_t(ne10) * 4 &&
+                dst->nb[1] >= size_t(src0->ne[1]) * 4) {
+                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
+                kparams->tile_size = opt_f16_f32_panel_shape;
+                kparams->src1_row_size = src1->nb[1];
+                return;
+            }
+
             if (src1->type == GGML_TYPE_F32) {
                 kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
             } else {
@@ -3847,6 +3933,12 @@ static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_hexagon_free(ggml_backend_t backend) {
+    if (opt_profile) {
+        auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+        if (sess->op_queue) {
+            sess->op_queue->dump_host_profile();
+        }
+    }
     // we just need to delete the backend here
     // the sessions are allocated & freed as part of the registry
     delete backend;
@@ -4939,6 +5031,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_use_hmx  = getenv("GGML_HEXAGON_USE_HMX");
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
+    const char * str_f16_f32_panel = getenv("GGML_HEXAGON_F16_F32_PANEL");
+    const char * str_f16_f32_panel_shape = getenv("GGML_HEXAGON_F16_F32_PANEL_SHAPE");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
@@ -4989,6 +5083,18 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : (str_use_hmx ? atoi(str_use_hmx) : opt_nhmx);
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
+    opt_f16_f32_panel = str_f16_f32_panel ? atoi(str_f16_f32_panel) == 1 : opt_f16_f32_panel;
+    if (str_f16_f32_panel_shape) {
+        if (strcmp(str_f16_f32_panel_shape, "4x2") == 0) {
+            opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_4X2;
+        } else if (strcmp(str_f16_f32_panel_shape, "2x2") == 0) {
+            opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_2X2;
+        } else {
+            GGML_LOG_WARN("ggml-hex: ignoring unsupported F16_F32_PANEL_SHAPE=%s; using 2x2\n",
+                          str_f16_f32_panel_shape);
+            opt_f16_f32_panel_shape = HTP_MM_F16_F32_PANEL_2X2;
+        }
+    }
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;

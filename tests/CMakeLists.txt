@@ -529,3 +529,25 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+
+set(TEST_TARGET test-hexagon-buffer)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
+
+# Host-portable regression for metadata retained until a Hexagon queue reply.
+set(TEST_TARGET test-hexagon-opcache)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE
+    ../src ../src/ggml-hexagon ../src/ggml-hexagon/htp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-audio8-codec-f32)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_tests_properties(${TEST_TARGET} PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "GGML_HEXAGON_MM_SELECT=2;GGML_HEXAGON_OPSTAGE=3")
+add_test(NAME ${TEST_TARGET}-reference COMMAND $<TARGET_FILE:${TEST_TARGET}> --reference-only)
