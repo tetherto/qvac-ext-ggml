@@ -5,6 +5,73 @@ HMX. An HMX fused implementation exists, but **current Audio8 codec matmuls
 request F32 precision and stay on HVX**. Historical HMX dispatch does not
 establish the route taken by the current application.
 
+## Corrected S1 baseline, October 8
+
+On the same QDC Snapdragon 8 Elite, enabling polling reduced median inference
+time from **24.5906 s to 19.4765 s**, a **1.2626x speedup** (20.80% less time).
+The ten timed Hexagon runs produced identical code files and WAV files across
+both settings. This is evidence for polling preserving the measured S1 output.
+
+| Variant | Median inference (s) | Median process wall time (s) | Frames | Audio duration (s) | Inference RTF |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hexagon baseline, `OPPOLL=0` | 24.5906 | 24.9704 | 66 | 3.065034 | 8.022945 |
+| Hexagon polling, `OPPOLL=1` | 19.4765 | 19.8224 | 66 | 3.065034 | 6.354416 |
+| OpenCL | 3.3727 | 4.7182 | 70 | 3.250794 | 1.037500 |
+
+Inference time is Audio8's `StageTimings.total_ms`, which covers generation
+after model loading. Process wall time additionally includes CLI startup,
+loading, output writing, and teardown. RTF is inference seconds divided by the
+actual WAV duration. Each column reports its own median of five timed runs.
+
+Protocol: S1 text was "The quick brown fox jumps over the lazy dog." on QDC
+`sa880573`, device serial `f3b4a4c5`, with Q8_0 LM/decoder models, greedy
+decoding, four CPU threads, default seed 42, and a 70-frame cap. Each variant
+had three warmups followed by five timed CLI invocations. Variants ran in
+interleaved order `hex-base`, `hex-poll`, `opencl` on every repetition.
+`GGML_HEXAGON_OPSTAGE=3`, `HOSTBUF=1`, `OPFUSION=1`, and `PROFILE=0` were fixed;
+only `OPPOLL` changed between the two Hexagon variants. No diagnostic tensor
+callback was enabled.
+
+Runtime source was ggml `9ef658d3` (later documentation commit `73b087b1`) and
+speech `3778e63d`. All variants used the same staged CLI and device library set.
+That set included the corrected Hexagon host library from the standalone
+Hexagon build alongside the OpenCL libraries. Model SHA-256 values were:
+
+| Model | SHA-256 |
+| --- | --- |
+| `audio8-lm-q8_0.gguf` | `f33c58b2fd46320c01544eec961112b4b9778106ce883e86914dd38854072d40` |
+| `audio8-codec-decoder-q8_0.gguf` | `84d4b88fc5b2274c2cbfd95c4ce1bdae7820eb1e2464b7bd715d3fe370895432` |
+
+All five runs within each variant had repeatable code and WAV hashes. However,
+Hexagon and OpenCL generated different codes and lengths: OpenCL reached the
+70-frame cap, while Hexagon produced 66 frames. These measurements therefore
+do not establish CPU/OpenCL/Hexagon parity or equal generated workloads. This
+is a single-prompt baseline, not the earlier five-prompt suite. The completed
+scope is the buffer correctness fix and this baseline; broader parity work
+and further kernel/routing optimization remain follow-ups.
+
+Local evidence resides under
+`/home/alokr/code/speech-qvac/hexagon-26715-build/`:
+
+- `results/baseline-S1.json`: per-run timings, medians, output hashes.
+- `results/benchmark-S1.log`: run order and process timestamps, including warmups.
+- `results/benchmark-device/{hex-base,hex-poll,opencl}-S1-{warmup1..3,timed1..5}.{log,codes,wav}`:
+  raw CLI logs and generated outputs.
+- `results/model-sha256.txt`: checked model identities.
+- `device-stage/benchmark.sh`: device runner; `single` reproduces the S1 protocol.
+- `summarize-benchmark.py`: reconstructs the summary from timestamps, logs, and WAVs.
+
+After staging the matching build and models in `/data/local/tmp/qvac-26715`,
+run `sh /data/local/tmp/qvac-26715/benchmark.sh single` on the device and capture
+its output plus the generated `results/` files. Recompute the existing local
+summary from the ggml checkout with:
+
+```sh
+python3 ../hexagon-26715-build/summarize-benchmark.py \
+  ../hexagon-26715-build/results/benchmark-S1.log \
+  ../hexagon-26715-build/results/benchmark-device
+```
+
 ## Current application routing
 
 In the speech checkout, `engines/tts/src/audio8/codec_ops.cpp` sets
@@ -116,8 +183,9 @@ quantized types. After the fix those checks pass with both `HOSTBUF=1` and
 `HOSTBUF=0`, including explicit repack buffers in the default mode. The default
 Audio8 three-frame smoke now produces nonzero codes, but codes still diverge
 from CPU/OpenCL in the first frame. This establishes the buffer correction,
-not end-to-end parity; waveform finiteness, quality, and matched performance
-remain separate validation requirements.
+not end-to-end parity. The matched S1 timings above establish polling's
+performance and output stability for that prompt; waveform finiteness and
+perceptual quality remain separate validation requirements.
 
 ## Build the focused tests
 
