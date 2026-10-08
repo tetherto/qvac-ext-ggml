@@ -47,6 +47,7 @@
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "htp-opnode.h"
+#include "htp-opcache.h"
 #include "htp-ops.h"
 #include "htp/matmul-ops.h"
 #include "htp/flash-attn-ops.h"
@@ -144,6 +145,12 @@ static const char * htp_event_name(uint16_t id) {
         case HTP_TRACE_EVT_L2FLUSH:        return "L2FLUSH";
         case HTP_TRACE_EVT_INIT:           return "INIT";
         case HTP_TRACE_EVT_BUFF:           return "BUFF";
+        case HTP_TRACE_EVT_TENSOR_PREP:    return "TENSOR_PREP";
+        case HTP_TRACE_EVT_WORKER_WAKE:    return "WORKER_WAKE";
+        case HTP_TRACE_EVT_WORKER_SUSPEND: return "WORKER_SUSPEND";
+        case HTP_TRACE_EVT_OP_SETUP:       return "OP_SETUP";
+        case HTP_TRACE_EVT_OP_EXECUTE:     return "OP_EXECUTE";
+        case HTP_TRACE_EVT_OP_RETIRE:      return "OP_RETIRE";
         default:                           return "UNKNOWN";
     }
 }
@@ -193,6 +200,14 @@ static void ggml_hexagon_dump_trace_events(const std::string & sess_name, const 
             valid_cnt[t] = count > n_traces ? n_traces : count;
         }
 
+        uint32_t saturated = 0;
+        for (uint32_t t = 0; t <= HTP_MAX_NTHREADS; t++) {
+            if (n_traces && rsp.n_traces[t] >= n_traces) {
+                saturated |= 1u << t;
+            }
+        }
+        GGML_LOG_DEBUG("ggml-hex: %s trace-state capacity %u saturated-mask %u\n",
+                       sess_name.c_str(), n_traces, saturated);
         for (uint32_t t = 0; t <= HTP_MAX_NTHREADS; t++) {
             for (uint32_t idx = 0; idx < valid_cnt[t]; idx++) {
                 const auto & e = trace_events[t * n_traces + idx];
@@ -1544,11 +1559,13 @@ struct ggml_hexagon_opqueue {
     ggml_hexagon_shared_buffer *shm_buf;
     size_t                      shm_blk_size;
 
-    using opvec = std::vector<htp_opnode>;
-
     std::queue<unsigned int>    done;           // completed batch ids
-    std::vector<opvec>          op_cache;       // per batch op cache
-    std::vector<uint64_t>       start_usec;     // per batch start time
+    htp_op_cache               op_cache;       // live metadata per outstanding batch
+    std::vector<uint64_t>       start_usec;     // profiled capture-to-response lifetime
+    // PROFILE-only aggregates. Lifetime overlaps queued batches; pop includes
+    // profile formatting/output, so these fields must not be summed as compute.
+    uint64_t prof_batches = 0, prof_ops = 0, prof_cache_us = 0, prof_pack_us = 0;
+    uint64_t prof_submit_us = 0, prof_wait_us = 0, prof_pop_us = 0, prof_lifetime_us = 0;
 
     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) {
         size_t n_bufs    = HTP_OP_MAX_BUFS;
@@ -1581,6 +1598,13 @@ struct ggml_hexagon_opqueue {
     }
 
     ~ggml_hexagon_opqueue() {
+        if (opt_profile && prof_batches) {
+            GGML_LOG_INFO("ggml-hex: %s profile-host batches %llu ops %llu cache-us %llu pack-us %llu submit-us %llu wait-us %llu pop-us %llu lifetime-sum-us %llu\n",
+                shm_buf->sess->c_name(), (unsigned long long) prof_batches, (unsigned long long) prof_ops,
+                (unsigned long long) prof_cache_us, (unsigned long long) prof_pack_us,
+                (unsigned long long) prof_submit_us, (unsigned long long) prof_wait_us,
+                (unsigned long long) prof_pop_us, (unsigned long long) prof_lifetime_us);
+        }
         delete shm_buf;
     }
 
@@ -1600,8 +1624,15 @@ struct ggml_hexagon_opqueue {
         req.n_tensors = op_batch->n_tens;
         req.n_ops     = op_batch->n_ops;
 
-        op_cache[req.id]   = op_batch->ops;
-        start_usec[req.id] = ggml_time_us();
+        const uint64_t cache_start = opt_profile ? ggml_time_us() : 0;
+        op_cache.capture(req.id, op_batch->ops, req.n_ops);
+        const uint64_t pack_start = opt_profile ? ggml_time_us() : 0;
+        if (opt_profile) {
+            prof_cache_us += pack_start - cache_start;
+            start_usec[req.id] = cache_start;
+            prof_batches++;
+            prof_ops += req.n_ops;
+        }
 
         const size_t b_size = sizeof(htp_buf_desc)  * req.n_bufs;
         const size_t t_size = sizeof(htp_tensor)    * req.n_tensors;
@@ -1653,6 +1684,9 @@ struct ggml_hexagon_opqueue {
             }
         }
 
+        if (opt_profile) {
+            prof_pack_us += ggml_time_us() - pack_start;
+        }
         return true;
     }
 
@@ -1709,6 +1743,7 @@ struct ggml_hexagon_opqueue {
 
 // Flush HTP response queue i.e wait for all outstanding requests to complete
 void ggml_hexagon_session::flush_pending(bool all) {
+    uint64_t wait_start = opt_profile ? ggml_time_us() : 0;
     while (this->op_pending) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -1756,7 +1791,17 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_ABORT("ggml-hex: %s aborting on DSP failure (see op dump above)\n", this->c_name());
         }
 
+        const uint64_t pop_start = opt_profile ? ggml_time_us() : 0;
+        if (opt_profile) {
+            op_queue->prof_wait_us += pop_start - wait_start;
+            GGML_ASSERT(rsp.id < op_queue->start_usec.size());
+            op_queue->prof_lifetime_us += pop_start - op_queue->start_usec[rsp.id];
+        }
         op_queue->pop(rsp, dbuf);
+        if (opt_profile) {
+            wait_start = ggml_time_us();
+            op_queue->prof_pop_us += wait_start - pop_start;
+        }
 
         this->op_pending--;  // atomic dec
 
@@ -1782,7 +1827,11 @@ void ggml_hexagon_session::flush_batch() {
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
+    const uint64_t submit_start = opt_profile ? ggml_time_us() : 0;
     int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
+    if (opt_profile) {
+        op_queue->prof_submit_us += ggml_time_us() - submit_start;
+    }
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }

@@ -196,6 +196,12 @@ enum htp_trace_event_id {
     HTP_TRACE_EVT_L2FLUSH             = 1,
     HTP_TRACE_EVT_INIT                = 2,
     HTP_TRACE_EVT_BUFF                = 3,
+    HTP_TRACE_EVT_TENSOR_PREP         = 4,
+    HTP_TRACE_EVT_WORKER_WAKE         = 5,
+    HTP_TRACE_EVT_WORKER_SUSPEND      = 6,
+    HTP_TRACE_EVT_OP_SETUP            = 7,
+    HTP_TRACE_EVT_OP_EXECUTE          = 8,
+    HTP_TRACE_EVT_OP_RETIRE           = 9,
 
     HTP_TRACE_EVT_HVX_COMP            = 20,
     HTP_TRACE_EVT_HVX_A_QUANT         = 21,
