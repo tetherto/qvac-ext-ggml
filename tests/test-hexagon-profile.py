@@ -57,8 +57,13 @@ class TestProfile(unittest.TestCase):
         self.assertEqual(result[0]["sessions"][0]["groups"][0]["leaf_cycle_percent"], 0)
 
     def test_malformed_record_fails_instead_of_silently_omitting_work(self):
-        with self.assertRaisesRegex(ValueError, "line 1"):
-            PROFILE.summarize([record("MUL_MAT+ADD", 42).replace("cycles 42", "cycles ???")])
+        for line in [
+            record("MUL_MAT+ADD", 42).replace("cycles 42", "cycles ???"),
+            "ggml-hex: HTP0 profile-op\n",
+            "ggml-hex: HTP0 profile-op MUL_MAT+ADD|weights x input -> out\n",
+        ]:
+            with self.subTest(line=line), self.assertRaisesRegex(ValueError, "line 1"):
+                PROFILE.summarize([line])
 
 
 if __name__ == "__main__":

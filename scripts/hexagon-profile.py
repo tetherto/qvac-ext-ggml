@@ -13,7 +13,7 @@ import re
 
 
 MARKER = re.compile(r"^\s*===\s*(.*?)\s*===\s*$")
-RECORD = re.compile(r"\b(HTP\d+) profile-op (.*)")
+RECORD = re.compile(r"\b(HTP\d+) profile-op\b(.*)")
 TIMING = re.compile(r"^usec (\d+) cycles (\d+) start (\d+) mhz \S+(?: pmu \[.*\])?$")
 
 

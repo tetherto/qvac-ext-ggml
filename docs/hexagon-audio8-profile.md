@@ -1,8 +1,9 @@
 # Audio8 fused matmul profiling
 
 QVAC-26715 originally proposed routing Audio8's large fused `MUL_MAT+ADD` to
-HMX. The October 7 profile used for that proposal already labels **every fused
-call `hmx-tiled`**. Verify the kernel and workload before changing dispatch.
+HMX. The October 7 profile used for that proposal already labels **every
+`MUL_MAT+ADD` call `hmx-tiled`**. Verify the kernel and workload before changing
+dispatch.
 
 The source log is `audio8-raw/hex-profile.log` (not checked into this repository).
 It contains two labelled runs, including the warmup despite its label saying
