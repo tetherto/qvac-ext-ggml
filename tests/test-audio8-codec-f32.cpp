@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,7 @@ struct shape {
     const char * name;
     int k, channels, rows, batches;
     bool views, bias, panel;
+    bool varied = false;
 };
 
 static const shape cases[] = {
@@ -32,6 +34,11 @@ static const shape cases[] = {
     {"channels96",    96, 96, 33, 1, false, false, true},
     {"channels192",  192,192, 33, 1, false, false, true},
     {"channels384",  384,384, 33, 1, false, false, true},
+    // Independent values along every axis expose lane/row permutations that
+    // the deliberately repeated cancellation pattern cannot distinguish.
+    {"varied-k96",    96,  9,  7, 1, true,  false, true, true},
+    {"varied-k192",  192,  7, 11, 1, false, false, true, true},
+    {"varied-k384",  384, 11,  9, 1, true,  false, true, true},
     // Ineligible shapes retain the existing F16-activation arithmetic.
     {"guard-k32",     32,  7,  5, 1, false, false, false},
     {"guard-batched", 96,  7,  5, 2, false, false, false},
@@ -41,19 +48,33 @@ static const shape cases[] = {
 };
 
 struct inputs {
-    std::vector<float> weights, activations, expected;
+    std::vector<float> weights, activations;
+    std::vector<double> expected, tolerance;
 };
+
+static float varied_value(uint32_t index, uint32_t seed) {
+    uint32_t bits = index ^ seed;
+    bits ^= bits >> 16;
+    bits *= 0x7feb352du;
+    bits ^= bits >> 15;
+    bits *= 0x846ca68bu;
+    bits ^= bits >> 16;
+    return float(int32_t(bits & 0x00ffffffu) - 0x00800000) / 8388608.0f;
+}
 
 static inputs make_inputs(const shape & s, bool narrow) {
     inputs in;
     in.weights.resize(size_t(s.k) * s.channels * s.batches);
     in.activations.resize(size_t(s.k) * s.rows * s.batches);
     in.expected.resize(size_t(s.channels) * s.rows * s.batches);
+    in.tolerance.resize(in.expected.size(), 2e-6);
     for (int batch = 0; batch < s.batches; ++batch) {
         for (int c = 0; c < s.channels; ++c) {
             for (int k = 0; k < s.k; ++k) {
-                const float weight = k == s.k - 1 && s.k % 2 ? 0.0f
-                                     : float(1 + c % 4) * (k % 2 ? -1.0f : 1.0f);
+                const float weight = s.varied
+                    ? varied_value(uint32_t((batch * s.channels + c) * s.k + k), 0x735a2d91u)
+                    : (k == s.k - 1 && s.k % 2 ? 0.0f
+                       : float(1 + c % 4) * (k % 2 ? -1.0f : 1.0f));
                 in.weights[(size_t(batch) * s.channels + c) * s.k + k] =
                     ggml_fp16_to_fp32(ggml_fp32_to_fp16(weight));
             }
@@ -63,17 +84,29 @@ static inputs make_inputs(const shape & s, bool narrow) {
                 const float base = 1.0f + float((k / 2 + r) % 8) / 16.0f;
                 const float delta = float(1 + (r + batch) % 3) / 8192.0f;
                 float x = base + (k % 2 ? 0.0f : delta);
+                if (s.varied) x = varied_value(uint32_t((batch * s.rows + r) * s.k + k), 0xd62f179bu);
                 if (narrow) x = ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
                 in.activations[(size_t(batch) * s.rows + r) * s.k + k] = x;
             }
             for (int c = 0; c < s.channels; ++c) {
-                double sum = 0;
+                double sum = 0, sum_abs = 0;
                 for (int k = 0; k < s.k; ++k) {
-                    sum += double(in.weights[(size_t(batch) * s.channels + c) * s.k + k]) *
-                           in.activations[(size_t(batch) * s.rows + r) * s.k + k];
+                    const double product = double(in.weights[(size_t(batch) * s.channels + c) * s.k + k]) *
+                                           in.activations[(size_t(batch) * s.rows + r) * s.k + k];
+                    sum += product;
+                    sum_abs += std::abs(product);
                 }
                 if (s.bias) sum += float(c + 1) / 16.0f;
-                in.expected[(size_t(batch) * s.rows + r) * s.channels + c] = float(sum);
+                const size_t index = (size_t(batch) * s.rows + r) * s.channels + c;
+                in.expected[index] = sum;
+                if (s.varied) {
+                    // Conservative forward-error bound for separate F32
+                    // products and additions: gamma_(2K+1) * sum(abs(w*x)).
+                    // This permits different reduction orders without hiding
+                    // permutations; cancellation fixtures keep the strict bound.
+                    const double roundoff = (2 * s.k + 1) * 0.5 * std::numeric_limits<float>::epsilon();
+                    in.tolerance[index] = std::max(2e-6, roundoff / (1.0 - roundoff) * sum_abs);
+                }
             }
         }
     }
@@ -146,16 +179,17 @@ static bool compute(ggml_backend_t backend, const shape & s, const inputs & in,
 }
 
 static bool compare(const char * backend, const shape & s, const std::vector<float> & actual,
-                    const std::vector<float> & expected) {
-    bool ok = actual.size() == expected.size();
-    double max_abs = 0;
-    for (size_t i = 0; i < actual.size() && i < expected.size(); ++i) {
-        const double error = std::abs(double(actual[i]) - expected[i]);
-        ok = std::isfinite(actual[i]) && error <= 2e-6 && ok;
+                    const inputs & reference) {
+    bool ok = actual.size() == reference.expected.size();
+    double max_abs = 0, max_bound = 0;
+    for (size_t i = 0; i < actual.size() && i < reference.expected.size(); ++i) {
+        const double error = std::abs(double(actual[i]) - reference.expected[i]);
+        ok = std::isfinite(actual[i]) && error <= reference.tolerance[i] && ok;
         max_abs = std::max(max_abs, error);
+        max_bound = std::max(max_bound, reference.tolerance[i]);
     }
-    std::printf("%s %s k=%d channels=%d rows=%d batches=%d max_abs=%.9g %s\n",
-                backend, s.name, s.k, s.channels, s.rows, s.batches, max_abs, ok ? "PASS" : "FAIL");
+    std::printf("%s %s k=%d channels=%d rows=%d batches=%d max_abs=%.9g max_bound=%.9g %s\n",
+                backend, s.name, s.k, s.channels, s.rows, s.batches, max_abs, max_bound, ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -183,14 +217,14 @@ int main(int argc, char ** argv) {
         std::vector<float> result;
         const bool ref_ok = compute(cpu, s, expected, GGML_TYPE_F32, result);
         ok = ref_ok && ok;
-        if (ref_ok) ok = compare("CPU-dequantized-F32", s, result, expected.expected) && ok;
+        if (ref_ok) ok = compare("CPU-dequantized-F32", s, result, expected) && ok;
         // Confirm this fixture would catch activation narrowing on every
         // eligible shape, rather than accidentally using F16-exact inputs.
         if (s.panel && full.expected == narrowed.expected) ok = false;
         if (hexagon) {
             const bool ran = compute(hexagon, s, full, GGML_TYPE_F16, result);
             ok = ran && ok;
-            if (ran) ok = compare("Hexagon", s, result, expected.expected) && ok;
+            if (ran) ok = compare("Hexagon", s, result, expected) && ok;
         }
     }
     ggml_backend_free(hexagon);
