@@ -21,8 +21,7 @@ remainders. Batched, fused, and other layouts retain the existing routes. HMX
 selection keeps its existing precedence; set `GGML_HEXAGON_MM_SELECT=2` when
 testing the panel explicitly. The option applies only when the normal VTCM
 path cannot be used. Eligible small shapes retain the existing VTCM kernel;
-focused DDR tests use activation
-matrices larger than the device VTCM budget.
+focused DDR tests use activation matrices larger than the device VTCM budget.
 
 This option defaults off. Evaluate with `GGML_HEXAGON_OPSTAGE=3`, the exact-F32
 oracle, fixed-code codec/PCM comparisons, and end-to-end Audio8 timing against
@@ -61,9 +60,78 @@ The initial broad selector passed fixed-code CPU/OpenCL parity, but repeated
 full S1 inference medians were 19.8494 s off versus 19.8996 s on. Paired profiles
 matched all 67,539 leaf operations: 76 existing DDR matmuls saved 5,408.814 ms,
 while replacing 41 existing VTCM matmuls added 5,341.744 ms. The selector now
-preserves every normal VTCM choice and only replaces DDR fallbacks. Updated
-model parity and end-to-end timings are required for this narrower selector;
-the isolated results do not establish its application speedup.
+preserves every normal VTCM choice and only replaces DDR fallbacks. The results below validate this narrower selector.
+
+## Validated DDR-only panel result, October 8
+
+On the renewed QDC SM8750/v79 device (`57dd7911`), the opt-in panel reduced
+median S1 inference from **20.346 s to 14.603 s**: **1.3933x faster**, or
+**28.23% less inference time**. The codec synthesis median fell from 12.4843 s
+to 7.0899 s. These are same-device comparisons of the same binary, changing
+only `GGML_HEXAGON_F16_F32_PANEL` between 0 and 1.
+
+| Setting | Median inference (s) | Median codec synthesis (s) | Inference RTF |
+| --- | ---: | ---: | ---: |
+| Panel off | 20.346 | 12.4843 | 6.6381 |
+| DDR-only panel on | 14.603 | 7.0899 | 4.7644 |
+
+Each setting had three warmups and five timed runs, interleaved off/on.
+The prompt was "The quick brown fox jumps over the lazy dog.", with greedy
+sampling, default seed 42, four threads, and a 70-frame cap. Every run produced
+the same 66-frame code sequence and 3.065034 s of audio. WAV hashes repeat
+within each setting; cross-setting WAVs differ slightly and pass the numeric
+gates (cosine `0.9999999404`, NMSE `1.19266e-7`). Inference uses the CLI's
+`StageTimings.total_ms`, excluding model loading, not process wall time.
+
+Both 3-frame and 66-frame fixed-code checks pass all five codec/PCM boundaries
+against CPU reference. The 3-frame PCM is identical between panel settings.
+For 66 frames, candidate PCM versus CPU has cosine `0.9999966593` and NMSE
+`6.72147e-6`. Direct candidate versus OpenCL PCM has cosine `0.9999900834` and
+NMSE `1.98341e-5`; all compared PCM is finite. Gates are cosine at least
+0.9999 and NMSE at most 2e-4. This establishes bounded numerical agreement,
+not bit-identical waveforms, universal prompt coverage, or subjective audio
+quality. OpenCL comparison uses identical codes; differing free-running
+CPU/OpenCL/Hexagon trajectories remain outside this optimization's claim.
+
+Validation also passed 23 independent-oracle device cases, host reference
+checks, host/Android/DSP v79 builds, and independent review. The cases cover
+natural DDR routing, VTCM preservation, varied and precision-sensitive inputs,
+odd dimensions, strides, offsets, bias, and excluded shapes. The existing
+small VTCM arithmetic is intentionally retained. The option remains off by
+default.
+
+Use the corrected ggml host-buffer and speech key-cache fixes, then enable:
+
+```sh
+export GGML_HEXAGON_HOSTBUF=1
+export GGML_HEXAGON_OPPOLL=1
+export GGML_HEXAGON_OPSTAGE=3
+export GGML_HEXAGON_OPFUSION=1
+export GGML_HEXAGON_F16_F32_PANEL=1
+```
+
+Do not use `OPSTAGE=1`: it omits computation. Performance runs used
+`GGML_HEXAGON_PROFILE=0` and default matmul selection. The model identities are
+those listed in the corrected baseline below. Runtime routing commit was
+`f4ab5509`, tests `e4e6ac15`, and speech runtime `3778e63d` (later documented at `0f75ca40`). The DSP is unchanged
+from the isolated-kernel checks. The staged stripped host library SHA-256 is
+`bc39c3acdb013644fec7adc08b93a7ee2a9c25d3aa7c1a000082b777954aa768`.
+
+Evidence beside the checkout is under `hexagon-codec-build/`:
+
+- `results/model-ddr/`: all raw logs, code/WAV outputs, and fixed-code PCM exports.
+- `results/model-ddr-summary.json` and `summarize-model.py`: timings, hashes,
+  waveform metrics and completeness checks for all ten timed runs.
+- `stage/validate-audio-ddr.sh` and `results/model-validation-ddr.log`: exact
+  run order, model hash verification, flags and commands.
+- `results/device-oracle-ddr.log` and `results/ci-validation.txt`: test/build evidence.
+- `results/profiles/`: paired profiles explaining why VTCM routes must be retained.
+
+The OpenCL reference run uses the earlier OpenCL-enabled registry with the
+same CPU/base libraries; the candidate registry is built for CPU/Hexagon.
+This registry setup does not change the timed Hexagon library set. The earlier
+polling-only baseline below came from a different QDC device serial; do not
+combine the two speedup ratios as a same-device measurement.
 
 ## Corrected S1 baseline, October 8
 
