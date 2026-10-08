@@ -360,6 +360,9 @@ struct htp_opformat {
             } else if (type == HTP_MM_KERNEL_HVX_F16_F16_VTCM || type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
                        type == HTP_MM_KERNEL_HVX_QUANT_ROW    || type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
                 path = "hvx-tiled";
+            } else if (type == HTP_MM_KERNEL_HVX_F16_F32_DDR &&
+                       kparams->tile_size == HTP_MM_F16_F32_PANEL_4X2) {
+                path = "hvx-panel-4x2";
             } else if (type == HTP_MM_KERNEL_HVX_F16_F16_DDR  || type == HTP_MM_KERNEL_HVX_F16_F32_DDR ||
                        type == HTP_MM_KERNEL_HVX_F32_F32_DDR  || type == HTP_MM_KERNEL_HVX_F32_F16_DDR ||
                        type == HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT) {

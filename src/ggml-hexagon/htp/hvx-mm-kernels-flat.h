@@ -1306,6 +1306,57 @@ static inline void vec_dot_f16_f32_uu_2x2(const uint32_t n, float * restrict s0,
     hvx_vec_store_u(s1, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum01, sum11));
 }
 
+
+// Four weight rows share each pair of F32 activation vectors. Each output
+// retains the 2x2 kernel's low-then-high accumulation and pairwise reduction.
+static inline void vec_dot_f16_f32_uu_4x2(const uint32_t n, float * restrict s0, float * restrict s1,
+                                        const void * restrict vx0, const void * restrict vx1,
+                                        const void * restrict vx2, const void * restrict vx3,
+                                        const void * restrict vy0, const void * restrict vy1) {
+    const uint8_t * x0 = vx0;
+    const uint8_t * x1 = vx1;
+    const uint8_t * x2 = vx2;
+    const uint8_t * x3 = vx3;
+    const uint8_t * y0 = vy0;
+    const uint8_t * y1 = vy1;
+    HVX_Vector sum00 = Q6_V_vzero(), sum01 = Q6_V_vzero();
+    HVX_Vector sum10 = Q6_V_vzero(), sum11 = Q6_V_vzero();
+    HVX_Vector sum20 = Q6_V_vzero(), sum21 = Q6_V_vzero();
+    HVX_Vector sum30 = Q6_V_vzero(), sum31 = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP16) {
+        const HVX_VectorPair w0 = panel_f16_weights(x0 + k * 2, n - k);
+        const HVX_VectorPair w1 = panel_f16_weights(x1 + k * 2, n - k);
+        const HVX_VectorPair w2 = panel_f16_weights(x2 + k * 2, n - k);
+        const HVX_VectorPair w3 = panel_f16_weights(x3 + k * 2, n - k);
+        HVX_Vector a0 = hvx_vmemu(y0 + k * 4);
+        HVX_Vector a1 = hvx_vmemu(y1 + k * 4);
+        sum00 = HVX_OP_ADD_F32(sum00, HVX_OP_MUL_F32(Q6_V_lo_W(w0), a0));
+        sum01 = HVX_OP_ADD_F32(sum01, HVX_OP_MUL_F32(Q6_V_lo_W(w0), a1));
+        sum10 = HVX_OP_ADD_F32(sum10, HVX_OP_MUL_F32(Q6_V_lo_W(w1), a0));
+        sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(Q6_V_lo_W(w1), a1));
+        sum20 = HVX_OP_ADD_F32(sum20, HVX_OP_MUL_F32(Q6_V_lo_W(w2), a0));
+        sum21 = HVX_OP_ADD_F32(sum21, HVX_OP_MUL_F32(Q6_V_lo_W(w2), a1));
+        sum30 = HVX_OP_ADD_F32(sum30, HVX_OP_MUL_F32(Q6_V_lo_W(w3), a0));
+        sum31 = HVX_OP_ADD_F32(sum31, HVX_OP_MUL_F32(Q6_V_lo_W(w3), a1));
+        if (n - k >= VLEN_FP16) {
+            a0 = hvx_vmemu(y0 + (k + VLEN_FP32) * 4);
+            a1 = hvx_vmemu(y1 + (k + VLEN_FP32) * 4);
+            sum00 = HVX_OP_ADD_F32(sum00, HVX_OP_MUL_F32(Q6_V_hi_W(w0), a0));
+            sum01 = HVX_OP_ADD_F32(sum01, HVX_OP_MUL_F32(Q6_V_hi_W(w0), a1));
+            sum10 = HVX_OP_ADD_F32(sum10, HVX_OP_MUL_F32(Q6_V_hi_W(w1), a0));
+            sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(Q6_V_hi_W(w1), a1));
+            sum20 = HVX_OP_ADD_F32(sum20, HVX_OP_MUL_F32(Q6_V_hi_W(w2), a0));
+            sum21 = HVX_OP_ADD_F32(sum21, HVX_OP_MUL_F32(Q6_V_hi_W(w2), a1));
+            sum30 = HVX_OP_ADD_F32(sum30, HVX_OP_MUL_F32(Q6_V_hi_W(w3), a0));
+            sum31 = HVX_OP_ADD_F32(sum31, HVX_OP_MUL_F32(Q6_V_hi_W(w3), a1));
+        }
+    }
+    hvx_vec_store_u(s0, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum00, sum10));
+    hvx_vec_store_u(s0 + 2, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum20, sum30));
+    hvx_vec_store_u(s1, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum01, sum11));
+    hvx_vec_store_u(s1 + 2, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum21, sum31));
+}
+
 #undef HVX_OP_ADD_F32
 #undef HVX_OP_MUL_F32
 
