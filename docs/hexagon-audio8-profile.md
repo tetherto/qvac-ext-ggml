@@ -5,6 +5,163 @@ HMX. An HMX fused implementation exists, but **current Audio8 codec matmuls
 request F32 precision and stay on HVX**. Historical HMX dispatch does not
 establish the route taken by the current application.
 
+## Dispatch investigation (QVAC-26714)
+
+The task's historical "58% framework overhead" estimate treated inclusive
+OPBATCH timing as exclusive dispatch time. It is not a valid overhead estimate.
+In the saved `hexagon-codec-build/results/profiles/profile-p1.log`, 12,895
+batches contain 67,539 leaf operations. Batch time totals 13.537086 s; the
+leaf sum is 13.272701 s, leaving 0.264385 s (1.953% of batch time) outside
+those leaf intervals. Leaf intervals themselves include tensor binding and
+cache coherence, not only arithmetic. The 6.461 s of inference outside
+OPBATCH also includes CPU work, scheduling, transport and profiling output.
+This trace predates the final DDR-only selector and is historical diagnostic
+evidence, not the current performance baseline.
+
+The host previously copied the complete 1,024-entry operation vector for
+every submission, including unused entries. The historical trace would copy
+13,204,480 entries for 67,539 live operations (195.5x excess); 7,769 batches
+contained just ADD followed by RMS_NORM+MUL. The queue now snapshots only the
+live prefix into its slot. It still owns fused-operation vectors and kernel
+metadata until the response arrives, retaining both profiling and DSP-error
+diagnostics when the submission buffer is reused. Tensor storage, descriptors,
+cache flushes, synchronization, arithmetic and kernel routing are unchanged.
+
+`PROFILE=3` adds these main-thread trace spans using the existing trace layout:
+
+| Span | Meaning |
+| --- | --- |
+| `BUFF` | Batch buffer mapping/preparation (existing span) |
+| `TENSOR_PREP` | Batch tensor descriptor/view preparation |
+| `WORKER_WAKE` / `WORKER_SUSPEND` | Worker/HMX wake and completion handling |
+| `OP_SETUP` | Per-op metadata, tensor binding and coherence flushes |
+| `OP_EXECUTE` | Kernel execution, including its nested traces |
+| `OP_RETIRE` | Dirty tracking and scratch-pointer reset |
+
+For a normal greedy S1 invocation, enable `GGML_HEXAGON_PROFILE=3` and
+`GGML_HEXAGON_OPTRACE=65536`, keep computation enabled (`OPSTAGE=3`), use
+`--verbose`, and capture stdout plus stderr. Then run:
+
+```sh
+python3 scripts/hexagon-dispatch-profile.py audio8-s1-trace.log
+```
+
+Check `complete_trace`: the parser requires matched spans, exact per-operation
+index coverage and batch preparation/worker spans, and detects trace saturation.
+Only matched spans contribute to totals. Nested L2 flush and worker/kernel
+spans are not additive wall time. Trace timestamps wrap at 32 bits; a single
+span must be shorter than one counter period. Increase trace capacity if
+necessary, accounting for shared memory per queue slot and thread.
+
+For `PROFILE>0`, `profile-host` reports cumulative cache-copy, packing,
+submission, waiting, response-pop and capture-to-response lifetime timings on
+backend release (and queue destruction, if reached). The parser's `host_latest`
+selects the latest snapshot per session; repeated snapshots must not be summed.
+Wait includes DSP work/transport/polling; pop includes profile formatting and
+logging; queued lifetimes overlap. These totals cannot be summed as exclusive
+dispatch time. Profiling remains off by default. Use separate unprofiled runs
+for performance claims, with all validated optimizations enabled by default.
+
+The shared cache regression covers deep metadata ownership after source
+mutation/destruction, independent queue slots, shrink/empty/grow reuse and
+profiler/error formatting. It passes host CTest, Android compilation and
+focused ASan/UBSan. LeakSanitizer was unavailable under sandbox ptrace.
+Ten dispatch-parser regressions and five existing profile-parser tests pass.
+
+### S1 validation of the live-operation cache
+
+On October 8, QDC SM8750/v79 device `e8b7f0c8` compared baseline ggml
+`866ad51f` (runtime defaults `1f334383`) with candidate runtime `7d75209c`
+and cache tests `7da5ad5b`. The speech CLI has the same runtime source as
+PR #303 `3b74ad91`; changes since its build are test/documentation only.
+All five tuning variables were unset, exercising compiled defaults
+`OPPOLL=1`, `OPSTAGE=3`, `OPFUSION=1`, `HOSTBUF=1`, `F16_F32_PANEL=1`.
+Profiling was disabled. S1 used greedy seed 42, four threads, max 70 frames,
+three warmups and five timed runs per variant with alternating pair order.
+
+| Variant | Five inference times (s) | Median (s) | Median codec synthesis (s) |
+| --- | --- | ---: | ---: |
+| Baseline | 13.8197, 14.2418, 13.9042, 13.4194, 14.1262 | 13.9042 | 7.0655 |
+| Live-operation cache | 13.8654, 13.8926, 14.2358, 14.0464, 14.0297 | 14.0297 | 7.0730 |
+
+The candidate median is **0.90% slower**, within the observed run spread;
+this experiment demonstrates **no end-to-end speedup**. Every run began at
+thermal status 0, but timed post-run states were `0,0,2,0,1` for baseline
+and `1,0,0,1,0` for candidate. Cooling does not eliminate all thermal variation,
+and five samples cannot establish a performance-equivalence bound.
+
+All 16 runs produced identical 66-frame code and WAV files (3.065034 s audio):
+
+- codes SHA-256: `3d7e3716ec6c6e6776e4955fafb2eec08c3bc05fdcd3c2ba20c93ab2f46fed17`
+- WAV SHA-256: `cabfe8e928545d755e41749d86cda74b2f1e4cfe16e505e22a56f6ee9388cbd9`
+
+The candidate passes all 23 independent device oracle cases and all five
+fixed-66-frame codec boundaries vs CPU. PCM cosine is `0.9999966593`, NMSE
+`6.721473961e-6`. Both separate PROFILE=1 and PROFILE=3 captures preserve the
+same codes/WAV hashes. This validates these inputs; it does not establish
+universal CPU/OpenCL/Hexagon trajectory equivalence.
+
+Artifact SHA-256:
+
+| Artifact | Baseline | Candidate |
+| --- | --- | --- |
+| Hexagon host library | `248af7d0db677e47a38c25e1a57bbdeb8c826423824f87b7a7af63b6d496f253` | `3be5cc86d15d306b0dfbd3b34eb0a22713b531806105c71e7fb9e7bc3fd931a7` |
+| v79 DSP skeleton | `49b8e8d93f12b19494da69666c47b9f4b766bd08d62aba6dcc5c0b7485fbb041` | `faeb5abeb402142cf2ae5f0bbb8231ff03266ff3735b160a569f8f82b10b0732` |
+
+The CLI SHA-256 is `da8ca10b5928159e83fa6e978c2570b6d5091338ae97b1ef4f2758e29a2993ee`.
+Model hashes remain those listed below. Reproduction scripts and raw evidence
+are in `hexagon-26714-build/run-s1.sh`, `run-profile.sh`, `results/device/`,
+`results/s1-summary.json` and `results/cli-provenance.txt` beside the checkout.
+
+### Current DSP dispatch breakdown
+
+The candidate's separate PROFILE=1 capture contains 12,895 batches and 67,539
+operations. Inclusive batch time is 8.217117 s, leaf time 7.948592 s, and the
+residual is 268.525 ms. The residual is 2.8850% by cycles and 3.2679% by
+microseconds; independent timer sampling and integer-microsecond conversion
+affect these small differences.
+This residual is batch work outside leaf intervals, not all dispatch cost.
+The largest batch contains 495 operations, below the 1,024 limit. Its 7.062788 s
+inclusive time contains only 0.623 ms residual; raising batch capacity is not
+supported by this evidence.
+
+The full PROFILE=3 capture passes `complete_trace` for every batch and
+operation with zero saturation, missing spans, duplicate indices or unmatched
+edges. Main-thread spans as shares of inclusive DSP batch cycles:
+
+| Span | Count | Batch cycle share |
+| --- | ---: | ---: |
+| `OP_EXECUTE` | 67,539 | 95.5081% |
+| `OP_SETUP` | 67,539 | 1.2811% |
+| `OP_RETIRE` | 67,539 | 0.2435% |
+| `BUFF` | 12,895 | 0.0999% |
+| `TENSOR_PREP` | 12,895 | 0.1107% |
+| `WORKER_WAKE` | 12,895 | 0.7558% |
+| `WORKER_SUSPEND` | 12,895 | 0.3660% |
+
+These disjoint spans cover 98.3651% of batch cycles. Execute includes kernel
+setup, synchronization and nested work; it is not pure arithmetic. Separately,
+L2FLUSH totals 1.7063% but mixes nested and batch-boundary spans, so it must
+not be added to this table. The trace's 28.7024 s application inference time
+is heavily perturbed by trace handling; inclusive DSP batch time remains
+8.243389 s. Neither profiled run supplies a speedup claim.
+
+This evidence does not establish a major DSP batch-dispatch bottleneck.
+Preserve coherence and worker synchronization. The three largest codec matmul
+families still account for 71.18% of PROFILE=1 leaf microseconds; investigate
+kernel execution and host/CPU scheduling before speculative batching changes.
+Raw captures and analysis are `hexagon-26714-build/results/profile{1,3}.log.gz`
+and `profile{1,3}-analysis.json` beside the checkout.
+
+Those captures also exposed a host-summary lifetime issue: the registry-owned
+queue survives backend release, so destructor-only host logging did not run.
+Commit `573a4508` emits gated cumulative snapshots at backend release without
+flushing or changing default execution. The S1 timings above use the earlier
+stub; this follow-up changes profiling output only. Its matching diagnostic
+stub SHA-256 is `f718204047fcaf33c31ee7562ada8366001cfc710c5ab65a7731f3c0d1d6375a`;
+the DSP skeleton is unchanged. A snapshot reports currently recorded counters,
+not an implicit queue drain.
+
 ## F32 codec panels
 
 The Hexagon backend enables a 2x2 HVX DDR output panel by default for
@@ -143,6 +300,39 @@ same CPU/base libraries; the candidate registry is built for CPU/Hexagon.
 This registry setup does not change the timed Hexagon library set. The earlier
 polling-only baseline below came from a different QDC device serial; do not
 combine the two speedup ratios as a same-device measurement.
+
+## Default-enabled verification and S1–S5 follow-up, October 8
+
+Commit `1f334383` makes polling and the DDR panel the backend defaults. PR #116
+was merged into PR #115's feature branch at `866ad51f`; #115 remains the single
+combined PR targeting `speech`.
+
+The rebuilt host library was checked on QDC device `57dd7911` with
+`OPPOLL`, `OPSTAGE`, `OPFUSION`, `HOSTBUF` and `F16_F32_PANEL` environment
+overrides unset. All 23 focused oracle cases and all five fixed-66-frame codec
+boundaries passed. Full S1 codes and WAV were byte-identical to the earlier
+explicit-enabled panel result. Setting `OPPOLL=0` and `F16_F32_PANEL=0`
+reproduced the earlier panel-off codes and WAV byte for byte. Host reference,
+buffer and profile-parser checks, host/Android/DSP builds, and independent
+review passed. The DSP binary remains unchanged.
+
+The stripped default-enabled Hexagon host library SHA-256 is
+`248af7d0db677e47a38c25e1a57bbdeb8c826423824f87b7a7af63b6d496f253`.
+Device validation output is retained at
+`hexagon-codec-build/results/defaults-validation.log`; the remote artifact
+directory is `/data/local/tmp/qvac-codec/results-defaults-20261008`.
+
+A requested CPU/OpenCL/Hexagon S1–S5 sweep used greedy decoding, seed 42,
+four threads, per-prompt frame caps 70/60/90/70/110, and three warmups plus five
+timed runs per cell. QDC access ended during S2. S1's thermal snapshots also
+showed a transition from status 0 to status 3, with OpenCL inference rising
+from about 3.4 s to 7.3 s. These mixed-state, incomplete results are not the
+final cross-backend benchmark. The user retained S1 and subsequently
+cancelled the S2–S5 continuation on replacement device `e8b7f0c8`. The partial
+sweep is preserved as diagnostics; it does not replace the validated same-device
+S1 panel comparison above. Under QVAC-26714, the user subsequently requested
+a new Hexagon-only S1–S5 sweep with all validated defaults enabled; it is a
+separate candidate experiment, not a continuation of that three-backend sweep.
 
 ## Corrected S1 baseline, October 8
 
