@@ -55,6 +55,39 @@ separately. Unlabelled input remains unlabelled; it cannot infer warmups from
 the records. Groups retain operation, shape, types, and the selected kernel.
 Malformed profile records fail rather than silently dropping timed work.
 
+## Quantized weight buffer correctness
+
+Before timing Audio8, verify the Hexagon weight-buffer contract:
+
+```sh
+./test-hexagon-buffer
+GGML_HEXAGON_HOSTBUF=0 ./test-hexagon-buffer
+```
+
+The default Hexagon buffer advertises host-accessible storage when `HOSTBUF=1`
+(the default). CPU fallback and tensor copies may read its data pointer without
+calling the backend's `get_tensor`. Such storage must retain canonical ggml
+quantized blocks. Uploading tiled DSP blocks there corrupts CPU fallback inputs
+even if backend `set_tensor`/`get_tensor` roundtrips appear correct. Audio8 loads
+weights into this default buffer, making this contract relevant to its Q8
+projections.
+
+Host buffers now retain canonical bytes; explicit `HTP0-REPACK` buffers and the
+legacy non-host `HOSTBUF=0` mode retain tiled storage with conversion on upload
+and readback. The test covers Q4_0, Q4_1, Q8_0, IQ4_NL, and MXFP4, checking API
+roundtrips, host-visible bytes, copies to CPU, and partial transfers on host
+buffers. It also checks explicit repack buffers when available. Run this test
+on the device; the Hexagon portion is skipped on hosts without that backend.
+
+On the October 8 QDC Snapdragon 8 Elite run, the pre-fix default buffer passed
+API roundtrips but failed direct host-byte and CPU-copy checks for all five
+quantized types. After the fix those checks pass with both `HOSTBUF=1` and
+`HOSTBUF=0`, including explicit repack buffers in the default mode. The default
+Audio8 three-frame smoke now produces nonzero codes, but codes still diverge
+from CPU/OpenCL in the first frame. This establishes the buffer correction,
+not end-to-end parity; waveform finiteness, quality, and matched performance
+remain separate validation requirements.
+
 ## Build the focused tests
 
 Host correctness (CPU optimized path compared to the CPU reference):
@@ -79,7 +112,7 @@ cmake -S . -B ../hexagon-26715-build/android/ggml -G Ninja \
   -DGGML_BUILD_EXAMPLES=OFF -DPREBUILT_LIB_DIR=android_aarch64 \
   -DHEXAGON_SDK_ROOT=/home/alokr/code/speech-qvac/poc/toolchains/Hexagon_SDK/6.6.0.0 \
   -DHEXAGON_TOOLS_ROOT=/home/alokr/code/speech-qvac/poc/toolchains/Hexagon_SDK/6.6.0.0/tools/HEXAGON_Tools/19.0.07
-cmake --build ../hexagon-26715-build/android/ggml --target test-backend-ops htp-v79 -j 6
+cmake --build ../hexagon-26715-build/android/ggml --target test-backend-ops test-hexagon-buffer htp-v79 -j 6
 ```
 
 `PREBUILT_LIB_DIR` is required by this SDK's CMake helpers even for the host

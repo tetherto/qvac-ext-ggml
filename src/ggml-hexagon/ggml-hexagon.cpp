@@ -978,6 +978,13 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
+    // CPU fallback and backend copies read host buffers directly. Only the
+    // non-host (repack) buffers may store the DSP's tiled quantized layout.
+    if (ggml_backend_buffer_is_host(buffer)) {
+        memcpy((char *) tensor->data + offset, data, size);
+        return;
+    }
+
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
             GGML_ASSERT(offset == 0);
@@ -1025,6 +1032,11 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
     auto sess = sbuf->sess;
 
     HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
+
+    if (ggml_backend_buffer_is_host(buffer)) {
+        memcpy(data, (const char *) tensor->data + offset, size);
+        return;
+    }
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
