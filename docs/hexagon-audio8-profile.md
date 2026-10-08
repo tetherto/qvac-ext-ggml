@@ -1,9 +1,40 @@
-# Audio8 fused matmul profiling
+# Audio8 matmul profiling and correctness
 
 QVAC-26715 originally proposed routing Audio8's large fused `MUL_MAT+ADD` to
-HMX. The October 7 profile used for that proposal already labels **every
-`MUL_MAT+ADD` call `hmx-tiled`**. Verify the kernel and workload before changing
-dispatch.
+HMX. An HMX fused implementation exists, but **current Audio8 codec matmuls
+request F32 precision and stay on HVX**. Historical HMX dispatch does not
+establish the route taken by the current application.
+
+## Current application routing
+
+In the speech checkout, `engines/tts/src/audio8/codec_ops.cpp` sets
+`GGML_PREC_F32` on both `sum_taps` and `causal_conv_transpose` matmuls. These
+requests were present in the original Audio8 implementation (`09566de3`).
+The current ggml HMX eligibility check rejects that precision because HMX
+multiplies in F16 (`be3edbd6`). Fused parameter selection also preserves the
+original MUL_MAT node's precision (`ccb67cb8`); older code passed the ADD node,
+which could bypass that check. Both ggml fixes are in the merged `8c85fb0f` base.
+
+Fusion requires either an HMX kernel or a single activation row. Consequently,
+the large current codec products use separate HVX `MUL_MAT` and ADD operations.
+The October 8 three-frame `hex-base-profile.log` confirms zero `MUL_MAT+ADD`
+calls; its largest codec products (`192:192 x 192:3072`,
+`96:96 x 96:6144`, and `384:384 x 384:768`) are labelled `hvx-tiled`.
+This trace used `OPSTAGE=3`, but preceded the quantized host-buffer correction
+below and produced invalid outputs, so it establishes dispatch, not valid
+end-to-end performance.
+
+Preserve the explicit F32 requirement. Relaxing the HMX row threshold alone
+does not make these products eligible. Any future precision change would need
+separate application-level correctness evidence and must not silently override
+`GGML_PREC_F32` in the backend.
+
+## Historical October 7 profile
+
+The older profile labels every `MUL_MAT+ADD` call `hmx-tiled`. This shows that
+the fused implementation was exercised in that run. Its exact repository
+commits are not recorded, so the discrepancy with current routing cannot be
+attributed to a specific historical build.
 
 The source log is `audio8-raw/hex-profile.log` (not checked into this repository).
 It contains two labelled runs, including the warmup despite its label saying
@@ -25,7 +56,7 @@ and cleanup. Adding it to individual operation times double-counts work. The
 original 196 calls also combined the warmup and captured run. Neither DSP
 percentage represents the share of end-to-end inference latency.
 
-The dominant captured fused shapes are F16 weights, F32 activations, and a
+The dominant historical captured fused shapes are F16 weights, F32 activations, and a
 full-size F32 partial convolution as the ADD operand:
 
 | Weight shape K:N | Activation shape K:M | Calls | Cycles |
@@ -160,6 +191,10 @@ activation row counts 1/4/5 across the current HVX/HMX threshold, incomplete
 activation tiles, and partial output-column tiles. They use the existing
 matmul NMSE tolerance of `5e-4`; they do not certify end-to-end speech parity.
 Perf mode uses the four exact shapes above with each ADD operand type.
+These synthetic graphs use default matmul precision to exercise the existing
+fused implementation; they do not reproduce the current codec's explicit F32
+precision requirement. Passing them does not authorize routing the real codec
+through HMX.
 
 `PROFILE=3` exposes `HVX_A_PREP`, `HVX_W_PREP`, `HVX_O_PROC`, `HMX_COMP`, and
 DMA events. These distinguish conversion/output work from HMX multiplication.
