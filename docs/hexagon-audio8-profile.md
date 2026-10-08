@@ -212,9 +212,10 @@ CPU/OpenCL timings and does not replace the separate panel-on/off experiment.
 
 ## F32 codec panels
 
-The Hexagon backend enables a 2x2 HVX DDR output panel by default for
-unbatched F16-weight/F32-activation matmuls. It widens the weights to F32 and
-reuses each weight and activation vector across two outputs. The existing
+The Hexagon backend enables an HVX DDR output panel by default for unbatched
+F16-weight/F32-activation matmuls. The 4x2 shape described below is the
+default; the original 2x2 shape remains selectable. The 2x2 panel widens the
+weights to F32 and reuses each weight and activation vector across two outputs. The existing
 `vec_dot_f16_f32_uu_1x1` narrows activations to F16 internally, so this panel
 changes arithmetic as well as data reuse. F32 precision requested by a graph
 does not by itself prove that the old DDR helper retains F32 activations.
@@ -675,22 +676,22 @@ runs, and check per-stage cosine >=0.9999 plus generated tokens, EOS, frame
 count, and audio quality. Do not enable a routing change based only on these
 synthetic backend tests.
 
-## Codec panel prototype (QVAC-26763)
+## 4x2 codec panel (QVAC-26763)
 
 The follow-up [QVAC-26763](https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219313976732459)
 adds a selectable 4x2 HVX panel for the existing F16-weight/F32-activation DDR
 route. Four output channels share each pair of activation rows. Each output
 retains the 2x2 panel's F32 low-then-high accumulation order and pairwise
 reduction. VTCM selection, F32 precision guards and unsupported-shape fallbacks
-remain unchanged. The validated 2x2 panel remains the default until device
-correctness and performance gates pass; all previously validated optimizations
-remain enabled by default.
+remain unchanged. After the device validation below, 4x2 is the default and
+all previously validated optimizations remain enabled by default.
 
-For candidate testing, set `GGML_HEXAGON_F16_F32_PANEL_SHAPE=4x2`; use `2x2`
-or unset it for the default. Invalid values warn and select 2x2. The existing
-`GGML_HEXAGON_F16_F32_PANEL=0` override still disables panel routing.
-With profiling enabled, selected 4x2 operations report `hvx-panel-4x2`.
-Capture that routing evidence separately from unprofiled timing runs.
+Set `GGML_HEXAGON_F16_F32_PANEL_SHAPE=2x2` to restore the previous panel;
+unset it or use `4x2` for the default. Invalid values warn and keep 4x2. The
+existing `GGML_HEXAGON_F16_F32_PANEL=0` override still disables panel routing.
+With profiling enabled, selected 4x2 operations report `hvx-panel-4x2` and the
+2x2 panel reports `hvx-flat`. Capture that routing evidence separately from
+unprofiled timing runs.
 
 The independent oracle now has 29 cases. New cases cover full four-channel
 panels, two-channel remainders, padded views, K64/K96 tails and channel-axis
@@ -726,8 +727,85 @@ The 4x2 worker is larger (850 instruction words and a 144-byte scalar frame,
 versus 517 words and 104 bytes for 2x2). This establishes build and static
 readiness, not a speedup.
 
-Device correctness, exact cross-panel agreement, CPU/OpenCL fixed-code gates,
-worker-count tuning and repeated S1–S5 timing are pending. The renewed QDC
-session exposed a different SM8750 device serial; it lost its upstream endpoint
-during model staging. Fresh baseline and candidate measurements on the same
-device are required before promotion or performance claims.
+### Device validation, October 8
+
+A Samsung Galaxy S25 (SM8750, Hexagon v79, firmware `S931BXXSCCZH1`, local
+USB rather than QDC) validated ggml `5687b0e7` with speech `d9d47284`, whose
+Audio8 runtime is identical to the merged speech change. Baseline and
+candidate used the same binaries; only `GGML_HEXAGON_F16_F32_PANEL_SHAPE`
+changed (unset, then 2x2, versus `4x2`). Every run set `OPPOLL=1`, `OPSTAGE=3`,
+`OPFUSION=1`, `HOSTBUF=1`, `F16_F32_PANEL=1` and `PROFILE=0` unless profiling
+is stated. The v79 DSP skeleton SHA-256 was
+`0c6acab717a9e20c8b698d16d8fbb18138d7a6c071dacb95d9f942e2ed5ad95b`; the
+Q8_0 models are those listed in the corrected baseline above.
+
+Build the Android libraries with the NDK default CPU flags to reproduce the QDC
+trajectories. A build of the same commits with
+`-march=armv8.7a+fp16+dotprod+i8mm` kept the DSP skeleton byte-identical but
+produced a 70-frame S1 trajectory; the default build reproduces the QDC
+66-frame codes and WAV byte for byte. Matched artifacts therefore include the
+host CPU library build flags.
+
+Correctness:
+
+- The independent oracle passes all 29 cases for both shapes with 1, 2 and 6
+  HVX workers; all 174 result dumps are byte-identical across shape and
+  worker count. Profiled runs route the 12 DDR cases to `hvx-panel-4x2`
+  under 4x2 and to `hvx-flat` under 2x2; the 16 VTCM cases stay `hvx-tiled`.
+- The saved S1 codes (66 frames, SHA-256 `3d7e3716...`, and their first
+  3 frames) decoded on the CPU reference, CPU, Hexagon 2x2, Hexagon 4x2 and
+  OpenCL pass all five codec boundaries (finite, cosine >= 0.9999, NMSE
+  <= 2e-4). 2x2 and 4x2 are byte-identical at every boundary. 66-frame
+  Hexagon PCM versus CPU has cosine `0.9999966593` and NMSE `6.72147e-6`;
+  versus OpenCL, `0.9999900834` and `1.98341e-5`.
+- `test-audio8-backend-parity --backend hexagon --frames 3` passes 38/38
+  boundaries with no token or chain mismatches for both shapes.
+- Greedy S1–S5 codes and WAVs are identical between 2x2 and 4x2 on every
+  prompt; S1 reproduces the QDC hashes listed earlier.
+
+Profiled S1 (separate from timing; leaf microseconds):
+
+| Weight x activation (K:N x K:M) | 2x2 `hvx-flat` | 4x2 `hvx-panel-4x2` | Change |
+| --- | ---: | ---: | ---: |
+| 192:192 x 192:67584 (26 calls) | 2,271,541 | 1,800,432 | -20.7% |
+| 384:384 x 384:16896 (24 calls) | 1,791,512 | 1,314,321 | -26.6% |
+| 96:96 x 96:135168 (24 calls) | 1,668,263 | 1,395,931 | -16.3% |
+| 384:768 x 384:16896 (2 calls) | 368,009 | 262,152 | -28.8% |
+| All leaf operations | 7,352,930 | 6,014,799 | -18.2% |
+
+Dominant shapes in `test-backend-ops` (median of three alternating runs):
+
+| Shape | 2x2 (us/run) | 4x2 (us/run) | Speedup |
+| --- | ---: | ---: | ---: |
+| K96 / output96 / rows 135168 | 69,588 | 59,501 | 1.170x |
+| K192 / output192 / rows 67584 | 87,966 | 70,290 | 1.251x |
+| K384 / output384 / rows 16896 | 78,295 | 57,336 | 1.366x |
+
+End-to-end Audio8 used greedy decoding, seed 42, four threads, frame caps
+70/60/90/70/110, three warmups and five timed runs per variant. Hexagon order
+alternated between 2x2-first and 4x2-first, with OpenCL in the same session.
+Each run waited for thermal status 0 immediately before launch. S3 and S4 are
+reruns: in their first pass three timed runs each started at status 1 (same
+direction, 1.06x and 1.10x end to end). Inference excludes model loading.
+
+| Prompt | Frames (Hexagon / OpenCL) | Inference 2x2 -> 4x2 (s) | Speedup | Codec synthesis 2x2 -> 4x2 (s) | Speedup | OpenCL inference (s) |
+| --- | --- | --- | ---: | --- | ---: | ---: |
+| S1 | 66 / 70 | 15.2645 -> 14.2156 | 1.074x | 7.1026 -> 5.9104 | 1.202x | 3.2070 |
+| S2 | 55 / 50 | 12.4183 -> 11.5605 | 1.074x | 5.7363 -> 4.7386 | 1.211x | 2.2763 |
+| S3 | 70 / 72 | 15.9855 -> 14.5015 | 1.102x | 7.3106 -> 6.0255 | 1.213x | 3.2387 |
+| S4 | 70 / 67 | 15.8039 -> 14.7175 | 1.074x | 7.3115 -> 6.0526 | 1.208x | 3.0376 |
+| S5 | 94 / 94 | 21.2986 -> 19.4735 | 1.094x | 9.7883 -> 8.1157 | 1.206x | 4.2112 |
+
+On every prompt the slowest 4x2 run is faster than the fastest 2x2 run, and
+the non-codec time is unchanged. OpenCL generates different codes and frame
+counts, so it is a timing reference rather than an equal workload; its codec
+synthesis remains 5.1-6.0x faster than Hexagon 4x2.
+
+With 4x2 as the compiled default, the same device confirms that an unset
+variable routes the 12 DDR oracle cases to `hvx-panel-4x2`, `2x2` restores
+`hvx-flat`, and an unsupported value warns and keeps 4x2. The default oracle
+dumps match the validated ones byte for byte at 1, 2 and 6 workers, and S1
+with no shape override reproduces the QDC codes and WAV. The DSP skeleton is
+unchanged by the default switch. Raw per-run logs, codes, WAVs, boundary dumps,
+thermal records and scripts are archived as `qvac-26763-s25-evidence.tar.gz`
+(SHA-256 `e1bcfabb85ee0b298b5c4ca40bc41dec9c6bacd7b2fc55c2bc7c3f4e5c1b3069`).
