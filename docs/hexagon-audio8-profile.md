@@ -162,6 +162,54 @@ stub SHA-256 is `f718204047fcaf33c31ee7562ada8366001cfc710c5ab65a7731f3c0d1d6375
 the DSP skeleton is unchanged. A snapshot reports currently recorded counters,
 not an implicit queue drain.
 
+Fresh device validation of that follow-up passes: PROFILE=1 emits two
+identical cumulative snapshots for 12,895 batches / 67,539 operations. Using
+only the latest snapshot gives cache copy 1.567 ms, packing 1.388 ms,
+submission 2.203 ms, wait 9,023.276 ms, and response pop 176.633 ms. Overlapping
+capture-to-response lifetimes sum to 9,029.127 ms. Wait includes DSP execution
+and transport, while pop includes profile output; these are not exclusive
+host-overhead totals. Both the profiled run and a separate PROFILE=0 S1 run
+produce the same codes/WAV hashes as above. Evidence is in
+`hexagon-26714-build/results/diagnostics/` and `run-diagnostics.sh`.
+
+### Hexagon-only S1–S5 result
+
+The requested five-prompt sweep completed on the same QDC device `e8b7f0c8`,
+using the unchanged benchmark host/DSP pair above, all five compiled tuning
+defaults enabled, profiling off, greedy seed 42 and four threads. Each prompt
+has three warmups and five timed runs. S1 reuses the candidate half of the
+paired experiment; S2–S5 run the candidate only. The staged CLI has production
+source identical to speech PR #303 `a90dc140` (later changes are docs/tests).
+
+| Prompt | Frame cap | Generated frames | Median inference (s) | Timed range (s) | Median codec synthesis (s) | Inference RTF |
+| --- | ---: | ---: | ---: | --- | ---: | ---: |
+| S1: The quick brown fox jumps over the lazy dog. | 70 | 66 | 14.0297 | 13.8654–14.2358 | 7.0730 | 4.5773 |
+| S2: She sells seashells by the seashore. | 60 | 55 | 11.4858 | 11.3312–11.7409 | 5.6623 | 4.4968 |
+| S3: In a world where machines think, humans still dream. | 90 | 70 | 14.3848 | 14.2154–15.2066 | 7.2083 | 4.4250 |
+| S4: Testing one, two, three, four, five. | 70 | 70 | 14.3936 | 13.9417–15.2274 | 7.2095 | 4.4277 |
+| S5: The year was 2026, and the signal was finally clear. | 110 | 94 | 19.4038 | 19.0168–19.7377 | 9.6671 | 4.4450 |
+
+Inference excludes model loading; RTF is inference time divided by generated
+audio duration. S4 reaches its configured cap, so do not assume natural EOS.
+All 40 candidate runs pass raw-artifact validation: correct HTP0 selection,
+profiling off, ten finite timing fields, frames×10 token codes in range,
+mono PCM16 at 44.1 kHz with exactly frames×2048 samples, and matching code/WAV
+hashes across all eight runs of each prompt. Repeatability does not establish
+universal CPU/OpenCL parity or listening quality.
+
+Every run began at thermal status 0. Timed post-run states were S1 `1,0,0,1,0`,
+S2 `0,2,0,0,0`, S3/S4 `0,1,0,1,0`, and S5 `0,2,0,2,0`. These are start-cooled
+measurements, not continuously unthrottled runs. The tunnel dropped during S5;
+reconnection recovered all eight completed runs and the suite completion marker
+from the same device. No missing timing was inferred or substituted.
+
+Reproduce with `hexagon-26714-build/run-s1.sh`, `run-hex-s2-s5.sh` and
+`summarize-hex-suite.py` beside the checkout. The complete report is
+`results/hex-suite-summary.json`; per-run logs, thermal records, codes and WAVs
+are in `results/device/` and `results/hex-suite/`. Exact model/library/CLI hashes
+are in `results/runtime-provenance.json`. This sweep has no contemporaneous
+CPU/OpenCL timings and does not replace the separate panel-on/off experiment.
+
 ## F32 codec panels
 
 The Hexagon backend enables a 2x2 HVX DDR output panel by default for
