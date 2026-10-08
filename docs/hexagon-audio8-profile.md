@@ -19,8 +19,10 @@ and divisible by 32, scalar-contiguous inner axes, and no fused ADD. Padded row 
 unaligned row bases are supported; K=96 and odd output dimensions have explicit
 remainders. Batched, fused, and other layouts retain the existing routes. HMX
 selection keeps its existing precedence; set `GGML_HEXAGON_MM_SELECT=2` when
-testing the panel explicitly. The option also selects DDR for eligible small
-test shapes that would normally fit in VTCM.
+testing the panel explicitly. The option applies only when the normal VTCM
+path cannot be used. Eligible small shapes retain the existing VTCM kernel;
+focused DDR tests use activation
+matrices larger than the device VTCM budget.
 
 This option defaults off. Evaluate with `GGML_HEXAGON_OPSTAGE=3`, the exact-F32
 oracle, fixed-code codec/PCM comparisons, and end-to-end Audio8 timing against
@@ -55,8 +57,13 @@ Raw evidence is in `hexagon-codec-build/results/device-oracle.log`,
 `device-perf-repeat.log`, and `device-perf-summary.json` beside the checkout.
 The DSP artifact SHA-256 was
 `49b8e8d93f12b19494da69666c47b9f4b766bd08d62aba6dcc5c0b7485fbb041`.
-Model-level fixed-code PCM parity and end-to-end performance are still pending;
-the isolated results do not establish either.
+The initial broad selector passed fixed-code CPU/OpenCL parity, but repeated
+full S1 inference medians were 19.8494 s off versus 19.8996 s on. Paired profiles
+matched all 67,539 leaf operations: 76 existing DDR matmuls saved 5,408.814 ms,
+while replacing 41 existing VTCM matmuls added 5,341.744 ms. The selector now
+preserves every normal VTCM choice and only replaces DDR fallbacks. Updated
+model parity and end-to-end timings are required for this narrower selector;
+the isolated results do not establish its application speedup.
 
 ## Corrected S1 baseline, October 8
 

@@ -2680,22 +2680,6 @@ static void ggml_hexagon_precompute_hvx_mm_params(
 
     done_quant:;
     } else if (wtype == GGML_TYPE_F16) {
-        // Candidate only: preserve F32 activations and reuse a 2x2 output panel.
-        // HMX selection has already run; this only replaces an HVX choice.
-        if (opt_f16_f32_panel && !is_matmul_id && src2_row_size == 0 &&
-            ne10 >= 64 && ne10 % 32 == 0 && src0->ne[1] >= 2 && ne11 >= 2 &&
-            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
-            dst->ne[2] == 1 && dst->ne[3] == 1 &&
-            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-            src0->nb[0] == 2 && src1->nb[0] == 4 && dst->nb[0] == 4 &&
-            src0->nb[1] >= size_t(ne10) * 2 && src1->nb[1] >= size_t(ne10) * 4 &&
-            dst->nb[1] >= size_t(src0->ne[1]) * 4) {
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
-            kparams->tile_size = HTP_MM_F16_F32_PANEL_2X2;
-            kparams->src1_row_size = src1->nb[1];
-            return;
-        }
-
         // The first 3x3 convolution has thousands of K=9 im2col rows.
         // Vectorize across these rows instead of reducing a mostly empty
         // vector per dot product. Keep batching, views and fused adds on the
@@ -2728,6 +2712,23 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->vtcm_dst_size = L.dst_bytes;
             kparams->n_prefetch = 16;
         } else {
+            // Candidate only: preserve F32 activations and reuse a 2x2 output panel.
+            // Keep the existing VTCM 2x2 path whenever it fits: it reuses staged
+            // activations and prefetched weights more efficiently for smaller graphs.
+            if (opt_f16_f32_panel && !is_matmul_id && src2_row_size == 0 &&
+                ne10 >= 64 && ne10 % 32 == 0 && src0->ne[1] >= 2 && ne11 >= 2 &&
+                ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+                dst->ne[2] == 1 && dst->ne[3] == 1 &&
+                src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                src0->nb[0] == 2 && src1->nb[0] == 4 && dst->nb[0] == 4 &&
+                src0->nb[1] >= size_t(ne10) * 2 && src1->nb[1] >= size_t(ne10) * 4 &&
+                dst->nb[1] >= size_t(src0->ne[1]) * 4) {
+                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
+                kparams->tile_size = HTP_MM_F16_F32_PANEL_2X2;
+                kparams->src1_row_size = src1->nb[1];
+                return;
+            }
+
             if (src1->type == GGML_TYPE_F32) {
                 kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
             } else {
