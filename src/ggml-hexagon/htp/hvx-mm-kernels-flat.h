@@ -1245,6 +1245,67 @@ static inline void vec_dot_f32_f32_uu_1x1(const uint32_t n, float * restrict s, 
     hvx_vec_store_u(&s[0], 4, rsum);
 }
 
+// The legacy F16/F32 DDR 1x1 narrows activations to F16. These opt-in panel kernels
+// instead widen weights and retain every F32 activation bit. K >= 64 is a
+// multiple of 32. For a final half-vector, load a full vector ending at the
+// row boundary and rotate its upper half down. A memcpy of 64 bytes can be
+// widened by the compiler into an out-of-row HVX load, so do not use it here.
+static inline HVX_VectorPair panel_f16_weights(const uint8_t * row, uint32_t remaining) {
+    HVX_Vector packed;
+    if (remaining >= VLEN_FP16) {
+        packed = hvx_vmemu(row);
+    } else {
+        packed = Q6_V_vror_VR(hvx_vmemu(row - VLEN / 2), VLEN / 2);
+    }
+    return hvx_vec_f16_to_f32(packed); // upper F32 vector is unused for a half-vector tail
+}
+
+static inline void vec_dot_f16_f32_panel_1x1(const uint32_t n, float * restrict s,
+                                           const void * restrict vx, const void * restrict vy) {
+    const uint8_t * x = vx;
+    const uint8_t * y = vy;
+    HVX_Vector sum = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP16) {
+        const HVX_VectorPair w = panel_f16_weights(x + k * 2, n - k);
+        sum = HVX_OP_ADD_F32(sum, HVX_OP_MUL_F32(Q6_V_lo_W(w), hvx_vmemu(y + k * 4)));
+        if (n - k >= VLEN_FP16) {
+            sum = HVX_OP_ADD_F32(sum, HVX_OP_MUL_F32(Q6_V_hi_W(w), hvx_vmemu(y + (k + VLEN_FP32) * 4)));
+        }
+    }
+    hvx_vec_store_u(s, sizeof(float), hvx_vec_reduce_sum_f32(sum));
+}
+
+static inline void vec_dot_f16_f32_uu_2x2(const uint32_t n, float * restrict s0, float * restrict s1,
+                                        const void * restrict vx0, const void * restrict vx1,
+                                        const void * restrict vy0, const void * restrict vy1) {
+    const uint8_t * x0 = vx0;
+    const uint8_t * x1 = vx1;
+    const uint8_t * y0 = vy0;
+    const uint8_t * y1 = vy1;
+    HVX_Vector sum00 = Q6_V_vzero(), sum10 = Q6_V_vzero();
+    HVX_Vector sum01 = Q6_V_vzero(), sum11 = Q6_V_vzero();
+    for (uint32_t k = 0; k < n; k += VLEN_FP16) {
+        const HVX_VectorPair w0 = panel_f16_weights(x0 + k * 2, n - k);
+        const HVX_VectorPair w1 = panel_f16_weights(x1 + k * 2, n - k);
+        HVX_Vector a0 = hvx_vmemu(y0 + k * 4);
+        HVX_Vector a1 = hvx_vmemu(y1 + k * 4);
+        sum00 = HVX_OP_ADD_F32(sum00, HVX_OP_MUL_F32(Q6_V_lo_W(w0), a0));
+        sum10 = HVX_OP_ADD_F32(sum10, HVX_OP_MUL_F32(Q6_V_lo_W(w1), a0));
+        sum01 = HVX_OP_ADD_F32(sum01, HVX_OP_MUL_F32(Q6_V_lo_W(w0), a1));
+        sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(Q6_V_lo_W(w1), a1));
+        if (n - k >= VLEN_FP16) {
+            a0 = hvx_vmemu(y0 + (k + VLEN_FP32) * 4);
+            a1 = hvx_vmemu(y1 + (k + VLEN_FP32) * 4);
+            sum00 = HVX_OP_ADD_F32(sum00, HVX_OP_MUL_F32(Q6_V_hi_W(w0), a0));
+            sum10 = HVX_OP_ADD_F32(sum10, HVX_OP_MUL_F32(Q6_V_hi_W(w1), a0));
+            sum01 = HVX_OP_ADD_F32(sum01, HVX_OP_MUL_F32(Q6_V_hi_W(w0), a1));
+            sum11 = HVX_OP_ADD_F32(sum11, HVX_OP_MUL_F32(Q6_V_hi_W(w1), a1));
+        }
+    }
+    hvx_vec_store_u(s0, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum00, sum10));
+    hvx_vec_store_u(s1, 2 * sizeof(float), hvx_vec_reduce_sum_f32x2(sum01, sum11));
+}
+
 #undef HVX_OP_ADD_F32
 #undef HVX_OP_MUL_F32
 
@@ -1508,4 +1569,3 @@ static inline void hvx_tensor_add_f32_grid(
         }
     }
 }
-

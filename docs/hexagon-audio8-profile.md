@@ -5,6 +5,30 @@ HMX. An HMX fused implementation exists, but **current Audio8 codec matmuls
 request F32 precision and stay on HVX**. Historical HMX dispatch does not
 establish the route taken by the current application.
 
+## Experimental F32 codec panels
+
+`GGML_HEXAGON_F16_F32_PANEL=1` opts into a 2x2 HVX DDR output panel for
+unbatched F16-weight/F32-activation matmuls. It widens the weights to F32 and
+reuses each weight and activation vector across two outputs. The existing
+`vec_dot_f16_f32_uu_1x1` narrows activations to F16 internally, so this candidate
+changes arithmetic as well as data reuse. F32 precision requested by a graph
+does not by itself prove that the old DDR helper retains F32 activations.
+
+Eligibility requires at least two weight and activation rows, K at least 64
+and divisible by 32, scalar-contiguous inner axes, and no fused ADD. Padded row strides and
+unaligned row bases are supported; K=96 and odd output dimensions have explicit
+remainders. Batched, fused, and other layouts retain the existing routes. HMX
+selection keeps its existing precedence; set `GGML_HEXAGON_MM_SELECT=2` when
+testing the panel explicitly. The option also selects DDR for eligible small
+test shapes that would normally fit in VTCM.
+
+This option defaults off. Evaluate with `GGML_HEXAGON_OPSTAGE=3`, the exact-F32
+oracle, fixed-code codec/PCM comparisons, and end-to-end Audio8 timing against
+the same build with the option unset. Local compilation alone establishes no
+device correctness or speedup. The measured codec shapes motivating the
+candidate are `[192,192] x [192,71680]`, `[96,96] x [96,143360]`, and
+`[384,384] x [384,17920]` in ggml dimension order.
+
 ## Corrected S1 baseline, October 8
 
 On the same QDC Snapdragon 8 Elite, enabling polling reduced median inference
