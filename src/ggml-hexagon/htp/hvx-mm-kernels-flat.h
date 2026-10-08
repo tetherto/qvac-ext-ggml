@@ -1245,7 +1245,7 @@ static inline void vec_dot_f32_f32_uu_1x1(const uint32_t n, float * restrict s, 
     hvx_vec_store_u(&s[0], 4, rsum);
 }
 
-// The legacy F16/F32 DDR 1x1 narrows activations to F16. These opt-in panel kernels
+// The legacy F16/F32 DDR 1x1 narrows activations to F16. These panel kernels
 // instead widen weights and retain every F32 activation bit. K >= 64 is a
 // multiple of 32. For a final half-vector, load a full vector ending at the
 // row boundary and rotate its upper half down. A memcpy of 64 bytes can be

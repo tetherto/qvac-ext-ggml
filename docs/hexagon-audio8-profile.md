@@ -5,12 +5,12 @@ HMX. An HMX fused implementation exists, but **current Audio8 codec matmuls
 request F32 precision and stay on HVX**. Historical HMX dispatch does not
 establish the route taken by the current application.
 
-## Experimental F32 codec panels
+## F32 codec panels
 
-`GGML_HEXAGON_F16_F32_PANEL=1` opts into a 2x2 HVX DDR output panel for
+The Hexagon backend enables a 2x2 HVX DDR output panel by default for
 unbatched F16-weight/F32-activation matmuls. It widens the weights to F32 and
 reuses each weight and activation vector across two outputs. The existing
-`vec_dot_f16_f32_uu_1x1` narrows activations to F16 internally, so this candidate
+`vec_dot_f16_f32_uu_1x1` narrows activations to F16 internally, so this panel
 changes arithmetic as well as data reuse. F32 precision requested by a graph
 does not by itself prove that the old DDR helper retains F32 activations.
 
@@ -23,10 +23,12 @@ testing the panel explicitly. The option applies only when the normal VTCM
 path cannot be used. Eligible small shapes retain the existing VTCM kernel;
 focused DDR tests use activation matrices larger than the device VTCM budget.
 
-This option defaults off. Evaluate with `GGML_HEXAGON_OPSTAGE=3`, the exact-F32
-oracle, fixed-code codec/PCM comparisons, and end-to-end Audio8 timing against
-the same build with the option unset. Local compilation alone establishes no
-device correctness or speedup. The measured codec shapes motivating the
+Set `GGML_HEXAGON_F16_F32_PANEL=0` to restore the previous DDR route; `=1`
+explicitly enables the panel. Evaluate with `GGML_HEXAGON_OPSTAGE=3`, the
+exact-F32 oracle, fixed-code codec/PCM comparisons, and end-to-end Audio8
+timing against the same build with the panel explicitly disabled. Local
+compilation alone establishes no device correctness or speedup. The measured
+codec shapes motivating the
 candidate are `[192,192] x [192,71680]`, `[96,96] x [96,143360]`, and
 `[384,384] x [384,17920]` in ggml dimension order.
 
@@ -64,7 +66,7 @@ preserves every normal VTCM choice and only replaces DDR fallbacks. The results 
 
 ## Validated DDR-only panel result, October 8
 
-On the renewed QDC SM8750/v79 device (`57dd7911`), the opt-in panel reduced
+On the renewed QDC SM8750/v79 device (`57dd7911`), the panel reduced
 median S1 inference from **20.346 s to 14.603 s**: **1.3933x faster**, or
 **28.23% less inference time**. The codec synthesis median fell from 12.4843 s
 to 7.0899 s. These are same-device comparisons of the same binary, changing
@@ -97,10 +99,19 @@ Validation also passed 23 independent-oracle device cases, host reference
 checks, host/Android/DSP v79 builds, and independent review. The cases cover
 natural DDR routing, VTCM preservation, varied and precision-sensitive inputs,
 odd dimensions, strides, offsets, bias, and excluded shapes. The existing
-small VTCM arithmetic is intentionally retained. The option remains off by
-default.
+small VTCM arithmetic is intentionally retained. The panel is now enabled by
+default, with the same DDR-only routing guards used for these measurements.
 
-Use the corrected ggml host-buffer and speech key-cache fixes, then enable:
+Polling is also enabled by default for the entire Hexagon backend, including
+workloads other than Audio8. It reduces batch-completion wait latency by
+actively checking for results instead of waiting with a blocking timeout.
+This can increase host CPU activity and may affect power use; CPU utilization
+and power were not measured in these experiments. Set `GGML_HEXAGON_OPPOLL=0`
+to restore blocking waits, or `=1` to explicitly enable polling.
+
+Use the corrected ggml host-buffer and speech key-cache fixes. The current
+defaults below need no environment configuration; explicit exports remain
+useful for reproducing the historical measurements:
 
 ```sh
 export GGML_HEXAGON_HOSTBUF=1
