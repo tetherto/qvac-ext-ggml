@@ -674,3 +674,60 @@ device, separate model loading from inference, use three warmups and five timed
 runs, and check per-stage cosine >=0.9999 plus generated tokens, EOS, frame
 count, and audio quality. Do not enable a routing change based only on these
 synthetic backend tests.
+
+## Codec panel prototype (QVAC-26763)
+
+The follow-up [QVAC-26763](https://app.asana.com/1/45238840754660/project/1214153063536860/task/1219313976732459)
+adds a selectable 4x2 HVX panel for the existing F16-weight/F32-activation DDR
+route. Four output channels share each pair of activation rows. Each output
+retains the 2x2 panel's F32 low-then-high accumulation order and pairwise
+reduction. VTCM selection, F32 precision guards and unsupported-shape fallbacks
+remain unchanged. The validated 2x2 panel remains the default until device
+correctness and performance gates pass; all previously validated optimizations
+remain enabled by default.
+
+For candidate testing, set `GGML_HEXAGON_F16_F32_PANEL_SHAPE=4x2`; use `2x2`
+or unset it for the default. Invalid values warn and select 2x2. The existing
+`GGML_HEXAGON_F16_F32_PANEL=0` override still disables panel routing.
+With profiling enabled, selected 4x2 operations report `hvx-panel-4x2`.
+Capture that routing evidence separately from unprofiled timing runs.
+
+The independent oracle now has 29 cases. New cases cover full four-channel
+panels, two-channel remainders, padded views, K64/K96 tails and channel-axis
+worker partitioning. The latter use legal weight-row padding to exceed the
+8 MiB VTCM budget even with one worker, retaining small K96 dot products and
+NaN-filled padding. On the device, run both panel shapes with 1, 2 and 6 HVX
+workers and compare the canonical little-endian result dumps byte for byte:
+
+```sh
+GGML_HEXAGON_NHVX=6 GGML_HEXAGON_F16_F32_PANEL_SHAPE=2x2 \
+  ./test-audio8-codec-f32 --dump-prefix oracle-2x2
+GGML_HEXAGON_NHVX=6 GGML_HEXAGON_F16_F32_PANEL_SHAPE=4x2 \
+  ./test-audio8-codec-f32 --dump-prefix oracle-4x2
+```
+
+`--dump-prefix` writes Hexagon results and cannot be combined with
+`--reference-only`. Host-only reference checks do not validate DSP execution.
+
+`test-backend-ops` also includes the three dominant shapes from the complete
+QVAC-26714 S1 trace: K96/output96/rows135168,
+K192/output192/rows67584 and K384/output384/rows16896. Select only those cases
+for an unprofiled comparison, with the chosen panel shape set in the environment:
+
+```sh
+GGML_HEXAGON_PROFILE=0 ./test-backend-ops perf -b HTP0 -o MUL_MAT \
+  -p 'audio8_codec_f32=1.*n=(135168|67584|16896),'
+```
+
+Local validation on October 8 passes host/Android/DSP v79 builds, all 29 host
+reference cases, and cache/buffer/profile-parser regressions. Independent v79
+assembly inspection finds no HVX vector spills or calls inside the K loop.
+The 4x2 worker is larger (850 instruction words and a 144-byte scalar frame,
+versus 517 words and 104 bytes for 2x2). This establishes build and static
+readiness, not a speedup.
+
+Device correctness, exact cross-panel agreement, CPU/OpenCL fixed-code gates,
+worker-count tuning and repeated S1–S5 timing are pending. The renewed QDC
+session exposed a different SM8750 device serial; it lost its upstream endpoint
+during model staging. Fresh baseline and candidate measurements on the same
+device are required before promotion or performance claims.

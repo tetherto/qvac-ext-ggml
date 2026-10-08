@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <string>
 #include <vector>
 
 // CPU F16 MUL_MAT converts F32 activations to F16 even with GGML_PREC_F32.
@@ -20,6 +22,7 @@ struct shape {
     int k, channels, rows, batches;
     bool views, bias, panel;
     bool varied = false;
+    int weight_padding = 13;
 };
 
 static const shape cases[] = {
@@ -50,6 +53,21 @@ static const shape cases[] = {
     {"ddr-varied-k96",   96,  9, 32769, 1, true,  false, true, true},
     {"ddr-varied-k192", 192,  7, 21847, 1, false, false, true, true},
     {"ddr-varied-k384", 384,  5, 10923, 1, true,  false, true, true},
+    // Exercise full four-channel panels and their two-channel remainder,
+    // including K64, unaligned row views, and both even/odd activation rows.
+    // These also remain valid oracle cases for the default 2x2 panel.
+    {"ddr-four-k96",      96,  4, 32770, 1, false, false, true},
+    {"ddr-six-k64",       64,  6, 65537, 1, true,  false, true, true},
+    {"ddr-eight-k192",   192,  8, 21849, 1, true,  false, true, true},
+    {"ddr-ten-k384",     384, 10, 10924, 1, false, false, true, true},
+    // Most codec-shaped cases split activation rows among workers. Here
+    // padded weight-prefetch staging alone exceeds 8 MiB even with one
+    // worker (16 * 524416 bytes), forcing natural DDR dispatch while
+    // channels outnumber rows. The logical K96 dot product stays small;
+    // NaN-filled padding checks bounded loads as well as channel ownership,
+    // idle workers, half-vector tails and panel remainders.
+    {"ddr-split-channels", 96, 22, 3, 1, true, false, true, false, 262112},
+    {"ddr-split-varied",   96, 29, 3, 1, true, false, true, true,  262112},
     // Ineligible shapes retain the existing F16-activation arithmetic.
     {"guard-k32",     32,  7,  5, 1, false, false, false},
     {"guard-batched", 96,  7,  5, 2, false, false, false},
@@ -156,7 +174,7 @@ static bool compute(ggml_backend_t backend, const shape & s, const inputs & in,
     if (!storage.ctx) return false;
     auto * ctx = storage.ctx;
     auto * graph = ggml_new_graph(ctx);
-    auto * a = ggml_new_tensor_3d(ctx, weight_type, s.k + (s.views ? 13 : 0), s.channels, s.batches);
+    auto * a = ggml_new_tensor_3d(ctx, weight_type, s.k + (s.views ? s.weight_padding : 0), s.channels, s.batches);
     auto * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, s.k + (s.views ? 11 : 0), s.rows, s.batches);
     auto * av = s.views ? ggml_view_3d(ctx, a, s.k, s.channels, s.batches, a->nb[1], a->nb[2], a->nb[0]) : a;
     auto * bv = s.views ? ggml_view_3d(ctx, b, s.k, s.rows, s.batches, b->nb[1], b->nb[2], b->nb[0]) : b;
@@ -205,9 +223,24 @@ static bool compare(const char * backend, const shape & s, const std::vector<flo
 }
 
 int main(int argc, char ** argv) {
-    const bool reference_only = argc == 2 && std::strcmp(argv[1], "--reference-only") == 0;
-    if (argc != 1 && !reference_only) {
-        std::fprintf(stderr, "usage: %s [--reference-only]\n", argv[0]);
+    bool reference_only = false;
+    std::string dump_prefix;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--reference-only") == 0) {
+            reference_only = true;
+        } else if (std::strcmp(argv[i], "--dump-prefix") == 0 && i + 1 < argc) {
+            dump_prefix = argv[++i];
+            if (dump_prefix.empty()) {
+                std::fprintf(stderr, "--dump-prefix requires a nonempty path\n");
+                return 1;
+            }
+        } else {
+            std::fprintf(stderr, "usage: %s [--reference-only] [--dump-prefix PATH]\n", argv[0]);
+            return 1;
+        }
+    }
+    if (reference_only && !dump_prefix.empty()) {
+        std::fprintf(stderr, "--dump-prefix writes Hexagon results; incompatible with --reference-only\n");
         return 1;
     }
     ggml_backend_load_all();
@@ -236,6 +269,23 @@ int main(int argc, char ** argv) {
             const bool ran = compute(hexagon, s, full, GGML_TYPE_F16, result);
             ok = ran && ok;
             if (ran) ok = compare("Hexagon", s, result, expected) && ok;
+            if (ran && !dump_prefix.empty()) {
+                // Canonical binary32 little-endian output permits exact
+                // cross-panel comparisons independent of printed tolerances.
+                static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
+                              "result dumps require IEEE754 binary32");
+                std::ofstream dump(dump_prefix + "." + s.name + ".f32", std::ios::binary);
+                for (float value : result) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    for (int byte = 0; byte < 4; ++byte) dump.put(char((bits >> (byte * 8)) & 255));
+                }
+                dump.close();
+                if (!dump) {
+                    std::fprintf(stderr, "%s: cannot write result dump\n", s.name);
+                    ok = false;
+                }
+            }
         }
     }
     ggml_backend_free(hexagon);

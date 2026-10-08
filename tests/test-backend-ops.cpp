@@ -6615,6 +6615,11 @@ struct test_audio8_codec_f32 : public test_mul_mat_prec_f32 {
 };
 
 static void add_audio8_codec_f32_perf_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    // QVAC-26714's complete S1 trace: the three dominant F32-required DDR
+    // families. Keep the longer historical probes below for scaling checks.
+    cases.emplace_back(new test_audio8_codec_f32(96, 135168));
+    cases.emplace_back(new test_audio8_codec_f32(192, 67584));
+    cases.emplace_back(new test_audio8_codec_f32(384, 16896));
     cases.emplace_back(new test_audio8_codec_f32(96, 184320));
     cases.emplace_back(new test_audio8_codec_f32(192, 92160));
     cases.emplace_back(new test_audio8_codec_f32(384, 23040));
