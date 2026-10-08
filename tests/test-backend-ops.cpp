@@ -6600,6 +6600,26 @@ static void add_audio8_matmul_add_tests(std::vector<std::unique_ptr<test_case>> 
     }
 }
 
+// Current codec products explicitly request F32 precision. Keep these perf
+// cases separate from the historical default-precision MUL_MAT+ADD probes.
+// Sensitive-input correctness uses test-audio8-codec-f32: the ordinary CPU
+// F16 matmul reference here rounds F32 activations to F16.
+struct test_audio8_codec_f32 : public test_mul_mat_prec_f32 {
+    test_audio8_codec_f32(int64_t channels, int64_t rows)
+        : test_mul_mat_prec_f32(GGML_TYPE_F16, channels, rows, channels,
+                               false, false, unit_magnitude, unit_magnitude) {}
+
+    std::string vars() override {
+        return "audio8_codec_f32=1," + test_mul_mat_prec_f32::vars();
+    }
+};
+
+static void add_audio8_codec_f32_perf_tests(std::vector<std::unique_ptr<test_case>> & cases) {
+    cases.emplace_back(new test_audio8_codec_f32(96, 184320));
+    cases.emplace_back(new test_audio8_codec_f32(192, 92160));
+    cases.emplace_back(new test_audio8_codec_f32(384, 23040));
+}
+
 static void add_strided_mul_mat_prec_f32_tests(std::vector<std::unique_ptr<test_case>> & test_cases) {
     constexpr float overflow_magnitude = test_mul_mat_prec_f32::fp16_overflow_magnitude;
     constexpr float unit_magnitude = test_mul_mat_prec_f32::unit_magnitude;
@@ -14877,6 +14897,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_audio8_matmul_add_tests(test_cases, true);
+    add_audio8_codec_f32_perf_tests(test_cases);
     add_speech_hotspot_tests(test_cases, true);
     add_acestep_tests(test_cases, true);
     add_supertonic_tests(test_cases, true);

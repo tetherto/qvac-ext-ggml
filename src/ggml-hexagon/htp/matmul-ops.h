@@ -75,6 +75,9 @@ enum htp_mm_kernel_type {
 };
 
 // Op-specific struct for precomputed matmul params
+// Opt-in F16/F32 DDR microtile, carried in the otherwise unused tile_size.
+#define HTP_MM_F16_F32_PANEL_2X2 2
+
 struct htp_mm_kernel_params {
     int32_t  kernel_type;        // enum htp_mm_kernel_type
     int32_t  pipeline;           // 1 = pipelined execution, 0 = standard
@@ -84,7 +87,7 @@ struct htp_mm_kernel_params {
     int32_t  n_act_threads;      // Number of threads for activation preparation
     int32_t  n_hmx;              // 1 = use HMX, 0 = use HVX
     int32_t  n_prefetch;         // Prefetch lookahead buffers/rows in VTCM
-    int32_t  tile_size;          // Weight tile size
+    int32_t  tile_size;          // Weight tile size; F16_F32_DDR: 0=legacy, 2=F32 panel
     int32_t  aligned_tile_size;  // Aligned weight tile size (padded to 128)
     int32_t  src1_row_size;      // Row size for quantized activation
     int32_t  vtcm_size;          // Total required scratchpad size in VTCM

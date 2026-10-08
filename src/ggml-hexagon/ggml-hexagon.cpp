@@ -70,6 +70,7 @@ static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static int    opt_hostbuf = 1; // hostbuf ON by default
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
+static int    opt_f16_f32_panel = 1; // DDR F32 activation panels; preserve VTCM routing
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
@@ -82,7 +83,7 @@ static int opt_opstage  = HTP_OPSTAGE_QUEUE | HTP_OPSTAGE_COMPUTE;
 static int opt_opbatch  = 1024; // max number of ops in a batch
 static int opt_opqueue  = 16;   // max number of pending batches
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
-static int opt_oppoll   = 0;    // polling for batch completions
+static int opt_oppoll   = 1;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
@@ -2711,6 +2712,23 @@ static void ggml_hexagon_precompute_hvx_mm_params(
             kparams->vtcm_dst_size = L.dst_bytes;
             kparams->n_prefetch = 16;
         } else {
+            // Preserve F32 activations and reuse a 2x2 output panel.
+            // Keep the existing VTCM 2x2 path whenever it fits: it reuses staged
+            // activations and prefetched weights more efficiently for smaller graphs.
+            if (opt_f16_f32_panel && !is_matmul_id && src2_row_size == 0 &&
+                ne10 >= 64 && ne10 % 32 == 0 && src0->ne[1] >= 2 && ne11 >= 2 &&
+                ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+                dst->ne[2] == 1 && dst->ne[3] == 1 &&
+                src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                src0->nb[0] == 2 && src1->nb[0] == 4 && dst->nb[0] == 4 &&
+                src0->nb[1] >= size_t(ne10) * 2 && src1->nb[1] >= size_t(ne10) * 4 &&
+                dst->nb[1] >= size_t(src0->ne[1]) * 4) {
+                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
+                kparams->tile_size = HTP_MM_F16_F32_PANEL_2X2;
+                kparams->src1_row_size = src1->nb[1];
+                return;
+            }
+
             if (src1->type == GGML_TYPE_F32) {
                 kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
             } else {
@@ -4951,6 +4969,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_use_hmx  = getenv("GGML_HEXAGON_USE_HMX");
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
+    const char * str_f16_f32_panel = getenv("GGML_HEXAGON_F16_F32_PANEL");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
@@ -5001,6 +5020,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : (str_use_hmx ? atoi(str_use_hmx) : opt_nhmx);
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
+    opt_f16_f32_panel = str_f16_f32_panel ? atoi(str_f16_f32_panel) == 1 : opt_f16_f32_panel;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
