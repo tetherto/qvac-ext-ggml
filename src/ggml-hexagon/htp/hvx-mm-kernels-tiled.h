@@ -121,36 +121,42 @@ static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * r
     }
 }
 
+static inline float q8_0_block_scale(HVX_Vector vx) {
+    float amax[32] __attribute__((aligned(128)));
+    hvx_vec_store_u(amax, 128, hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx)));
+    return amax[0] / 127.0f;
+}
+
+static inline HVX_Vector q8_0_block_quants_qf32(HVX_Vector vx, float d) {
+    const HVX_Vector round_bias = hvx_vec_splat_f32(12582912.0f);
+    const float      id         = d != 0.0f ? 1.0f / d : 0.0f;
+    HVX_Vector       scaled     = hvx_vec_mul_f32_f32(vx, hvx_vec_splat_f32(id));
+    HVX_Vector       rounded    = hvx_vec_sub_f32_f32(hvx_vec_add_f32_f32(scaled, round_bias), round_bias);
+    return Q6_Vqf32_vsub_VsfVsf(rounded, Q6_V_vzero());
+}
+
+static inline HVX_Vector q8_0_pack_quants(HVX_Vector q0, HVX_Vector q1, HVX_Vector q2, HVX_Vector q3) {
+    HVX_Vector q01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q1, q0)));
+    HVX_Vector q23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(q3, q2)));
+    return Q6_Vb_vpack_VhVh_sat(hvx_vec_i16_from_hf_rnd_sat(q23_hf), hvx_vec_i16_from_hf_rnd_sat(q01_hf));
+}
+
+static inline HVX_Vector q8_0_scale_splat(float d) {
+    const __fp16 d_h = (__fp16) d;
+    return Q6_Vh_vsplat_R(*(const int16_t *) &d_h);
+}
+
 static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * restrict y_block) {
     assert((unsigned long) x % 128 == 0);
     assert((unsigned long) y_block % 128 == 0);
 
-    HVX_Vector * vx = (HVX_Vector *) x;
-    HVX_Vector zero   = Q6_V_vzero();
+    const HVX_Vector * vx = (const HVX_Vector *) x;
 
-    HVX_Vector vx0_qf = Q6_Vqf32_vsub_VsfVsf(vx[0], zero);
-    HVX_Vector vx1_qf = Q6_Vqf32_vsub_VsfVsf(vx[1], zero);
-    HVX_Vector vx2_qf = Q6_Vqf32_vsub_VsfVsf(vx[2], zero);
-    HVX_Vector vx3_qf = Q6_Vqf32_vsub_VsfVsf(vx[3], zero);
+    const float d[4] = { q8_0_block_scale(vx[0]), q8_0_block_scale(vx[1]), q8_0_block_scale(vx[2]),
+                         q8_0_block_scale(vx[3]) };
 
-    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx1_qf, vx0_qf)));
-    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx3_qf, vx2_qf)));
-
-    HVX_Vector vmax_hf = hvx_vec_reduce_max_f16(hvx_vec_abs_f16(vx01_hf));
-    vmax_hf            = hvx_vec_reduce_max2_f16(hvx_vec_abs_f16(vx23_hf), vmax_hf);
-
-    HVX_Vector vd_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax_hf, Q6_Vh_vsplat_R(0x2008));
-    HVX_Vector vd_hf   = Q6_Vhf_equals_Vqf16(vd_qf16);
-
-    HVX_Vector vd_inv_hf = hvx_vec_inverse_f16(vd_hf);
-    vx01_hf              = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(vx01_hf, vd_inv_hf));
-    vx23_hf              = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(vx23_hf, vd_inv_hf));
-
-    HVX_Vector vx01_i16 = hvx_vec_i16_from_hf_rnd_sat(vx01_hf);
-    HVX_Vector vx23_i16 = hvx_vec_i16_from_hf_rnd_sat(vx23_hf);
-    HVX_Vector vx_i8    = Q6_Vb_vpack_VhVh_sat(vx23_i16, vx01_i16);
-
-    HVX_Vector r_scale = hvx_vec_repl_f16(vd_hf);
+    HVX_Vector vx_i8 = q8_0_pack_quants(q8_0_block_quants_qf32(vx[0], d[0]), q8_0_block_quants_qf32(vx[1], d[1]),
+                                        q8_0_block_quants_qf32(vx[2], d[2]), q8_0_block_quants_qf32(vx[3], d[3]));
 
     static const uint8_t __attribute__((aligned(128))) repl[128] = {
         0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x08, 0x08, 0x08, 0x08, 0x04, 0x04, 0x04, 0x04,
@@ -185,7 +191,7 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
         dst[5] = r5;
         dst[6] = r6;
         dst[7] = r7;
-        dst[8] = r_scale;
+        dst[8] = q8_0_scale_splat(d[b]);
     }
 }
 
@@ -458,8 +464,8 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
         HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
 
-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
+        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
+        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
     }
 
     for (; kt < n_k_tiles; kt++) {
@@ -612,8 +618,8 @@ static void tiled_vec_dot_q4_1_32x2(const uint32_t n, float * restrict s0, float
         HVX_Vector v_scaled_dot_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_add_f32_f32(v_scaled_dot_c1_1, v_offset_comb_c1_1);
 
-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
+        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
+        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
     }
 
     for (; kt < n_k_tiles; kt++) {
@@ -743,8 +749,8 @@ static void tiled_vec_dot_q8_0_32x2(const uint32_t n, float * restrict s0, float
         HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
 
-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
+        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
+        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
     }
 
     for (; kt < n_k_tiles; kt++) {
@@ -867,8 +873,8 @@ static void tiled_vec_dot_iq4nl_32x2(const uint32_t n, float * restrict s0, floa
         HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
 
-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
+        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
+        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
     }
 
     for (; kt < n_k_tiles; kt++) {
@@ -1022,8 +1028,8 @@ static void tiled_vec_dot_mxfp4_32x2(const uint32_t n, float * restrict s0, floa
         HVX_Vector v_sum_scaled_c0_1 = hvx_vec_mul_f32_f32(v_sum_sf_c0_1, v_scale_comb_c0_1);
         HVX_Vector v_sum_scaled_c1_1 = hvx_vec_mul_f32_f32(v_sum_sf_c1_1, v_scale_comb_c1_1);
 
-        v_sum_float_c0 = hvx_vec_add_f32_f32(v_sum_float_c0, hvx_vec_add_f32_f32(v_sum_scaled_c0_0, v_sum_scaled_c0_1));
-        v_sum_float_c1 = hvx_vec_add_f32_f32(v_sum_float_c1, hvx_vec_add_f32_f32(v_sum_scaled_c1_0, v_sum_scaled_c1_1));
+        v_sum_float_c0 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c0, v_sum_scaled_c0_0), v_sum_scaled_c0_1);
+        v_sum_float_c1 = hvx_vec_add_f32_f32(hvx_vec_add_f32_f32(v_sum_float_c1, v_sum_scaled_c1_0), v_sum_scaled_c1_1);
     }
 
     for (; kt < n_k_tiles; kt++) {
@@ -1086,7 +1092,7 @@ static inline void quantize_f32_q8_0_tiled_kernel(
     size_t src_row_size,
     size_t dst_row_size
 ) {
-    const size_t src_row_size_padded = hex_round_up(src_row_size, QK_Q8_0_TILED * sizeof(float));
+    const size_t src_row_size_padded = hex_round_up(ne0 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
     hvx_splat_f32_a(tmp_data, 0.0f, src_row_size_padded / sizeof(float));
 
     for (uint32_t i = 0; i < nrows; ++i) {
@@ -1108,7 +1114,7 @@ static inline void quantize_f32_q8_1_tiled_kernel(
     size_t src_row_size,
     size_t dst_row_size
 ) {
-    const size_t src_row_size_padded = hex_round_up(src_row_size, QK_Q8_0_TILED * sizeof(float));
+    const size_t src_row_size_padded = hex_round_up(ne0 * sizeof(float), QK_Q8_0_TILED * sizeof(float));
     hvx_splat_f32_a(tmp_data, 0.0f, src_row_size_padded / sizeof(float));
 
     for (uint32_t i = 0; i < nrows; ++i) {
