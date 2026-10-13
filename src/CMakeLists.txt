@@ -65,6 +65,16 @@ if (GGML_LTO)
     endif()
 endif()
 
+if (MSVC)
+    # Shader arrays need individual sections for a consumer's /OPT:REF and
+    # /OPT:ICF to remove unused payloads and fold identical ones at final link.
+    # GGML_LTO=ON additionally enables ThinLTO with clang-cl; consumers of those
+    # static libraries must use a compatible LLVM toolchain and lld-link.
+    add_compile_options(
+        "$<$<AND:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>,$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>>:/Gy>"
+        "$<$<AND:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>,$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>>:/Gw>")
+endif()
+
 if (GGML_CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
     find_program(GGML_CCACHE_FOUND ccache)
     find_program(GGML_SCCACHE_FOUND sccache)
