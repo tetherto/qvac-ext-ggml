@@ -196,12 +196,23 @@ export function findHardcodedLabelViolations(relativePath, source, runners) {
     if (!assign) continue
     const value = assign[1]
 
-    // Composite flow array: compare token sets against catalog array entries.
+    // Composite flow array. Every literal one is a finding: a set that IS in the
+    // catalog should come from runner_names, and a set that is NOT is worse -
+    // nothing routes it, so the job queues 24h and is cancelled. Matching only
+    // known sets would mean retiring a catalog entry silently drops it from the
+    // search set, which is how an upstream sync could reintroduce the very label
+    // set this catalog exists to remove.
     const arrayValue = value.match(/^\[([^\]]+)\]$/)
     if (arrayValue) {
       const tokens = normalizeArrayTokens(arrayValue[1])
       const match = arrays.find((entry) => sameSet(entry.labels, tokens))
-      if (match) findings.push({ file: relativePath, line: i + 1, target: targetKeyString(match), text: line.trim() })
+      findings.push({
+        file: relativePath,
+        line: i + 1,
+        target: match ? targetKeyString(match) : `[${tokens.join(',')}]`,
+        uncatalogued: !match,
+        text: line.trim(),
+      })
       continue
     }
 

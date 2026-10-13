@@ -17,14 +17,22 @@ A catalog value is one of:
 
 - a **scalar** label (`ubuntu-22.04`) — consumed as
   `runs-on: ${{ needs.runner_names.outputs.<key> }}`
-- a **composite label set** (`[self-hosted, Linux, X64, NVIDIA]`) — exported as a
+- a **composite label set** (`[self-hosted, macOS, ARM64]`) — exported as a
   JSON array string and consumed as
   `runs-on: ${{ fromJSON(needs.runner_names.outputs.<key>) }}`
+
+`fromJSON` is required for the array form and wrong for the scalar form — it
+raises on a bare label and the job errors before its first step. Check the
+catalog for the shape of the key you are wiring.
 
 Rolling `-latest` aliases (`ubuntu-latest`, `macos-latest`, `windows-latest`)
 are intentionally left hardcoded — they are GitHub aliases, not fleet labels.
 
 ## Wiring a job
+
+Every `selfhosted_*` key also needs the fork-authorization gate, or a fork's PR
+runs its own code on our hardware. `validate-runner-names.mjs` does **not** check
+for it — only for hardcoded labels and the `runner_names` dependency.
 
 ```yaml
 jobs:
@@ -33,11 +41,26 @@ jobs:
       contents: read
     uses: ./.github/workflows/reusable-runner-names.yml
 
-  my-gpu-job:
-    needs: runner_names
-    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_linux_x64_nvidia) }}
+  authorize:             # required for every self-hosted job below
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
+  my-gpu-job:            # scalar key - no fromJSON
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: ${{ needs.runner_names.outputs.selfhosted_linux_x64_nvidia }}
+    steps: ...
+
+  my-mac-job:            # composite key - fromJSON
+    needs: [runner_names, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: ${{ fromJSON(needs.runner_names.outputs.selfhosted_macos_arm64) }}
     steps: ...
 ```
+
+GitHub-hosted keys (`ubuntu_2204`, `ubuntu_2204_arm`) need only
+`needs: runner_names`.
 
 ## Changing a label
 

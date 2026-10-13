@@ -20,11 +20,17 @@ import {
 
 test('runners.yaml parses scalar + array entries with unique keys/targets', () => {
   const runners = loadRunners()
-  assert.ok(runners.length >= 5)
+  assert.ok(runners.length >= 4)
   assert.ok(runners.some((e) => e.kind === 'scalar' && e.label === 'ubuntu-22.04'))
+  // Still one composite set in the catalog, so the array path stays covered.
+  const mac = runners.find((e) => e.key === 'selfhosted_macos_arm64')
+  assert.equal(mac.kind, 'array')
+  assert.deepEqual(mac.labels, ['self-hosted', 'macOS', 'ARM64'])
+  // Pinned so an upstream sync cannot restore the composite set, which matches
+  // no runner here (QVAC-24501).
   const nvidia = runners.find((e) => e.key === 'selfhosted_linux_x64_nvidia')
-  assert.equal(nvidia.kind, 'array')
-  assert.deepEqual(nvidia.labels, ['self-hosted', 'Linux', 'X64', 'NVIDIA'])
+  assert.equal(nvidia.kind, 'scalar')
+  assert.equal(nvidia.label, 'qvac-ubuntu2204-x64-gpu')
   assert.equal(new Set(runners.map((e) => e.key)).size, runners.length)
 })
 
@@ -53,7 +59,9 @@ test('reusable-runner-names.yml matches the catalog', () => {
   assert.match(rendered, /runs-on: ubuntu-latest/)
   assert.doesNotMatch(rendered, /actions\/checkout/)
   // Array entry exported as a single-quoted JSON string.
-  assert.match(rendered, /selfhosted_linux_x64_nvidia=\["self-hosted","Linux","X64","NVIDIA"\]/)
+  assert.match(rendered, /selfhosted_macos_arm64=\["self-hosted","macOS","ARM64"\]/)
+  // Scalar entry exported bare.
+  assert.match(rendered, /selfhosted_linux_x64_nvidia=qvac-ubuntu2204-x64-gpu/)
 })
 
 test('CI workflows do not hardcode catalog runner targets', () => {
@@ -91,6 +99,33 @@ test('detector catches scalar and composite-array hardcoded runs-on', () => {
     [
       [3, 'ubuntu-22.04'],
       [5, '[self-hosted,Linux,X64,NVIDIA]'],
+    ],
+  )
+})
+
+test('detector flags a composite set that is in no catalog entry', () => {
+  // The regression this guards: retiring the NVIDIA array entries used to drop
+  // them from the detector's search set, so an upstream sync reintroducing
+  // `runs-on: [self-hosted, Linux, X64, NVIDIA]` validated clean and went back
+  // to queueing 24h. Nothing routes an uncatalogued set, so it is always wrong.
+  const runners = parseRunnersYaml('gpu: qvac-ubuntu2204-x64-gpu\nmac: [self-hosted, macOS, ARM64]\n')
+  const source = [
+    'jobs:',
+    '  resynced:',
+    '    runs-on: [self-hosted, Linux, X64, NVIDIA]',
+    '  known:',
+    '    runs-on: [self-hosted, macOS, ARM64]',
+    '  wired:',
+    '    runs-on: ${{ fromJSON(needs.runner_names.outputs.mac) }}',
+    '',
+  ].join('\n')
+
+  const findings = findHardcodedLabelViolations('x.yml', source, runners)
+  assert.deepEqual(
+    findings.map((f) => [f.line, f.target, Boolean(f.uncatalogued)]),
+    [
+      [3, '[self-hosted,Linux,X64,NVIDIA]', true],
+      [5, '[self-hosted,macOS,ARM64]', false],
     ],
   )
 })
