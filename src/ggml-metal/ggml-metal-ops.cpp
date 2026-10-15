@@ -3568,7 +3568,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         struct { uint32_t M, N, K, bits; } args = {
             (uint32_t) x->ne[1], (uint32_t) w->ne[1], (uint32_t) w->ne[0],
             w->type == GGML_TYPE_Q4_0 ? 4u : 8u };
-        auto pipeline = ggml_metal_library_get_pipeline_affine(ctx->lib);
+        auto pipeline = ggml_metal_library_get_pipeline_affine(ctx->lib, args.bits);
         ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
         ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(w), 0);
         ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(affine->src[2]), 1);
