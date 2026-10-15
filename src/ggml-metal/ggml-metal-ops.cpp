@@ -3560,6 +3560,25 @@ static void ggml_metal_mm_epilogue_match(ggml_metal_op_t ctx, int idx, ggml_meta
 }
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * affine = ctx->node(idx);
+    if (ggml_get_op_params_i32(affine, 1) == GGML_HINT_SRC0_IS_AFFINE_V1) {
+        const auto * w = affine->src[0]; const auto * x = affine->src[1];
+        GGML_ASSERT(affine->src[2] && affine->src[3] && x->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_n_dims(w) <= 2 && ggml_n_dims(x) <= 2 && ggml_is_contiguous(w) && ggml_is_contiguous(x));
+        struct { uint32_t M, N, K, bits; } args = {
+            (uint32_t) x->ne[1], (uint32_t) w->ne[1], (uint32_t) w->ne[0],
+            w->type == GGML_TYPE_Q4_0 ? 4u : 8u };
+        auto pipeline = ggml_metal_library_get_pipeline_affine(ctx->lib);
+        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(w), 0);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(affine->src[2]), 1);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(affine->src[3]), 2);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(x), 3);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(affine), 4);
+        ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 5);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (args.M+31)/32, (args.N+63)/64, 1, 128, 1, 1);
+        return 1;
+    }
     if (ctx->use_fusion) {
         const int n_fuse = ggml_metal_op_try_mul_mv_glu(ctx, idx);
         if (n_fuse > 0) {

@@ -1332,6 +1332,7 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src1 = dst->src[1];
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(hint != GGML_HINT_SRC0_IS_AFFINE_V1 && "affine v1 requires its Metal kernel");
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
         return;

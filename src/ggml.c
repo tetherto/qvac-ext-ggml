@@ -3522,6 +3522,24 @@ struct ggml_tensor * ggml_mul_mat(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_affine_v1(
+        struct ggml_context * ctx, struct ggml_tensor * codes,
+        struct ggml_tensor * input, struct ggml_tensor * step,
+        struct ggml_tensor * minimum) {
+    GGML_ASSERT(codes->type == GGML_TYPE_Q4_0 || codes->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && step->type == GGML_TYPE_F32 && minimum->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_n_dims(codes) <= 2 && ggml_n_dims(input) <= 2);
+    GGML_ASSERT(ggml_is_contiguous(codes) && ggml_is_contiguous(input));
+    GGML_ASSERT(ggml_is_contiguous(step) && ggml_is_contiguous(minimum));
+    GGML_ASSERT(codes->ne[0] % 32 == 0 && codes->ne[0] == input->ne[0]);
+    GGML_ASSERT(ggml_nelements(step) == codes->ne[1] && ggml_nelements(minimum) == codes->ne[1]);
+    struct ggml_tensor * result = ggml_mul_mat(ctx, codes, input);
+    result->src[2] = step;
+    result->src[3] = minimum;
+    ggml_mul_mat_set_hint(result, GGML_HINT_SRC0_IS_AFFINE_V1);
+    return result;
+}
+
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

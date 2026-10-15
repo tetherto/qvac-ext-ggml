@@ -80,6 +80,12 @@ ggml_metal_pipeline_t ggml_metal_pipelines_get(ggml_metal_pipelines_t ppls, cons
     return ppls->data[name];
 }
 
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_affine(ggml_metal_library_t lib) {
+    auto res = ggml_metal_library_get_pipeline(lib, "affine_mm");
+    if (!res.pipeline) res = ggml_metal_library_compile_pipeline(lib, "affine_mm", "affine_mm", nullptr);
+    return res;
+}
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml_metal_library_t lib, ggml_op op) {
     char base[256];
     char name[256];
