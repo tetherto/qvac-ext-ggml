@@ -15472,9 +15472,13 @@ kernel void affine_mm(device const uchar * codes [[buffer(0)]],
                       uint2 group [[threadgroup_position_in_grid]],
                       ushort tid [[thread_index_in_threadgroup]],
                       ushort sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup half sa[64*32];
-    threadgroup half sb[32*32];
-    threadgroup float tail[64*32];
+    // Operand staging and tail output are disjoint phases, separated by the
+    // existing threadgroup barrier. Reuse one 8 KiB allocation instead of
+    // reserving 6 KiB operands plus 8 KiB output for the whole kernel.
+    threadgroup float storage[64*32];
+    threadgroup half * sa = (threadgroup half *) storage;
+    threadgroup half * sb = sa + 64*32;
+    threadgroup float * tail = storage;
     const uint r0=group.y*64, r1=group.x*32;
     const ushort nr0=min(uint(64),a.N-r0), nr1=min(uint(32),a.M-r1);
     const ushort lr0=min(ushort(tid/2),ushort(nr0-1));
