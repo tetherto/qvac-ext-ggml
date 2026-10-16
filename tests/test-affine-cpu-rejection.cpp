@@ -64,8 +64,12 @@ int main(int argc, char ** argv) {
         std::memcpy(data.data() + row * block_size, &unit, sizeof(unit));
     }
     std::vector<float> ones(N, 1.0f), zeros(N, 0.0f);
+    // Q8 input quantization stores its scale in FP16. Use 127 so the scale
+    // is exactly one, keeping this ordinary baseline exact without tolerances
+    // for the unrelated 1/127 -> FP16 quantization of an all-ones input.
+    std::vector<float> input(K, type == GGML_TYPE_Q8_0 ? 127.0f : 1.0f);
     ggml_backend_tensor_set(codes, data.data(), 0, data.size());
-    ggml_backend_tensor_set(x, ones.data(), 0, K * sizeof(float));
+    ggml_backend_tensor_set(x, input.data(), 0, K * sizeof(float));
     ggml_backend_tensor_set(step, ones.data(), 0, N * sizeof(float));
     ggml_backend_tensor_set(minimum, zeros.data(), 0, N * sizeof(float));
     auto * graph = ggml_new_graph_custom(ctx, 32, false);
@@ -74,7 +78,7 @@ int main(int argc, char ** argv) {
     std::vector<float> out(N);
     ggml_backend_tensor_get(ordinary, out.data(), 0, N * sizeof(float));
     // Q4 code 8 is ordinary zero; the signed Q8 byte 0x88 is -120.
-    const float expected = type == GGML_TYPE_Q4_0 ? 0.0f : -3840.0f;
+    const float expected = type == GGML_TYPE_Q4_0 ? 0.0f : -487680.0f;
     for (float value : out) {
         if (!std::isfinite(value) || std::fabs(value - expected) > 0.001f) {
             std::fprintf(stderr, "FAIL: ordinary %s in %s got %.9g, expected %.9g\n",
