@@ -2088,6 +2088,12 @@ static bool ggml_metal_should_fuse_mul_mat_glu(
     if (!up || !gate || !glu) {
         return false;
     }
+    // Either projection can be affine even when the first graph node is an
+    // ordinary matmul. The generic GLU kernel does not read step/minimum.
+    if ((up->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(up, 1) == GGML_HINT_SRC0_IS_AFFINE_V1) ||
+        (gate->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(gate, 1) == GGML_HINT_SRC0_IS_AFFINE_V1)) {
+        return false;
+    }
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
         return false;
     }
