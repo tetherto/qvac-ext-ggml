@@ -76,7 +76,11 @@ int main(int argc, char ** argv) {
     // Q4 code 8 is ordinary zero; the signed Q8 byte 0x88 is -120.
     const float expected = type == GGML_TYPE_Q4_0 ? 0.0f : -3840.0f;
     for (float value : out) {
-        if (!std::isfinite(value) || std::fabs(value - expected) > 0.001f) return 1;
+        if (!std::isfinite(value) || std::fabs(value - expected) > 0.001f) {
+            std::fprintf(stderr, "FAIL: ordinary %s in %s got %.9g, expected %.9g\n",
+                         ggml_type_name(type), ggml_backend_buft_name(buft), value, expected);
+            return 1;
+        }
     }
     std::printf("Ordinary %s matmul passed in %s; attempting direct affine execution\n",
                 ggml_type_name(type), ggml_backend_buft_name(buft));
