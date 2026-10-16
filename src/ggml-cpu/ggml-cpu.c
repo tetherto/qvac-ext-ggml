@@ -1332,7 +1332,6 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src1 = dst->src[1];
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
-    GGML_ASSERT(hint != GGML_HINT_SRC0_IS_AFFINE_V1 && "affine v1 requires its Metal kernel");
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
         return;
@@ -1792,6 +1791,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
+    }
+
+    // Extra buffers (including CPU_REPACK) dispatch MUL_MAT themselves, so
+    // reject affine carriers before any ordinary quantized kernel sees them.
+    if (tensor->op == GGML_OP_MUL_MAT) {
+        GGML_ASSERT(ggml_get_op_params_i32(tensor, 1) != GGML_HINT_SRC0_IS_AFFINE_V1 &&
+                    "affine v1 requires its Metal kernel");
     }
 
     // extra_buffer op?
