@@ -1793,6 +1793,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
+    // Extra buffers (including CPU_REPACK) dispatch MUL_MAT themselves, so
+    // reject affine carriers before any ordinary quantized kernel sees them.
+    if (tensor->op == GGML_OP_MUL_MAT) {
+        GGML_ASSERT(ggml_get_op_params_i32(tensor, 1) != GGML_HINT_SRC0_IS_AFFINE_V1 &&
+                    "affine v1 requires its Metal kernel");
+    }
+
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;

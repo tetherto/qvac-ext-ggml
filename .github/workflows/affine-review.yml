@@ -1,0 +1,44 @@
+name: Affine review regressions
+on:
+  pull_request:
+    branches: [speech]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build affine regression harnesses
+        run: |
+          cmake -S . -B build-affine -DCMAKE_BUILD_TYPE=Release -DGGML_BUILD_TESTS=ON -DGGML_BUILD_EXAMPLES=OFF
+          cmake --build build-affine --target test-affine-backend-contract test-affine-cpu-rejection test-affine-metal-glu -j4
+      - name: Run capability, direct CPU and Metal fusion regressions
+        run: ctest --test-dir build-affine -R '^test-affine-' --verbose --output-on-failure --no-tests=error --output-junit affine-results.xml
+      - name: Require platform-specific regression coverage
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          cases = {t.attrib['name']: t for t in ET.parse('build-affine/affine-results.xml').iter('testcase')}
+          required = ['test-affine-backend-contract', 'test-affine-cpu-rejection-ordinary-q4', 'test-affine-cpu-rejection-ordinary-q8']
+          required += ['test-affine-cpu-rejection-repack-q4'] if os.environ['RUNNER_OS'] == 'Linux' else ['test-affine-metal-glu']
+          for name in required:
+              if name not in cases or any(cases[name].find(tag) is not None for tag in ('skipped', 'failure', 'error')):
+                  raise SystemExit('Required regression did not pass: ' + name)
+          print('All required platform-specific regressions executed and passed')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: affine-review-${{ matrix.os }}
+          path: |
+            build-affine/affine-results.xml
+            build-affine/Testing/Temporary/LastTest.log
