@@ -463,6 +463,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_SRC0_IS_AFFINE_V1 = 2,
     };
 
     // model file types
@@ -1583,6 +1584,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // Experimental Metal-only affine carrier matrix multiply. Unit-scale
+    // Q4_0/Q8_0 codes, F32 per-output-channel step/minimum, contiguous F32 input.
+    // Weights round to F16 after separate F32 multiply/add. No CPU fallback.
+#define GGML_AFFINE_METAL_V1 1
+    GGML_API struct ggml_tensor * ggml_mul_mat_affine_v1(
+            struct ggml_context * ctx, struct ggml_tensor * codes,
+            struct ggml_tensor * input, struct ggml_tensor * step,
+            struct ggml_tensor * minimum);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

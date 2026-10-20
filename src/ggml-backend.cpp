@@ -660,6 +660,12 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    // This hint changes the meaning of Q4_0/Q8_0 payloads. Ordinary matmul
+    // capability checks cannot opt other backends into the Metal-only format.
+    if (op->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_AFFINE_V1 &&
+            (!device->reg || strcmp(ggml_backend_reg_name(device->reg), "MTL") != 0)) {
+        return false;
+    }
     return device->iface.supports_op(device, op);
 }
 

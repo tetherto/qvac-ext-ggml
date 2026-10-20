@@ -577,6 +577,29 @@ set_tests_properties(${TEST_TARGET} PROPERTIES SKIP_RETURN_CODE 77
     ENVIRONMENT "GGML_HEXAGON_MM_SELECT=2;GGML_HEXAGON_OPSTAGE=3")
 add_test(NAME ${TEST_TARGET}-reference COMMAND $<TARGET_FILE:${TEST_TARGET}> --reference-only)
 
+set(TEST_TARGET test-affine-backend-contract)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ../src)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-affine-metal-glu)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_tests_properties(${TEST_TARGET} PROPERTIES SKIP_RETURN_CODE 77)
+
+set(TEST_TARGET test-affine-cpu-rejection)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+foreach(buffer IN ITEMS ordinary repack)
+    foreach(carrier IN ITEMS q4 q8)
+        add_test(NAME ${TEST_TARGET}-${buffer}-${carrier}
+            COMMAND $<TARGET_FILE:${TEST_TARGET}> ${buffer} ${carrier})
+        set_tests_properties(${TEST_TARGET}-${buffer}-${carrier} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
+
 set(TEST_TARGET test-hexagon-conv-taps)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)

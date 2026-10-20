@@ -1311,6 +1311,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
+    if (op->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_AFFINE_V1) {
+        const struct ggml_tensor * w = op->src[0], * x = op->src[1];
+        const struct ggml_tensor * step = op->src[2], * minimum = op->src[3];
+        return has_simdgroup_mm && w && x && step && minimum &&
+            (w->type == GGML_TYPE_Q4_0 || w->type == GGML_TYPE_Q8_0) &&
+            x->type == GGML_TYPE_F32 && step->type == GGML_TYPE_F32 && minimum->type == GGML_TYPE_F32 &&
+            op->type == GGML_TYPE_F32 && ggml_n_dims(w) <= 2 && ggml_n_dims(x) <= 2 &&
+            w->ne[0] % 32 == 0 && w->ne[0] == x->ne[0] &&
+            ggml_nelements(step) == w->ne[1] && ggml_nelements(minimum) == w->ne[1] &&
+            ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(step) && ggml_is_contiguous(minimum);
+    }
+
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {
             return false;
