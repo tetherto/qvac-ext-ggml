@@ -586,6 +586,14 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY SKIP_RETURN_CODE 77)
 
+set(TEST_TARGET test-hexagon-mul-mat-buffer)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+add_test(NAME ${TEST_TARGET}-nohostbuf COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_tests_properties(${TEST_TARGET} ${TEST_TARGET}-nohostbuf PROPERTIES SKIP_RETURN_CODE 77)
+set_property(TEST ${TEST_TARGET}-nohostbuf PROPERTY ENVIRONMENT "GGML_HEXAGON_NDEV=1;GGML_HEXAGON_HOSTBUF=0")
+
 # Host-portable regression for metadata retained until a Hexagon queue reply.
 set(TEST_TARGET test-hexagon-opcache)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)

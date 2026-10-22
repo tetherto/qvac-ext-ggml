@@ -3385,8 +3385,12 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
                 return false;  // no broadcasting (for now)
             }
 
-            // src0 (weights) must be repacked
-            if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+            // Quantized weights require the DSP's repacked layout. A bufferless
+            // probe can only promise the default allocation contract: HOSTBUF
+            // retains canonical bytes, whereas HOSTBUF=0 repacks on upload.
+            // Loaders selecting an explicit repack buffer can attach a zero-size
+            // candidate buffer when querying support before weight allocation.
+            if (src0->buffer ? !ggml_backend_buffer_is_hexagon_repack(src0->buffer) : opt_hostbuf) {
                 return false;
             }
             break;
