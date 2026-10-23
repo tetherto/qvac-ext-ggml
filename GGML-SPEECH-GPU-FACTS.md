@@ -101,6 +101,17 @@ verified mechanisms.
   `ne00 % 16 != 0` and `ne01 % 64 != 0`, which leaves those shapes on the generic
   GEMM. MOSS-Transcribe-Diarize prefill on the unfused graph went from cosine
   0.844 to 0.99988 against the Hugging Face logits.
+- The `gemm_noshuffle_*` prefill GEMMs (every Adreno-layout weight type, N > 1)
+  stage the activations in fp16; at default precision they also kept the
+  sums in fp16, so a dot product past 65504 came back as inf even when every
+  operand fits. TranscribePsy's block-0 feed-forward `linear2` reaches 66k on
+  some 60 s windows; the inf became NaN in the next layer norm and attention
+  spread it over the window (empty transcript from the second window on,
+  `test-opencl-mul-mat-sum-range` inf for n = 8/63/64/750). The q8_0 kernel now
+  sums each 32-wide block in fp16 and the block sums in fp32 (+9.6 % kernel time
+  at m=4096 n=512 k=14336, +1.5 % TranscribePsy encoder); the q4_0, q4_1, q5_0,
+  q5_1, q1_0, q4_K, q5_K, q6_K and iq4_nl kernels still sum in fp16. The gemv
+  (N == 1) kernels sum in fp32. `GGML_PREC_F32` keeps q8_0 activations in fp32 too.
 
 ## ggml-vulkan on AMD Strix Halo (Radeon 8060S, RADV GFX1151, Mesa 25.2.8)
 

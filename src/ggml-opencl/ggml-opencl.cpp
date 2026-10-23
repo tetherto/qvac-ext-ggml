@@ -20274,7 +20274,7 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         }
 
         // The default staging narrows the activations to half; GGML_PREC_F32 keeps them
-        // and the accumulators in float.
+        // in float.
         const bool prec_f32 = (ggml_prec) dst->op_params[0] == GGML_PREC_F32;
 
         // subbuffer for transposed activations
