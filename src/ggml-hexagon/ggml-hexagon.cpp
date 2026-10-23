@@ -1164,11 +1164,24 @@ static const char * ggml_backend_hexagon_buffer_type_name(ggml_backend_buffer_ty
     return static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->name.c_str();
 }
 
+static constexpr size_t HEXAGON_TENSOR_GUARD_BYTES = 4 * 1024;
+
+static size_t ggml_backend_hexagon_buffer_alloc_size(ggml_backend_buffer_type_t buft, size_t size) {
+    GGML_UNUSED(buft);
+    if (size == 0) {
+        return 0;
+    }
+    return size > SIZE_MAX - HEXAGON_TENSOR_GUARD_BYTES ? SIZE_MAX : size + HEXAGON_TENSOR_GUARD_BYTES;
+}
+
 static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
             ggml_backend_buffer_type_t buffer_type, size_t size) {
     auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
+    size = ggml_backend_hexagon_buffer_alloc_size(buffer_type, size);
+    if (size == SIZE_MAX) {
+        return nullptr;
+    }
     try {
-        size += 4 * 1024;  // guard page
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size);
         return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
     } catch (const std::exception & exc) {
@@ -1180,8 +1193,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
 static ggml_backend_buffer_t ggml_backend_hexagon_repack_buffer_type_alloc_buffer(
             ggml_backend_buffer_type_t buffer_type, size_t size) {
     auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
+    size = ggml_backend_hexagon_buffer_alloc_size(buffer_type, size);
+    if (size == SIZE_MAX) {
+        return nullptr;
+    }
     try {
-        size += 4 * 1024;  // guard page
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size);
         return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
     } catch (const std::exception & exc) {
@@ -3385,8 +3401,12 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
                 return false;  // no broadcasting (for now)
             }
 
-            // src0 (weights) must be repacked
-            if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+            // Quantized weights require the DSP's repacked layout. A bufferless
+            // probe can only promise the default allocation contract: HOSTBUF
+            // retains canonical bytes, whereas HOSTBUF=0 repacks on upload.
+            // Loaders selecting an explicit repack buffer can attach a zero-size
+            // candidate buffer when querying support before weight allocation.
+            if (src0->buffer ? !ggml_backend_buffer_is_hexagon_repack(src0->buffer) : opt_hostbuf) {
                 return false;
             }
             break;
@@ -4745,6 +4765,9 @@ static void ggml_backend_hexagon_device_get_props(ggml_backend_dev_t dev, struct
     props->name        = ggml_backend_hexagon_device_get_name(dev);
     props->description = ggml_backend_hexagon_device_get_description(dev);
     props->type        = ggml_backend_hexagon_device_get_type(dev);
+    // FastRPC tensor buffers and host allocations compete for system RAM.
+    // A zero capacity query is unknown capacity, not a separate zero-byte pool.
+    props->memory_unified = true;
     ggml_backend_hexagon_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ true,
@@ -5262,10 +5285,10 @@ bool ggml_backend_hexagon_get_runtime_info_v1(ggml_backend_t backend, uint64_t m
     ggml_backend_hexagon_runtime_info_v1 info = {};
     info.version = GGML_HEXAGON_RUNTIME_INFO_VERSION;
     info.op_stage = selected->runtime_op_stage;
-    info.max_buffer_bytes = htp_runtime_max_buffer_payload(selected->max_bufsize, HTP_MMAP_MAX_VMEM, 4 * 1024);
+    info.max_buffer_bytes = htp_runtime_max_buffer_payload(selected->max_bufsize, HTP_MMAP_MAX_VMEM, HEXAGON_TENSOR_GUARD_BYTES);
     info.max_batch_vmem_bytes = selected->max_vmem;
     info.vtcm_bytes = selected->vtcm_size;
-    info.tensor_guard_bytes = 4 * 1024;
+    info.tensor_guard_bytes = HEXAGON_TENSOR_GUARD_BYTES;
     info.buffer_alignment = 128;
     info.allocation_page_bytes = page;
 
@@ -5295,6 +5318,9 @@ bool ggml_backend_hexagon_get_runtime_info_v1(ggml_backend_t backend, uint64_t m
 }
 
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_buft_get_buffer_alloc_size") == 0) {
+        return (void *) ggml_backend_hexagon_buffer_alloc_size;
+    }
     if (strcmp(name, "ggml_backend_hexagon_get_runtime_info_v1") == 0) {
         return (void *) ggml_backend_hexagon_get_runtime_info_v1;
     }

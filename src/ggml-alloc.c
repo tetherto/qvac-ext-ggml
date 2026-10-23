@@ -905,7 +905,8 @@ static bool ggml_gallocr_shared_buffers_need_grow(ggml_gallocr_t galloc) {
     for (int i = 0; i < galloc->n_buffers; ++i) {
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; ++c) {
             const size_t current = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
-            if (ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > current) {
+            const size_t payload = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+            if (ggml_backend_buft_get_buffer_alloc_size(galloc->bufts[i], payload) > current) {
                 return true;
             }
         }
@@ -1024,7 +1025,7 @@ static bool ggml_gallocr_reserve_n_impl(
             size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
             size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
             new_size += new_chunk_size;
-            if (new_chunk_size > cur_chunk_size) {
+            if (ggml_backend_buft_get_buffer_alloc_size(galloc->bufts[i], new_chunk_size) > cur_chunk_size) {
                 realloc = true;
             }
         }
@@ -1063,8 +1064,22 @@ void ggml_gallocr_reserve_n_size(
     GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
     for (int i = 0; i < galloc->n_buffers; i++) {
         sizes[i] = 0;
+        // Repeated buffer types share the physical allocation. Match the
+        // deduplication in ggml_gallocr_get_buffer_size.
+        bool shared = false;
+        for (int j = 0; j < i; j++) {
+            if (galloc->bufts[i] == galloc->bufts[j]) {
+                shared = true;
+                break;
+            }
+        }
+        if (shared) {
+            continue;
+        }
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-            sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
+            const size_t size = ggml_backend_buft_get_buffer_alloc_size(
+                galloc->bufts[i], galloc->buf_tallocs[i]->chunks[c]->max_size);
+            sizes[i] = size > SIZE_MAX - sizes[i] ? SIZE_MAX : sizes[i] + size;
         }
     }
 }
@@ -1342,6 +1357,7 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
 
     size_t alignment = ggml_backend_buft_get_alignment(buft);
     size_t max_size = ggml_backend_buft_get_max_size(buft);
+    GGML_ASSERT(alignment > 0);
 
     ggml_backend_buffer_t * buffers = NULL;
     size_t n_buffers = 0;
@@ -1352,18 +1368,26 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
     for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         size_t this_size = 0;
         if (t->data == NULL && t->view_src == NULL) {
-            this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+            const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+            if (alloc_size > SIZE_MAX - (alignment - 1)) {
+                *nbytes_total = SIZE_MAX;
+                free_buffers(&buffers, &n_buffers);
+                return NULL;
+            }
+            this_size = GGML_PAD(alloc_size, alignment);
         }
 
         // Views need no allocation, but must remain in the range to be initialized,
         // even when the preceding tensor exceeds the backend's preferred buffer size.
-        if (this_size > 0 && cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
+        if (this_size > 0 && cur_buf_size > 0 &&
+                (cur_buf_size > max_size || this_size > max_size - cur_buf_size)) {
             // allocate tensors in the current buffer
             if (!no_alloc && !alloc_tensor_range(ctx, first, t, buft, cur_buf_size, &buffers, &n_buffers)) {
                 return NULL;
             }
             first = t;
-            *nbytes_total += cur_buf_size;
+            const size_t size = ggml_backend_buft_get_buffer_alloc_size(buft, cur_buf_size);
+            *nbytes_total = size > SIZE_MAX - *nbytes_total ? SIZE_MAX : *nbytes_total + size;
             cur_buf_size = this_size;
         } else {
             cur_buf_size += this_size;
@@ -1372,7 +1396,8 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
 
     // allocate remaining tensors
     if (cur_buf_size > 0) {
-        *nbytes_total += cur_buf_size;
+        const size_t size = ggml_backend_buft_get_buffer_alloc_size(buft, cur_buf_size);
+        *nbytes_total = size > SIZE_MAX - *nbytes_total ? SIZE_MAX : *nbytes_total + size;
         if (!no_alloc && !alloc_tensor_range(ctx, first, NULL, buft, cur_buf_size, &buffers, &n_buffers)) {
             return NULL;
         }

@@ -42,6 +42,33 @@ int main() {
     CHECK(base.tensor_guard_bytes == 4096 && base.buffer_alignment == 128 && base.allocation_page_bytes > 0);
     CHECK(future.host_bytes_bound > base.host_bytes_bound && future.shared_bytes == base.shared_bytes);
 
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(device, &props);
+    CHECK(props.memory_unified);
+    auto check_buffer_size = [&](ggml_backend_buffer_type_t type) {
+        if (ggml_backend_buft_get_buffer_alloc_size(type, 0) != 0 ||
+            ggml_backend_buft_get_buffer_alloc_size(type, 128) != 128 + base.tensor_guard_bytes ||
+            ggml_backend_buft_get_buffer_alloc_size(type, SIZE_MAX - 20) != SIZE_MAX) {
+            return false;
+        }
+        auto * buffer = ggml_backend_buft_alloc_buffer(type, 128);
+        const bool ok = buffer && ggml_backend_buffer_get_size(buffer) ==
+            ggml_backend_buft_get_buffer_alloc_size(type, 128);
+        ggml_backend_buffer_free(buffer);
+        if (!ok || ggml_backend_buft_alloc_buffer(type, SIZE_MAX - 20) != nullptr) {
+            return false;
+        }
+        return true;
+    };
+    CHECK(check_buffer_size(ggml_backend_dev_buffer_type(device)));
+    auto extras = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device), "ggml_backend_dev_get_extra_bufts"));
+    if (extras) {
+        for (auto * type = extras(device); type && *type; ++type) {
+            CHECK(check_buffer_size(*type));
+        }
+    }
+
     // The registry has retained its effective options. Mutating the process
     // environment after initialization must not change reported execution mode
     // or underprice persistent queues (especially PROFILE=3 trace storage).
