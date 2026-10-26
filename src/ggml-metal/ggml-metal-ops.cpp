@@ -2081,6 +2081,19 @@ static bool ggml_metal_mul_mv_glu_decode_ok(const ggml_tensor * mm) {
     return true;
 }
 
+static bool ggml_metal_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b);
+
+static bool ggml_metal_overlaps_operand(const ggml_tensor * a, const ggml_tensor * b) {
+    return b && ggml_metal_tensors_overlap(a, b);
+}
+
+static bool ggml_metal_mul_mv_glu_dst_ok(const ggml_tensor * mm, const ggml_tensor * gate_w, const ggml_tensor * glu) {
+    return !ggml_metal_overlaps_operand(glu, mm->src[0]) &&
+           !ggml_metal_overlaps_operand(glu, mm->src[1]) &&
+           !ggml_metal_overlaps_operand(glu, mm->src[2]) &&
+           !ggml_metal_overlaps_operand(glu, gate_w);
+}
+
 static bool ggml_metal_should_fuse_mul_mat_glu(
         const ggml_tensor * up,
         const ggml_tensor * gate,
@@ -2121,6 +2134,9 @@ static bool ggml_metal_should_fuse_mul_mat_glu(
         return false;
     }
     if (is_id && up->src[2] != gate->src[2]) {
+        return false;
+    }
+    if (!ggml_metal_mul_mv_glu_dst_ok(up, gate->src[0], glu)) {
         return false;
     }
 
@@ -2343,6 +2359,7 @@ static int ggml_metal_op_try_mul_mv_glu(ggml_metal_op_t ctx, int idx) {
                         v1->ne[1] == gate_up->ne[1] && v1->ne[2] == gate_up->ne[2] && v1->ne[3] == gate_up->ne[3] &&
                         v0->view_offs == 0 &&
                         v1->view_offs == (size_t) n_ff * gate_up->nb[0] &&
+                        ggml_metal_mul_mv_glu_dst_ok(gate_up, gate_up->src[0], glu) &&
                         ggml_metal_mul_mv_glu_decode_ok(gate_up)) {
                     const int n_fuse = ctx->n_fuse_span(idx, n_graph_ops);
                     return ggml_metal_op_mul_mv_glu_dispatch(ctx, idx, gate_up, gate_up->src[0], glu, true, n_fuse);

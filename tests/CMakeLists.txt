@@ -640,6 +640,12 @@ target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_tests_properties(${TEST_TARGET} PROPERTIES SKIP_RETURN_CODE 77)
 
+set(TEST_TARGET test-metal-glu-alias)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+set_tests_properties(${TEST_TARGET} PROPERTIES SKIP_RETURN_CODE 77)
+
 set(TEST_TARGET test-affine-cpu-rejection)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
