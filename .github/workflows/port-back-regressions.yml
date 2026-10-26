@@ -44,3 +44,13 @@ jobs:
         run: |
           ctest --test-dir build-metal -R '^test-metal-probe$' --output-on-failure --no-tests=error
           ctest --test-dir build-metal -R '^test-metal-probe-leaks$' --output-on-failure --no-tests=error
+  comparison:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build comparison regression
+        run: |
+          cmake -S . -B build-comparison -DCMAKE_BUILD_TYPE=Release -DGGML_BUILD_EXAMPLES=OFF
+          cmake --build build-comparison --target test-backend-nmse -j4
+      - name: Check masks, nonfinite values and large magnitudes
+        run: ctest --test-dir build-comparison -R '^test-backend-nmse$' --output-on-failure --no-tests=error

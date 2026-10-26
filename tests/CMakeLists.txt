@@ -681,3 +681,6 @@ if (GGML_METAL AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         add_test(NAME test-metal-probe-leaks COMMAND ${GGML_LEAKS_EXECUTABLE} --atExit -- $<TARGET_FILE:test-metal-probe>)
     endif()
 endif()
+
+add_executable(test-backend-nmse test-backend-nmse.cpp)
+add_test(NAME test-backend-nmse COMMAND $<TARGET_FILE:test-backend-nmse>)

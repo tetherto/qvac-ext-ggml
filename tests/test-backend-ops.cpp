@@ -1,3 +1,4 @@
+#include "backend-nmse.h"
 // This file defines tests for various GGML ops and backends.
 // For the forward pass it asserts that the results of multiple backends computing the same GGML ops are consistent.
 // For the backward pass it asserts that the gradients from backpropagation are consistent
@@ -276,22 +277,6 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     }
 
     return tv;
-}
-
-// normalized mean squared error = mse(a, b) / mse(a, 0)
-static double nmse(const float * a, const float * b, size_t n) {
-    double mse_a_b = 0.0;
-    double mse_a_0 = 0.0;
-
-    for (size_t i = 0; i < n; i++) {
-        float a_i = a[i];
-        float b_i = b[i];
-
-        mse_a_b += (a_i - b_i) * (a_i - b_i);
-        mse_a_0 += a_i * a_i;
-    }
-
-    return mse_a_b / mse_a_0;
 }
 
 // difference between 2 sets (Jaccard distance, 0 - no difference, 1 - no overlap)
