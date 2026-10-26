@@ -684,3 +684,9 @@ endif()
 
 add_executable(test-backend-nmse test-backend-nmse.cpp)
 add_test(NAME test-backend-nmse COMMAND $<TARGET_FILE:test-backend-nmse>)
+
+if (GGML_VULKAN)
+    add_executable(test-vulkan-view-alignment test-vulkan-view-alignment.cpp)
+    target_link_libraries(test-vulkan-view-alignment PRIVATE ggml)
+    add_test(NAME test-vulkan-view-alignment COMMAND $<TARGET_FILE:test-vulkan-view-alignment>)
+endif()
