@@ -258,13 +258,6 @@ jobs:
           export Dawn_DIR="$PWD/dawn/lib64/cmake/Dawn"
           GG_BUILD_WEBGPU=1 bash ./ci/run.sh ~/results/ggml /mnt/ggml
 
-      # Reported, not enforced: ci/run.sh leaves test-backend-ops out of the
-      # WebGPU release ctest because the WGSL kernels still fail the fork's
-      # GGML_PREC_F32 and large-activation matmul cases.
-      - name: Report test-backend-ops on WebGPU
-        run: |
-          ./build-ci-release/bin/test-backend-ops -b WebGPU 2>&1 | grep -E "FAIL|tests passed|Backend " | tail -n 80 || true
-
       # The speech addons ship ggml as GGML_BACKEND_DL modules, so the
       # registry loader has to probe the WebGPU module by name.
       - name: Loader probe under GGML_BACKEND_DL
