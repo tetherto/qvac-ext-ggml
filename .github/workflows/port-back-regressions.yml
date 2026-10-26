@@ -22,3 +22,13 @@ jobs:
           cmake --build build-loader --target test-backend-load-all ggml-cpu -j4
       - name: Require CPU backend discovery
         run: ctest --test-dir build-loader -R '^test-backend-load-all$' --output-on-failure --no-tests=error
+  turboquant:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build concurrent initialization regression with ThreadSanitizer
+        run: |
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_BUILD_EXAMPLES=OFF -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread
+          cmake --build build-tsan --target test-turboquant-init -j4
+      - name: Test concurrent first use with norm correction off and on
+        run: ctest --test-dir build-tsan -R '^test-turboquant-init' --output-on-failure --no-tests=error

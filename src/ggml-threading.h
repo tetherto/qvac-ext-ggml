@@ -9,6 +9,8 @@ extern "C" {
 GGML_API void ggml_critical_section_start(void);
 GGML_API void ggml_critical_section_end(void);
 
+GGML_API int ggml_tbq_norm_correction_enabled(void);
+
 #ifdef __cplusplus
 }
 #endif
