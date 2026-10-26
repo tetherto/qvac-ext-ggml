@@ -8848,6 +8848,24 @@ struct test_speech_hotspot_concat_transposed : public test_case {
     }
 };
 
+static void add_single_query_softmax_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        for (int64_t cols : {1024, 4096, 8192}) {
+            cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {cols, 1, 16, 1}, true, false, GGML_TYPE_F32,
+                                                 {1, 1}, 0.125f, 0.0f));
+        }
+        return;
+    }
+    for (int64_t cols : {1024, 1100, 4096}) {
+        for (int64_t heads : {14, 16, 32}) {
+            for (bool mask : {false, true}) {
+                cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {cols, 1, heads, 1}, mask, false, GGML_TYPE_F32,
+                                                     {1, 1}, 0.125f, 0.0f));
+            }
+        }
+    }
+}
+
 static void add_speech_hotspot_tests(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     if (perf) {
         for (int64_t positions : {60000, 96000, 120000, 192000}) {
@@ -12207,6 +12225,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_audio8_matmul_add_tests(test_cases, false);
     add_speech_hotspot_tests(test_cases, false);
+    add_single_query_softmax_tests(test_cases, false);
     add_acestep_tests(test_cases, false);
     add_supertonic_tests(test_cases, false);
     add_large_stride_tests(test_cases);
@@ -15008,6 +15027,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_audio8_matmul_add_tests(test_cases, true);
     add_audio8_codec_f32_perf_tests(test_cases);
     add_speech_hotspot_tests(test_cases, true);
+    add_single_query_softmax_tests(test_cases, true);
     add_acestep_tests(test_cases, true);
     add_supertonic_tests(test_cases, true);
     add_parler_tests(test_cases, true);

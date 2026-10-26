@@ -2500,6 +2500,8 @@ static int ggml_metal_op_try_mul_mv_id_mul(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
+static constexpr int64_t GGML_METAL_SOFT_MAX_GRID_THREADS = 8192;
+
 int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
     if (ctx->use_fusion) {
         const int n_fuse = ggml_metal_op_try_topk_moe(ctx, idx);
@@ -2562,13 +2564,14 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
     auto pipeline = ggml_metal_library_get_pipeline_soft_max(lib, op);
 
     int nth = 32; // SIMD width
+    const int nth_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
 
     if (ne00%4 == 0) {
-        while (nth < ne00/4 && nth*ne01*ne02*ne03 < 256) {
+        while (nth < ne00/4 && nth*ne01*ne02*ne03 < GGML_METAL_SOFT_MAX_GRID_THREADS && nth < nth_max) {
             nth *= 2;
         }
     } else {
-        while (nth < ne00 && nth*ne01*ne02*ne03 < 256) {
+        while (nth < ne00 && nth*ne01*ne02*ne03 < GGML_METAL_SOFT_MAX_GRID_THREADS && nth < nth_max) {
             nth *= 2;
         }
     }
