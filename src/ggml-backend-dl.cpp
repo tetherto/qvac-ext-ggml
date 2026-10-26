@@ -7,9 +7,15 @@ dl_handle * dl_load_library(const fs::path & path) {
     DWORD old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
     SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
 
-    HMODULE handle = LoadLibraryW(path.wstring().c_str());
+    // AddDllDirectory entries apply only with LOAD_LIBRARY_SEARCH_USER_DIRS
+    // (included in DEFAULT_DIRS). Resolve module-relative dependencies too.
+    const auto absolute_path = fs::absolute(path);
+    HMODULE handle = LoadLibraryExW(absolute_path.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    const DWORD error = GetLastError();
 
     SetErrorMode(old_mode);
+    SetLastError(error);
 
     return handle;
 }
