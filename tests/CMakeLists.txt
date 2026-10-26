@@ -663,3 +663,8 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_include_directories(${TEST_TARGET} PRIVATE ../src)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
+set(TEST_TARGET test-turboquant-init)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
