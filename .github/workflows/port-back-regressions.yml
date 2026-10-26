@@ -54,3 +54,24 @@ jobs:
           cmake --build build-comparison --target test-backend-nmse -j4
       - name: Check masks, nonfinite values and large magnitudes
         run: ctest --test-dir build-comparison -R '^test-backend-nmse$' --output-on-failure --no-tests=error
+  webgpu-precision:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install software Vulkan and pinned Dawn
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+          curl -fL -o dawn.tar.gz https://github.com/google/dawn/releases/download/v20260317.182325/Dawn-18eb229ef5f707c1464cc581252e7603c73a3ef0-ubuntu-latest-Release.tar.gz
+          mkdir dawn
+          tar -xf dawn.tar.gz -C dawn --strip-components=1
+      - name: Build WebGPU regression runner
+        run: |
+          cmake -S . -B build-webgpu -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_WEBGPU=ON -DDawn_DIR="$PWD/dawn/lib64/cmake/Dawn" -DGGML_BUILD_EXAMPLES=OFF
+          cmake --build build-webgpu --target test-backend-ops -j4
+      - name: Require WebGPU epilogue execution
+        shell: bash
+        run: |
+          set -o pipefail
+          ./build-webgpu/bin/test-backend-ops test -b WebGPU -p 'm=(100,n=37,k=96|32,n=9,k=128),B=1,mode=[12],prec_f32=1' 2>&1 | tee webgpu-precision.log
+          grep -q '4/4 tests passed' webgpu-precision.log

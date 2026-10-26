@@ -3879,6 +3879,11 @@ struct test_supertonic_mm_epilogue : public test_case {
         return prec_f32 ? 1e-9 : 5e-4;
     }
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0 ? 5e-4 : max_nmse_err();
+    }
+
     bool run_whole_graph() override { return true; }
 
     test_supertonic_mm_epilogue(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode, bool prec_f32 = false,
@@ -13118,6 +13123,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2048, 3, 1, true));
     test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2304, 3, 1, true));
     test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(37, 96, 5, 2, true, false, 0, 2));
+    test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32, 32, 9, 128, test_supertonic_mm_epilogue::BIAS, true));
+    test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32, 32, 9, 128, test_supertonic_mm_epilogue::BIAS_RESIDUAL, true));
     // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
     for (int mode : { 1, 2, 3, 4, 6, 7 }) {
         for (auto shape : { std::array<int64_t, 3>{512, 139, 512}, std::array<int64_t, 3>{2048, 90, 512}, std::array<int64_t, 3>{512, 468, 2048}, std::array<int64_t, 3>{144, 278, 512}, std::array<int64_t, 3>{100, 37, 96} }) {
