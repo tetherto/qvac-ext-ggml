@@ -209,6 +209,11 @@ if (GGML_WEBGPU)
         set_property(TEST ${TEST_TARGET}-no-driver PROPERTY ENVIRONMENT
             "VK_ICD_FILENAMES=/nonexistent/no-vulkan-driver.json;VK_DRIVER_FILES=/nonexistent/no-vulkan-driver.json")
     endif()
+
+    set(TEST_TARGET test-webgpu-mul-mat-prec-f32)
+    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 endif()
 
 # Byte-granular tensor I/O at buffer offsets that are not word aligned, on
