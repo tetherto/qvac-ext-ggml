@@ -112,15 +112,28 @@ verified mechanisms.
   before and has nmse <= 2.6e-7 after. The gemv (N == 1) kernels already summed
   in fp32. `GGML_PREC_F32` keeps q8_0 activations in fp32 too; the q4_0 and q4_K
   paths ignore it, so their `b_absmax=1e5` prec_f32 MUL_MAT cases fail.
-- The fp32 sums cost kernel time at m=4096 n=512 k=14336: q4_1 +9 %, q8_0
-  +9.6 %, q6_K +15 %, q5_1 +17 %, q5_K +17 %, iq4_nl +19 %, q5_0 +26 %, q4_K
-  +28 %, q4_0 +46 % (TranscribePsy encoder, q8_0: +1.5 %). The 32 fp32
-  accumulators and 16 half block sums per work-item lower occupancy in kernels
-  that ran near the fp16 peak. A flat k loop that flushes every 32 products and
-  fp32 products without block sums were both slower. Unroll hints changed nothing
-  except q1_0, whose fully unrolled bit loop runs 8 % faster than the old kernel,
-  and q4_K, which a full unroll made 2.3x slower. At n=8 every type got 13-42 %
-  faster: the block scale is now loaded once per block.
+- A 32-product fp16 block sum can overflow where the old running fp16 sum
+  survived through cancellation: 32 products of -1000 then 32 of +3000 total
+  64000, but the second block alone is 96000. A tile with a non-finite output is
+  therefore recomputed by `accumulate_tile_fp32`, a plain k loop with fp32
+  products and sums (`test-opencl-mul-mat-sum-range` cancel cases).
+- The Adreno compiler punishes any change to the shape of these fast loops, even
+  when it constant-folds away. A per-block overflow check cost q4_0 6.6 %.
+  Wrapping the K loop in a second-pass loop, or calling one inline K-loop
+  function twice with a constant flag, cost 2-56 % depending on the type;
+  q1_0's fully unrolled loop inside a retry loop ran 45x slower. Leaving the
+  fast loop untouched and adding a separate, non-unrolled fallback function
+  kept it within 2.5 %.
+- The fp32 sums cost kernel time at m=4096 n=512 k=14336: q8_0 +9.6 %, q4_1
+  +10 %, q6_K +16 %, q5_K +17 %, q5_1 +18 %, iq4_nl +20 %, q5_0 +26 %, q4_K
+  +27 %, q4_0 +45 % (TranscribePsy encoder, q8_0: +1.5 %). The tile check and
+  fp32 fallback above add at most 2.5 %. The 32 fp32 accumulators and 16 half
+  block sums per work-item lower occupancy in kernels that ran near the fp16
+  peak. A flat k loop that flushes every 32 products and fp32 products without
+  block sums were both slower. Unroll hints changed nothing except q1_0, whose
+  fully unrolled bit loop runs 6 % faster than the old kernel, and q4_K, which a
+  full unroll made 2.3x slower. At n=8 every type got 14-42 % faster: the block
+  scale is now loaded once per block.
 - With `cl_khr_integer_dot_product` (Adreno 830 has it), q6_K with N > 8 runs
   the dp4a GEMM by default on every generation but X1E, except for `output` and
   `token_embd` weights; it sums in integers and did not overflow.

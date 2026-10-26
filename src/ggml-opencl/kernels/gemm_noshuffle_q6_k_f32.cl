@@ -9,6 +9,57 @@
 
 #define K_PER_SCALE_PAIR 32
 
+inline bool tile_finite(float8 c0, float8 c1, float8 c2, float8 c3) {
+    return all(isfinite(c0)) && all(isfinite(c1)) && all(isfinite(c2)) && all(isfinite(c3));
+}
+
+inline float4 dequantize_rows(
+        global const ushort * ptr_ql,
+        global const uchar * ptr_qh,
+        global const ushort * ptr_s,
+        global const half * ptr_d,
+        int m,
+        int kk
+) {
+    ushort4 bits4 = vload4(0, ptr_ql + (kk/4)*m);
+    uchar4  bits2 = vload4(0, ptr_qh + (kk/4)*m);
+    char8 scale_s_8 = as_char8(vload4(0, ptr_s + (kk/K_PER_SCALE_PAIR)*m));
+    char4 scale_s = ((kk/16) % 2) == 0 ? scale_s_8.s0246 : scale_s_8.s1357;
+    float4 scale_d = convert_float4(vload4(0, ptr_d + (kk/256)*m));
+    ushort4 low  = (bits4 >> (ushort) (4 * (kk % 4))) & (ushort) 0xF;
+    ushort4 high = convert_ushort4((bits2 >> (uchar) (2 * (kk % 4))) & (uchar) 0x3);
+    return convert_float4(convert_int4(low | (high << (ushort) 4)) - 32) * convert_float4(scale_s) * scale_d;
+}
+
+inline void accumulate_tile_fp32(
+        read_only image1d_buffer_t src1,
+        global const ushort * ptr_ql,
+        global const uchar * ptr_qh,
+        global const ushort * ptr_s,
+        global const half * ptr_d,
+        int m,
+        int n_4,
+        int k,
+        int gy,
+        float8 * c0,
+        float8 * c1,
+        float8 * c2,
+        float8 * c3
+) {
+    *c0 = 0; *c1 = 0; *c2 = 0; *c3 = 0;
+    for (int kk = 0; kk < k; ++kk) {
+        half8 B;
+        B.s0123 = read_imageh(src1, gy * 2 + kk * n_4);
+        B.s4567 = read_imageh(src1, gy * 2 + kk * n_4 + 1);
+        float8 activations = convert_float8(B);
+        float4 weights = dequantize_rows(ptr_ql, ptr_qh, ptr_s, ptr_d, m, kk);
+        *c0 += activations * weights.s0;
+        *c1 += activations * weights.s1;
+        *c2 += activations * weights.s2;
+        *c3 += activations * weights.s3;
+    }
+}
+
 #ifdef ADRENO_GPU
 REQD_SUBGROUP_SIZE_128
 #endif
@@ -112,6 +163,10 @@ kernel void kernel_gemm_noshuffle_q6_K_f32(
         c1 += convert_float8(b1);
         c2 += convert_float8(b2);
         c3 += convert_float8(b3);
+    }
+
+    if (!tile_finite(c0, c1, c2, c3)) {
+        accumulate_tile_fp32(src1, ptr_ql, ptr_qh, ptr_s, ptr_d, m, n_4, k, gy, &c0, &c1, &c2, &c3);
     }
 
     int idx = (gy<<3)*m + (gx<<2);
