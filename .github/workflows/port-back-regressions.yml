@@ -32,3 +32,15 @@ jobs:
           cmake --build build-tsan --target test-turboquant-init -j4
       - name: Test concurrent first use with norm correction off and on
         run: ctest --test-dir build-tsan -R '^test-turboquant-init' --output-on-failure --no-tests=error
+  metal-probe:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Metal probe regression
+        run: |
+          cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_BUILD_EXAMPLES=OFF
+          cmake --build build-metal --target test-metal-probe -j4
+      - name: Run probe and require leak checking
+        run: |
+          ctest --test-dir build-metal -R '^test-metal-probe$' --output-on-failure --no-tests=error
+          ctest --test-dir build-metal -R '^test-metal-probe-leaks$' --output-on-failure --no-tests=error

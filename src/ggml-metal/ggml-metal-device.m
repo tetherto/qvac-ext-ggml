@@ -763,12 +763,38 @@ static bool ggml_metal_probe_dispatch(struct ggml_metal_device * dev, struct ggm
     }];
     [cmd_buf commit];
     const int64_t timeout_ns = 2 * NSEC_PER_SEC;
-    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeout_ns)) != 0) {
+    const bool completed = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeout_ns)) == 0;
+    dispatch_release(done);
+    if (!completed) {
         GGML_LOG_WARN("%s: probe kernel did not complete within %lld ms\n", __func__, timeout_ns / 1000000);
         return false;
     }
     return cmd_buf.status == MTLCommandBufferStatusCompleted;
 }
+
+#ifdef GGML_METAL_TEST_PROBES
+GGML_BACKEND_API bool ggml_metal_test_probe_dispatch(void) {
+    @autoreleasepool {
+        ggml_metal_device_t dev = ggml_metal_device_init(0);
+        if (dev == NULL) {
+            return false;
+        }
+        const char * source = "#include <metal_stdlib>\nusing namespace metal;\nkernel void probe_empty() {}";
+        ggml_metal_library_t lib = ggml_metal_library_init_from_source(dev, source, false);
+        bool completed = false;
+        if (lib != NULL) {
+            struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_compile_pipeline(
+                lib, "probe_empty", "probe_empty", nil);
+            if (ppl.pipeline != NULL) {
+                completed = ggml_metal_probe_dispatch(dev, ppl, @[], MTLSizeMake(1, 1, 1));
+            }
+            ggml_metal_library_free(lib);
+        }
+        ggml_metal_device_free(dev);
+        return completed;
+    }
+}
+#endif
 
 static id<MTLBuffer> ggml_metal_probe_buffer(struct ggml_metal_device * dev, const void * data, size_t size) {
     if (data) {
