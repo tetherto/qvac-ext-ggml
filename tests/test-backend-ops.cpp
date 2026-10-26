@@ -2834,7 +2834,7 @@ struct test_argmax_edge : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type != GGML_TYPE_F32) {
+            if (t->type != GGML_TYPE_F32 || strcmp(ggml_get_name(t), "a") != 0) {
                 init_tensor_uniform(t);
                 continue;
             }
