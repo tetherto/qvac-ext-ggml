@@ -13696,6 +13696,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_F32, 96, 63, 544, true, false));
 
+    // A row length that is a multiple of 4 inside a row pitch that is not, as the channel-major
+    // V cache of a short decoder presents its prefix: a backend that picks vec4 loads from
+    // ne[0] alone reads neighbouring rows.
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {1, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, n, 4, {1,1}, {1,1}, {0, 1, 2, 3}, 10));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, n, 8, {2,1}, {1,1}, {0, 1, 2, 3}, 10));
+        }
+    }
+
     // A non-contiguous quantized weight (k_v > k) under GGML_PREC_F32 is dequantized on the
     // GPU first; the dequantized copy must keep the f32 arithmetic the request asks for, and
     // the resulting pipeline must exist on coopmat2 devices, which have no f16 x f32 matmul.
