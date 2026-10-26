@@ -1,0 +1,24 @@
+name: Backend regression tests
+on:
+  pull_request:
+    branches: [speech]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  loader:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        prefix: ["", "portback-"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dynamic backend and discovery test
+        env:
+          LIBRARY_PREFIX: ${{ matrix.prefix }}
+        run: |
+          cmake -S . -B build-loader -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_LIB_OUTPUT_PREFIX="$LIBRARY_PREFIX" -DGGML_BUILD_EXAMPLES=OFF
+          cmake --build build-loader --target test-backend-load-all ggml-cpu -j4
+      - name: Require CPU backend discovery
+        run: ctest --test-dir build-loader -R '^test-backend-load-all$' --output-on-failure --no-tests=error
