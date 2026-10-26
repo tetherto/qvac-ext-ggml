@@ -106,12 +106,34 @@ verified mechanisms.
   sums in fp16, so a dot product past 65504 came back as inf even when every
   operand fits. TranscribePsy's block-0 feed-forward `linear2` reaches 66k on
   some 60 s windows; the inf became NaN in the next layer norm and attention
-  spread it over the window (empty transcript from the second window on,
-  `test-opencl-mul-mat-sum-range` inf for n = 8/63/64/750). The q8_0 kernel now
-  sums each 32-wide block in fp16 and the block sums in fp32 (+9.6 % kernel time
-  at m=4096 n=512 k=14336, +1.5 % TranscribePsy encoder); the q4_0, q4_1, q5_0,
-  q5_1, q1_0, q4_K, q5_K, q6_K and iq4_nl kernels still sum in fp16. The gemv
-  (N == 1) kernels sum in fp32. `GGML_PREC_F32` keeps q8_0 activations in fp32 too.
+  spread it over the window (empty transcript from the second window on). All
+  ten kernels now sum 32 products at a time in fp16 and add those sums into fp32
+  accumulators; `test-opencl-mul-mat-sum-range` returned inf for every n > 1
+  before and has nmse <= 2.6e-7 after. The gemv (N == 1) kernels already summed
+  in fp32. `GGML_PREC_F32` keeps q8_0 activations in fp32 too; the q4_0 and q4_K
+  paths ignore it, so their `b_absmax=1e5` prec_f32 MUL_MAT cases fail.
+- The fp32 sums cost kernel time at m=4096 n=512 k=14336: q4_1 +9 %, q8_0
+  +9.6 %, q6_K +15 %, q5_1 +17 %, q5_K +17 %, iq4_nl +19 %, q5_0 +26 %, q4_K
+  +28 %, q4_0 +46 % (TranscribePsy encoder, q8_0: +1.5 %). The 32 fp32
+  accumulators and 16 half block sums per work-item lower occupancy in kernels
+  that ran near the fp16 peak. A flat k loop that flushes every 32 products and
+  fp32 products without block sums were both slower. Unroll hints changed nothing
+  except q1_0, whose fully unrolled bit loop runs 8 % faster than the old kernel,
+  and q4_K, which a full unroll made 2.3x slower. At n=8 every type got 13-42 %
+  faster: the block scale is now loaded once per block.
+- With `cl_khr_integer_dot_product` (Adreno 830 has it), q6_K with N > 8 runs
+  the dp4a GEMM by default on every generation but X1E, except for `output` and
+  `token_embd` weights; it sums in integers and did not overflow.
+  `GGML_OPENCL_Q6K_DENSE_DP4A=0` selects the fp16 kernel.
+- `test-backend-ops -o MUL_MAT` reaches these GEMMs only for q4_0 and q4_K; the
+  cases of the other types use m = 16, below the 384 rows `use_adreno_kernels`
+  requires. `test-opencl-mul-mat-sum-range` covers every type.
+- Timing traps on the S25: one `test-backend-ops perf` run with about ten
+  n=512 GEMMs in a row drops the GPU to 525 MHz (`thermal_pwrlevel` 9 under
+  `/sys/class/kgsl/kgsl-3d0`) while `dumpsys thermalservice` still reports
+  status 0, and the GPU hot spot reaches 88-103 C within a single case. Time one
+  weight type per run, start each run below 37 C (`kgsl-3d0/temp`) with
+  `thermal_pwrlevel` 0, and drop runs during which it rose.
 
 ## ggml-vulkan on AMD Strix Halo (Radeon 8060S, RADV GFX1151, Mesa 25.2.8)
 
