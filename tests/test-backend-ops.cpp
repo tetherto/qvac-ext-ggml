@@ -13664,6 +13664,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // k that no tile alignment divides, to reach the unaligned matmul variants
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q4_0, 32, 9, 128));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 32, 9, 128));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, false));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
 
