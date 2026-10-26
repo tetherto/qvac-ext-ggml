@@ -5,6 +5,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   loader:
     runs-on: ubuntu-24.04
@@ -33,7 +36,8 @@ jobs:
       - name: Test concurrent first use with norm correction off and on
         run: ctest --test-dir build-tsan -R '^test-turboquant-init' --output-on-failure --no-tests=error
   metal-probe:
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Build Metal probe regression
