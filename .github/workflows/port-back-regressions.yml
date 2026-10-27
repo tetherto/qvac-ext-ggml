@@ -42,12 +42,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build Metal probe regression
         run: |
-          cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_BUILD_EXAMPLES=OFF
+          cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_BACKEND_DL=OFF -DGGML_BUILD_EXAMPLES=OFF
           cmake --build build-metal --target test-metal-probe -j4
       - name: Run probe and require leak checking
         run: |
           ctest --test-dir build-metal -R '^test-metal-probe$' --output-on-failure --no-tests=error
           ctest --test-dir build-metal -R '^test-metal-probe-leaks$' --output-on-failure --no-tests=error
+      - name: Build and load dynamically linked backends
+        run: |
+          cmake -S . -B build-metal-dl -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_BACKEND_DL=ON -DGGML_BUILD_TESTS=ON -DGGML_BUILD_EXAMPLES=OFF
+          cmake --build build-metal-dl --target ggml-metal ggml-cpu test-backend-load-all -j4
+          ctest --test-dir build-metal-dl -R '^test-backend-load-all$' --output-on-failure --no-tests=error
   comparison:
     runs-on: ubuntu-24.04
     steps:

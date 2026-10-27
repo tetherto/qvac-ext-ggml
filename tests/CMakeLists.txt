@@ -672,7 +672,7 @@ add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 add_test(NAME test-turboquant-init-correction COMMAND $<TARGET_FILE:test-turboquant-init>)
 set_tests_properties(test-turboquant-init-correction PROPERTIES ENVIRONMENT "GGML_TQ_NORM_CORRECTION=1")
 
-if (GGML_METAL AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+if (GGML_METAL AND NOT GGML_BACKEND_DL AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     add_executable(test-metal-probe test-metal-probe.cpp)
     target_link_libraries(test-metal-probe PRIVATE ggml-metal ggml)
     add_test(NAME test-metal-probe COMMAND $<TARGET_FILE:test-metal-probe>)
