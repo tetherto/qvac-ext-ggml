@@ -129,6 +129,13 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    if (GGML_CUDA_MODULE_SUFFIX)
+        if (NOT GGML_BACKEND_DL)
+            message(FATAL_ERROR "GGML_CUDA_MODULE_SUFFIX requires GGML_BACKEND_DL")
+        endif()
+        set_target_properties(ggml-cuda PROPERTIES OUTPUT_NAME "qvac-diffusion-ggml-cuda${GGML_CUDA_MODULE_SUFFIX}")
+    endif()
+
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)

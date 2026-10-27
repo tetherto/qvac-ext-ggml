@@ -3,13 +3,24 @@
 #ifdef _WIN32
 
 dl_handle * dl_load_library(const fs::path & path) {
+    std::error_code ec;
+    const auto absolute_path = path.is_absolute() ? path : fs::absolute(path, ec);
+    if (ec) {
+        return nullptr;
+    }
+
     // suppress error dialogs for missing DLLs
     DWORD old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
     SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
 
-    HMODULE handle = LoadLibraryW(path.wstring().c_str());
+    // AddDllDirectory entries apply only with LOAD_LIBRARY_SEARCH_USER_DIRS
+    // (included in DEFAULT_DIRS). Resolve module-relative dependencies too.
+    HMODULE handle = LoadLibraryExW(absolute_path.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    const DWORD error = GetLastError();
 
     SetErrorMode(old_mode);
+    SetLastError(error);
 
     return handle;
 }
