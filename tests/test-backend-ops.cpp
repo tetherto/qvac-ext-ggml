@@ -1,3 +1,4 @@
+#include "backend-nmse.h"
 // This file defines tests for various GGML ops and backends.
 // For the forward pass it asserts that the results of multiple backends computing the same GGML ops are consistent.
 // For the backward pass it asserts that the gradients from backpropagation are consistent
@@ -276,22 +277,6 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     }
 
     return tv;
-}
-
-// normalized mean squared error = mse(a, b) / mse(a, 0)
-static double nmse(const float * a, const float * b, size_t n) {
-    double mse_a_b = 0.0;
-    double mse_a_0 = 0.0;
-
-    for (size_t i = 0; i < n; i++) {
-        float a_i = a[i];
-        float b_i = b[i];
-
-        mse_a_b += (a_i - b_i) * (a_i - b_i);
-        mse_a_0 += a_i * a_i;
-    }
-
-    return mse_a_b / mse_a_0;
 }
 
 // difference between 2 sets (Jaccard distance, 0 - no difference, 1 - no overlap)
@@ -3894,6 +3879,11 @@ struct test_supertonic_mm_epilogue : public test_case {
         return prec_f32 ? 1e-9 : 5e-4;
     }
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0 ? 5e-4 : max_nmse_err();
+    }
+
     bool run_whole_graph() override { return true; }
 
     test_supertonic_mm_epilogue(ggml_type type_a, int64_t m, int64_t n, int64_t k, int mode, bool prec_f32 = false,
@@ -4816,17 +4806,27 @@ struct test_gru : public test_case {
 struct test_zero_upsample : public test_case {
     const std::array<int64_t, 4> ne;
     const int s;
+    const bool offset;
 
     std::string vars() override {
-        return VARS_TO_STR2(ne, s);
+        return VARS_TO_STR3(ne, s, offset);
     }
 
-    test_zero_upsample(std::array<int64_t, 4> ne = {10, 7, 3, 2}, int s = 2)
-        : ne(ne), s(s) {}
+    test_zero_upsample(std::array<int64_t, 4> ne = {10, 7, 3, 2}, int s = 2, bool offset = false)
+        : ne(ne), s(s), offset(offset) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * a = offset ? offset_view(ctx) : ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
         return ggml_zero_upsample(ctx, a, s);
+    }
+
+    ggml_tensor * offset_view(ggml_context * ctx) {
+        const int64_t elements = ne[0] * ne[1] * ne[2] * ne[3];
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 1);
+        ggml_set_name(storage, "zero-upsample-offset-storage");
+        return ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3],
+            ne[0] * sizeof(float), ne[0] * ne[1] * sizeof(float),
+            ne[0] * ne[1] * ne[2] * sizeof(float), sizeof(float));
     }
 };
 
@@ -12923,6 +12923,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {1, 0, 2, 3}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {128, 27, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {1, 0, 2, 3}, true));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {17, 5, 3, 2}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {1, 0, 2, 3}, true));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {17, 5, 3, 2}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {1, 0, 2, 3}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {1, 0, 2, 3}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {1, 0, 2, 3}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {1, 0, 2, 3}, true));
@@ -13140,6 +13142,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2048, 3, 1, true));
     test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(139, 2304, 3, 1, true));
     test_cases.emplace_back(new test_supertonic_depthwise_layer_norm(37, 96, 5, 2, true, false, 0, 2));
+    test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32, 32, 9, 128, test_supertonic_mm_epilogue::BIAS, true));
+    test_cases.emplace_back(new test_supertonic_mm_epilogue(GGML_TYPE_F32, 32, 9, 128, test_supertonic_mm_epilogue::BIAS_RESIDUAL, true));
     // Metal fuses these epilogues into its mat-mat kernels; the ragged shapes cover the tile bounds.
     for (int mode : { 1, 2, 3, 4, 6, 7 }) {
         for (auto shape : { std::array<int64_t, 3>{512, 139, 512}, std::array<int64_t, 3>{2048, 90, 512}, std::array<int64_t, 3>{512, 468, 2048}, std::array<int64_t, 3>{144, 278, 512}, std::array<int64_t, 3>{100, 37, 96} }) {
@@ -13271,6 +13275,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 1));
     test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2));
     test_cases.emplace_back(new test_zero_upsample({33, 5, 2, 2}, 5));
+    test_cases.emplace_back(new test_zero_upsample({10, 7, 3, 2}, 2, true));
 
     for (int groups : {1, 2, 3, 4}) {
         test_cases.emplace_back(new test_channel_shuffle({8, 4, 12, 2}, groups));
@@ -13681,6 +13686,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // k that no tile alignment divides, to reach the unaligned matmul variants
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q4_0, 32, 9, 128));
+    test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 32, 9, 128));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, false));
     test_cases.emplace_back(new test_mul_mat_prec_f32(GGML_TYPE_Q8_0, 96, 63, 544, true));
 

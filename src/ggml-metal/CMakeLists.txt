@@ -126,3 +126,7 @@ if (NOT GGML_METAL_EMBED_LIBRARY)
             DESTINATION ${CMAKE_INSTALL_BINDIR}
         )
 endif()
+
+if (GGML_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_compile_definitions(ggml-metal PRIVATE GGML_METAL_TEST_PROBES)
+endif()

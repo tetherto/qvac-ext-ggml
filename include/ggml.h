@@ -230,14 +230,8 @@
 // which would truncate/mismatch on load, so this fork bumps the default to 128
 // (matching upstream acestep.cpp).
 //
-// ABI WARNING: name[] is an inline array in struct ggml_tensor, so changing this
-// alters the tensor's size and field offsets. Linking objects built with 64
-// against a lib built with 128 is an ODR/ABI mismatch (silent memory
-// corruption). This is safe here ONLY because the whole QVAC speech stack
-// consumes ggml exclusively through the ggml-speech vcpkg port and is rebuilt
-// from THIS header in the same build (audiogen-cpp, tts-cpp, parakeet-cpp, …) —
-// there are no prebuilt 64-byte-layout artifacts in the link graph. Any change
-// to this value is a HARD rebuild-everything requirement for all downstreams.
+// Changing the inline name array changes the tensor ABI. Rebuild every consumer
+// from the same header; mixing capacities can corrupt memory.
 #   define GGML_MAX_NAME        128
 #endif
 

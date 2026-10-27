@@ -22631,6 +22631,19 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+static bool ggml_vk_view_offset_aligned(const vk_device & device, const ggml_tensor * tensor) {
+    return tensor->view_offs % device->properties.limits.minStorageBufferOffsetAlignment == 0;
+}
+
+static bool ggml_vk_op_views_aligned(const vk_device & device, const ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] && !ggml_vk_view_offset_aligned(device, op->src[i])) {
+            return false;
+        }
+    }
+    return ggml_vk_view_offset_aligned(device, op);
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -23341,7 +23354,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D_DW:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)
+            return ggml_vk_op_views_aligned(device, op) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)
                 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_1D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
@@ -23420,21 +23433,21 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_GRU:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] <= 128;   // hidden size H <= GRU_MAX_H (shared-mem cap)
         case GGML_OP_ZERO_UPSAMPLE:
-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]);
         case GGML_OP_CHANNEL_SHUFFLE:
-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]);
         case GGML_OP_AFFINE_PRELU:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
-            return op->src[0]->ne[3] == 1 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    (!op->src[2] || op->src[2]->type == GGML_TYPE_F32) &&
@@ -23445,28 +23458,28 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     ggml_get_op_params_i32(op, 0) == 5 ||
                     ggml_get_op_params_i32(op, 0) == 7);
         case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
-            return op->src[0]->ne[3] == 1 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
                    op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                    ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
-            return op->src[0]->ne[3] == 1 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
                    op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) &&
                    ggml_is_contiguous(op->src[3]) && ggml_is_contiguous(op);
         case GGML_OP_SUPERTONIC_BIAS_GELU:
-            return op->src[0]->ne[3] == 1 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->ne[3] == 1 &&
                    op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
-            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_SNAKE:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+            return ggml_vk_op_views_aligned(device, op) && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_LSTM_CELL:
