@@ -31,7 +31,7 @@ if (CUDAToolkit_FOUND)
                 list(APPEND CMAKE_CUDA_ARCHITECTURES 50-virtual 61-virtual 70-virtual)
             endif ()
 
-            list(APPEND CMAKE_CUDA_ARCHITECTURES 75-virtual 80-virtual 86-real)
+            list(APPEND CMAKE_CUDA_ARCHITECTURES 75-virtual 80-virtual 80-real 86-real)
 
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
                 list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real 90-virtual)
