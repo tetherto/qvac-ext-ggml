@@ -4802,6 +4802,14 @@ struct test_gru : public test_case {
     }
 };
 
+struct test_gru_htp_f32 : public test_gru {
+    using test_gru::test_gru;
+
+    std::string vars() override {
+        return "suite=hexagon_gru_f32," + test_gru::vars();
+    }
+};
+
 // GGML_OP_ZERO_UPSAMPLE
 struct test_zero_upsample : public test_case {
     const std::array<int64_t, 4> ne;
@@ -13251,6 +13259,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gru(64, 1, 17, true));
     test_cases.emplace_back(new test_gru(128, 2, 33, false));    // H at the GPU shared-mem cap
     test_cases.emplace_back(new test_gru(96, 2, 9, true));       // H not a multiple of the warp size
+    // Focused F32 Hexagon coverage: tiny/odd/full-width hidden states, batch
+    // independence, sequence boundaries, reverse storage and saturated gates.
+    for (const auto & shape : std::vector<std::array<int64_t, 3>>{
+             {1, 3, 1}, {2, 17, 63}, {3, 5, 7}, {7, 3, 11}, {16, 7, 17}, {31, 2, 9},
+             {32, 1, 33}, {63, 5, 2}, {64, 3, 63}, {127, 2, 7}, {128, 1, 17}}) {
+        for (bool reverse : {false, true}) {
+            test_cases.emplace_back(new test_gru_htp_f32(shape[0], shape[1], shape[2], reverse,
+                shape[0] == 64 && reverse ? 150.0f : 1.0f));
+        }
+    }
     test_cases.emplace_back(new test_gru(96, 2, 33, true));      // long L with H > typical warp size
     test_cases.emplace_back(new test_gru(4, 1953, 33, true));    // LavaSR denoiser DPGRNN shape (tiny H, huge B)
     test_cases.emplace_back(new test_gru(2, 31, 63, false));     // LavaSR cTFA shape

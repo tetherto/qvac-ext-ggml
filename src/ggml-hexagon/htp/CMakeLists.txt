@@ -52,6 +52,7 @@ add_library(${HTP_LIB} SHARED
     flash-attn-f32-ops.c
     transpose-ops.c
     depthwise-conv-1d-ops.c
+    gru-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE

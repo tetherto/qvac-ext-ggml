@@ -816,6 +816,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_CONV_TAPS_F32:
             return op_conv_taps_f32(octx);
 
+        case HTP_OP_GRU:
+            return op_gru(octx);
+
         case HTP_OP_CONCAT:
             return op_concat(octx);
 
