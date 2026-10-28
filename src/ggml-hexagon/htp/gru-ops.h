@@ -10,6 +10,24 @@
 // Shared with HTP_TYPE_F32 / GGML_TYPE_F32; asserted at both integration sites.
 #define HTP_GRU_TYPE_F32 0u
 
+// Pack independent small-hidden sequences into one HVX vector. Keeping H
+// adjacent lanes per sequence also keeps the final [H,B] output contiguous.
+static inline uint32_t htp_gru_packed_batches(uint32_t h, uint32_t b) {
+    const uint32_t batches = h == 4 || h == 8 ? HTP_GRU_LANES / h : 1;
+    return b >= batches ? batches : 1;
+}
+
+static inline uint8_t htp_gru_packed_repl_control(uint32_t h, uint32_t byte) {
+    const uint32_t word = (byte / sizeof(float)) % h;
+    // vdelta's descending butterfly replicates the first word within each
+    // H-word subgroup; all control bits crossing a subgroup remain clear.
+    return (uint8_t)((word & (0u - word)) * sizeof(float));
+}
+
+static inline uint32_t htp_gru_packed_input_word(uint32_t h, uint32_t gate, uint32_t lane) {
+    return (lane / h) * (3 * h) + gate * h + lane % h;
+}
+
 // Portable validation shared by host support checks, DSP execution and tests.
 struct htp_gru_tensor {
     uint64_t ne[4], nb[4], size, address;
@@ -63,7 +81,11 @@ static inline bool htp_gru_validate(const struct htp_gru_tensor * w, const struc
     const uint64_t padded = (h + HTP_GRU_LANES - 1) / HTP_GRU_LANES * HTP_GRU_LANES;
     const uint64_t threads = b < max_threads ? b : max_threads;
     const uint64_t weights = 3 * h * padded * sizeof(float), biases = 3 * padded * sizeof(float);
-    const uint64_t worker = 7 * padded * sizeof(float), total = weights + biases + threads * worker;
+    // Packed workers retain the old state/gate/input vectors plus a separate
+    // three-vector AoS staging area, so gathers cannot overwrite their source.
+    const uint64_t packed = htp_gru_packed_batches((uint32_t)h, (uint32_t)b);
+    const uint64_t worker = (7 * padded + (packed > 1 ? 3 * HTP_GRU_LANES : 0)) * sizeof(float);
+    const uint64_t total = weights + biases + threads * worker;
     if (total > vtcm_bytes || total > UINT32_MAX)
         return false;
     const struct htp_gru_layout layout = {(uint32_t)h,      (uint32_t)b,       (uint32_t)l,

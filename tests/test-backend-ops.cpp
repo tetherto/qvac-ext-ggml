@@ -4810,6 +4810,14 @@ struct test_gru_htp_f32 : public test_gru {
     }
 };
 
+struct test_gru_htp_packed_f32 : public test_gru {
+    using test_gru::test_gru;
+
+    std::string vars() override {
+        return "suite=hexagon_gru_packed_f32," + test_gru::vars();
+    }
+};
+
 // GGML_OP_ZERO_UPSAMPLE
 struct test_zero_upsample : public test_case {
     const std::array<int64_t, 4> ne;
@@ -13267,6 +13275,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool reverse : {false, true}) {
             test_cases.emplace_back(new test_gru_htp_f32(shape[0], shape[1], shape[2], reverse,
                 shape[0] == 64 && reverse ? 150.0f : 1.0f));
+        }
+    }
+    // Small-hidden packed HTP workers: complete and partial tiles, fallback
+    // below one tile, reverse storage and the denoiser's actual B/L shapes.
+    for (int64_t h : {4, 8}) {
+        for (const auto & shape : std::vector<std::array<int64_t, 2>>{
+                 {1, 9}, {3, 17}, {4, 17}, {5, 33}, {7, 63}, {8, 9}, {9, 17}, {11, 33},
+                 {17, 33}, {31, 63}, {32, 9}, {33, 17}, {231, 63}, {441, 33}}) {
+            for (bool reverse : {false, true}) {
+                test_cases.emplace_back(new test_gru_htp_packed_f32(h, shape[0], shape[1], reverse));
+            }
+        }
+    }
+    for (int64_t l : {9, 17}) {
+        for (bool reverse : {false, true}) {
+            test_cases.emplace_back(new test_gru_htp_packed_f32(4, 441, l, reverse));
         }
     }
     test_cases.emplace_back(new test_gru(96, 2, 33, true));      // long L with H > typical warp size
