@@ -8443,6 +8443,65 @@ struct test_conv_2d_dw : public test_case {
     }
 };
 
+// Asymmetric F32 depthwise geometries used by LavaSR. Keep the ordinary CPU
+// reference and grading; the tag selects this bounded suite on real HTP.
+struct test_dw_stride2_htp_f32 : public test_case {
+    const std::array<int64_t, 4> ne_input;
+    const std::array<int64_t, 4> ne_kernel;
+    const std::array<int, 6> params;
+    const bool cwhn;
+    const bool offset;
+    const int pattern; // 0=random, 1=silence, 2=zero weights
+
+    test_dw_stride2_htp_f32(std::array<int64_t, 4> ne, int kw, int kh,
+                           std::array<int, 6> p, bool cwhn = false, bool offset = false, int pattern = 0)
+        : ne_input(ne), ne_kernel({kw, kh, 1, ne[2]}), params(p),
+          cwhn(cwhn), offset(offset), pattern(pattern) {}
+
+    std::string vars() override {
+        return "suite=hexagon_dw_stride2_f32," + VARS_TO_STR6(ne_input, ne_kernel, params, cwhn, offset, pattern);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input;
+        if (offset) {
+            const int64_t elements = ne_input[0] * ne_input[1] * ne_input[2] * ne_input[3];
+            ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 8);
+            ggml_set_name(storage, "input_storage");
+            input = ggml_view_4d(ctx, storage, ne_input[0], ne_input[1], ne_input[2], ne_input[3],
+                ne_input[0] * sizeof(float), ne_input[0] * ne_input[1] * sizeof(float),
+                ne_input[0] * ne_input[1] * ne_input[2] * sizeof(float), sizeof(float));
+        } else {
+            input = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_input.data());
+        }
+        ggml_set_name(input, "input");
+        ggml_tensor * kernel = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_kernel.data());
+        ggml_set_name(kernel, "kernel");
+        if (cwhn) {
+            input = ggml_cont(ctx, ggml_permute(ctx, input, 1, 2, 0, 3));
+            input = ggml_permute(ctx, input, 2, 0, 1, 3);
+            kernel = ggml_cont(ctx, ggml_permute(ctx, kernel, 2, 3, 1, 0));
+            kernel = ggml_permute(ctx, kernel, 3, 2, 0, 1);
+        }
+        ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input,
+            params[0], params[1], params[2], params[3], params[4], params[5]);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (pattern == 0) return;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if ((pattern == 1 && (name == "input" || name == "input_storage")) ||
+                (pattern == 2 && name == "kernel")) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            }
+        }
+    }
+};
+
 // FastConformer regression shapes. A distinct parameter tag makes it possible
 // to require this bounded suite on an accelerator without running the large
 // image-model cases. These graphs are compared with the CPU backend by the
@@ -13302,6 +13361,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gru(3, 100, 7, false));         // ragged lanes (128 % 3 = 2 idle) + tail
     test_cases.emplace_back(new test_gru(48, 5, 9, true));           // PB=2, slot spans the wave64 boundary
     test_cases.emplace_back(new test_gru(2, 300, 11, true));         // small-H variant, multi-WG + tail
+
+    // Planar KW3/SX2 F32 path: actual LavaSR output widths 33/65, full and
+    // partial vector tails, vertical skipped rows, batch/channel independence,
+    // generalized KH/SY, and explicit unchanged fallback geometries.
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 63, 24, 7}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 63, 12, 7}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({33, 9, 3, 2}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({64, 5, 1, 1}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({127, 5, 2, 3}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({1, 1, 1, 2}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({2, 2, 3, 1}, 3, 2, {2, 1, 2, 2, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 5, 3, 2}, 3, 1, {2, 1, 1, 0, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 7, 3, 2}, 3, 3, {2, 2, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 7, 4, 3}, 3, 4, {2, 3, 1, 2, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 7, 3, 2}, 3, 2, {2, 1, 1, 2, 1, 2}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 5, 2, 1}, 3, 2, {2, 1, 2, 1, 2, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 5, 3, 2}, 3, 2, {1, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 7, 3, 2}, 5, 2, {2, 1, 2, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 7, 8, 2}, 3, 2, {2, 1, 1, 1, 1, 1}, true));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 7, 3, 2}, 3, 2, {2, 1, 1, 1, 1, 1}, false, true));
+    for (int pattern : {1, 2}) {
+        test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 63, 24, 7}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
+        test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 63, 12, 7}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
+        test_cases.emplace_back(new test_dw_stride2_htp_f32({1, 1, 1, 2}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
+    }
 
     // conv_2d_dw whcn_v4 (wide 1-D rows) + its selection boundaries
     test_cases.emplace_back(new test_conv_2d_dw({1031, 1, 512, 1}, {7, 1, 1, 512}, GGML_TYPE_F32, 1, 0, 1, false)); // enhancer-class row
