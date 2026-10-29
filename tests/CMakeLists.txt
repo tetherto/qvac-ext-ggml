@@ -645,6 +645,11 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_include_directories(${TEST_TARGET} PRIVATE ../src/ggml-hexagon/htp)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+set(TEST_TARGET test-hexagon-dw-stride1-guards)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ../src/ggml-hexagon/htp)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 set(TEST_TARGET test-audio8-codec-f32)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)

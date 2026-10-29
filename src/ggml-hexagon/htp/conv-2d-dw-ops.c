@@ -18,6 +18,7 @@ struct htp_conv_dw_context {
     bool channels_contiguous;
     bool planar_stride2_3x3;
     bool planar_stride2_kw3;
+    bool planar_stride1_kw35;
 };
 
 // All addresses use the original tensor strides, including the permuted
@@ -268,6 +269,52 @@ static void conv_dw_planar_stride2_kw3_row(const struct htp_ops_context *octx, u
     }
 }
 
+// Width-contiguous F32: a narrow row used to rebuild32 scalar samples for
+// each padded tap, then compute the final output positions one at a time.
+// Reuse a bounded two-vector window across all three/five horizontal taps.
+static void conv_dw_planar_stride1_kw35_row(const struct htp_ops_context *octx, uint32_t oy, uint32_t c, uint32_t n) {
+    const struct htp_tensor *k = octx->src[0];
+    const struct htp_tensor *x = octx->src[1];
+    const struct htp_tensor *y = octx->dst;
+    const int32_t *p = octx->op_params;
+    float tile[2 * VLEN_FP32] __attribute__((aligned(128)));
+
+    for (uint32_t ox = 0; ox < y->ne[0]; ox += VLEN_FP32) {
+        const uint32_t lanes = MIN(VLEN_FP32, y->ne[0] - ox);
+        const int64_t ix = (int64_t)ox - p[2];
+        HVX_Vector sum = Q6_V_vzero();
+        for (uint32_t ky = 0; ky < k->ne[1]; ++ky) {
+            const int64_t iy = (int64_t)oy * p[1] - p[3] + ky;
+            if (iy < 0 || iy >= x->ne[1]) {
+                continue;
+            }
+            HVX_Vector lo, hi;
+            if (ix >= 0 && ix + 2 * VLEN_FP32 <= x->ne[0]) {
+                const float *row = conv_dw_input(x, ix, iy, c, n);
+                lo = *(const HVX_UVector *)row;
+                hi = *(const HVX_UVector *)(row + VLEN_FP32);
+            } else {
+                ((HVX_Vector *)tile)[0] = Q6_V_vzero();
+                ((HVX_Vector *)tile)[1] = Q6_V_vzero();
+                uint32_t source, target, count;
+                htp_conv_dw_stride1_window(x->ne[0], ix, lanes + k->ne[0] - 1, &source, &target, &count);
+                if (count) {
+                    memcpy(tile + target, conv_dw_input(x, source, iy, c, n), count * sizeof(float));
+                }
+                lo = ((const HVX_Vector *)tile)[0];
+                hi = ((const HVX_Vector *)tile)[1];
+            }
+            for (uint32_t kx = 0; kx < k->ne[0]; ++kx) {
+                const HVX_Vector values = Q6_V_valign_VVR(hi, lo, kx * sizeof(float));
+                const HVX_Vector weight = hvx_vec_splat_f32(conv_dw_weight(k, kx, ky, c));
+                // IEEE F32 between taps also keeps zero/padded windows safe.
+                sum = hvx_vec_add_f32_f32(sum, hvx_vec_mul_f32_f32(values, weight));
+            }
+        }
+        hvx_vec_store_u(conv_dw_output(y, ox, oy, c, n), lanes * sizeof(float), sum);
+    }
+}
+
 static void conv_dw_thread(unsigned int nth, unsigned int ith, void *data) {
     struct htp_conv_dw_context *dc = (struct htp_conv_dw_context *)data;
     struct htp_ops_context *octx = dc->octx;
@@ -286,6 +333,8 @@ static void conv_dw_thread(unsigned int nth, unsigned int ith, void *data) {
             conv_dw_planar_stride2_3x3_row(octx, row % oh, (row / oh) % channels, row / (oh * channels));
         } else if (dc->planar_stride2_kw3) {
             conv_dw_planar_stride2_kw3_row(octx, row % oh, (row / oh) % channels, row / (oh * channels));
+        } else if (dc->planar_stride1_kw35) {
+            conv_dw_planar_stride1_kw35_row(octx, row % oh, (row / oh) % channels, row / (oh * channels));
         } else {
             conv_dw_planar_row(octx, row % oh, (row / oh) % channels, row / (oh * channels));
         }
@@ -313,12 +362,14 @@ int op_conv_2d_dw(struct htp_ops_context *octx) {
     const bool planar_stride2_kw3 = k->type == HTP_TYPE_F32 && !planar_stride2_3x3 &&
         htp_conv_dw_planar_stride2_kw3_eligible(
             channels_contiguous, x->nb[0], y->nb[0], k->ne[0], k->ne[1], p[0], p[1], p[4], p[5], true);
+    const bool planar_stride1_kw35 = htp_conv_dw_planar_stride1_kw35_eligible(
+        channels_contiguous, x->nb[0], y->nb[0], k->ne[0], k->ne[1], p[0], p[1], p[4], p[5], k->type == HTP_TYPE_F32);
     const uint32_t rows = y->ne[1] * y->ne[3] * (channels_contiguous ? y->ne[0] : y->ne[2]);
     const uint32_t threads = MIN(octx->n_threads, rows);
     if ((octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) || threads == 0) {
         return HTP_STATUS_OK;
     }
-    struct htp_conv_dw_context dc = {octx, rows, (rows + threads - 1) / threads, channels_contiguous, planar_stride2_3x3, planar_stride2_kw3};
+    struct htp_conv_dw_context dc = {octx, rows, (rows + threads - 1) / threads, channels_contiguous, planar_stride2_3x3, planar_stride2_kw3, planar_stride1_kw35};
     work_queue_run(octx->ctx->work_queue, conv_dw_thread, &dc, threads);
     return HTP_STATUS_OK;
 }

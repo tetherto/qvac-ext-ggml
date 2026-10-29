@@ -8613,6 +8613,42 @@ struct test_dw_stride2_htp_f32 : public test_case {
     }
 };
 
+struct test_dw_stride1_htp_f32 : public test_dw_stride2_htp_f32 {
+    const int case_id;
+
+    test_dw_stride1_htp_f32(int id, std::array<int64_t, 4> ne, int kw, int kh,
+                          std::array<int, 6> p, bool offset = false, int pattern = 0)
+        : test_dw_stride2_htp_f32(ne, kw, kh, p, false, offset, pattern), case_id(id) {}
+
+    std::string vars() override {
+        return "suite=hexagon_dw_stride1_f32," + VAR_TO_STR(case_id) + "," +
+               VARS_TO_STR6(ne_input, ne_kernel, params, cwhn, offset, pattern);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_dw_stride2_htp_f32::build_graph(ctx);
+        ggml_format_name(out, "hexagon_dw_stride1_%d", case_id);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dw_stride2_htp_f32::initialize_tensors(ctx);
+        if (pattern < 3) return;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            const bool input = name.find("input") != std::string::npos;
+            const bool kernel = name == "kernel";
+            if ((!input && !kernel) || (pattern == 4 && !input)) continue;
+            std::vector<float> values(ggml_nelements(t));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = pattern == 4 ? (i % 2 ? -0.0f : 0.0f) :
+                    kernel ? (int(i % 7) - 3) * 0.0625f : (int(i % 13) - 6) * 0.125f;
+            }
+            ggml_backend_tensor_set(t, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+};
+
 // FastConformer regression shapes. A distinct parameter tag makes it possible
 // to require this bounded suite on an accelerator without running the large
 // image-model cases. These graphs are compared with the CPU backend by the
@@ -13535,6 +13571,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {33, 7, 6, 2}, 1, 1, {1, 2, 2, 1, 2, 2}));
         test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {2, 2, 1, 3}, 1, 4, {2, 2, 0, 0, 1, 1}));
         test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {1, 1, 3, 2}, 1, 6, {1, 1, 4, 3, 2, 2}));
+    }
+
+    // F32 stride-one depthwise row-window reuse; retain the original grading.
+    {
+        int case_id = 0;
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 24, 7}, 3, 2, {1, 1, 1, 1, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 32, 7}, 5, 1, {1, 1, 2, 0, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 16, 7}, 5, 1, {1, 1, 2, 0, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 32, 7}, 5, 1, {1, 1, 2, 0, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 24, 7}, 5, 1, {1, 1, 2, 0, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 24, 7}, 3, 2, {1, 1, 1, 1, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {65, 63, 12, 7}, 3, 2, {1, 1, 1, 1, 1, 1}));
+        const int64_t widths[] = {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129};
+        const int64_t channels[] = {1, 3, 12, 24};
+        for (int kw : {3, 5}) {
+            for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+                const int kh = kw == 3 ? 2 : 1;
+                test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++,
+                    {widths[i], int64_t(5 + i % 3), channels[i % 4], int64_t(1 + i % 2)},
+                    kw, kh, {1, int(1 + i % 3), kw / 2, kh - 1, 1, 1}, i % 2));
+            }
+        }
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {65, 7, 3, 3}, 3, 4, {1, 3, 1, 3, 1, 1}, true));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {64, 7, 4, 2}, 5, 3, {1, 2, 4, 2, 1, 1}, true));
+        for (int pattern : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 7, 3, 2}, 3, 2,
+                {1, 1, 1, 1, 1, 1}, true, pattern));
+            test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 5, 4, 2}, 5, 1,
+                {1, 1, 2, 0, 1, 1}, true, pattern));
+        }
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {1, 1, 1, 2}, 3, 2, {1, 2, 4, 4, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {1, 1, 3, 2}, 5, 4, {1, 3, 4, 6, 1, 1}));
     }
 
     // conv_2d_dw whcn_v4 (wide 1-D rows) + its selection boundaries
