@@ -53,6 +53,7 @@ add_library(${HTP_LIB} SHARED
     transpose-ops.c
     depthwise-conv-1d-ops.c
     gru-ops.c
+    conv-2d-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE

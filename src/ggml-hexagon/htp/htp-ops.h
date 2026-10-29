@@ -119,6 +119,7 @@ enum htp_op_code {
     HTP_OP_ARGMAX,
     HTP_OP_CONV_TAPS_F32,
     HTP_OP_GRU,
+    HTP_OP_CONV_2D,
 
     HTP_OP_INVALID
 };

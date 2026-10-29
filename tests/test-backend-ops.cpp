@@ -8398,6 +8398,64 @@ struct test_conv_2d : public test_case {
     }
 };
 
+// Bounded direct F32 HTP coverage. Inherit the existing convolution grading.
+struct test_direct_conv_htp_f32 : public test_conv_2d {
+    const int case_id;
+    const bool offset;
+    const int pattern; // 0=random, 1=zero input, 2=zero weights, 3=mixed-sign dyadic.
+
+    test_direct_conv_htp_f32(int id, std::array<int64_t, 4> input, int kernel, int64_t outputs,
+                            std::array<int, 6> p = {1, 1, 0, 0, 1, 1}, bool offset = false, int pattern = 0)
+        : test_conv_2d(input, {kernel, kernel, input[2], outputs}, GGML_TYPE_F32,
+                       p[0], p[1], p[2], p[3], p[4], p[5], false),
+          case_id(id), offset(offset), pattern(pattern) {}
+
+    std::string vars() override {
+        return "suite=hexagon_direct_conv_f32," + VARS_TO_STR3(case_id, offset, pattern) + "," + test_conv_2d::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out;
+        if (!offset) {
+            out = test_conv_2d::build_graph(ctx);
+        } else {
+            const auto view = [&](const std::array<int64_t, 4> & ne, const char * name) {
+                const int64_t elements = ne[0] * ne[1] * ne[2] * ne[3];
+                ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 1);
+                ggml_format_name(storage, "%s_storage", name);
+                ggml_tensor * tensor = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3],
+                    ne[0] * sizeof(float), ne[0] * ne[1] * sizeof(float),
+                    ne[0] * ne[1] * ne[2] * sizeof(float), sizeof(float));
+                ggml_set_name(tensor, name);
+                return tensor;
+            };
+            out = ggml_conv_2d_direct(ctx, view(ne_kernel, "kernel"), view(ne_input, "input"),
+                stride0, stride1, padding0, padding1, dilation0, dilation1);
+        }
+        ggml_format_name(out, "hexagon_direct_conv_%d", case_id);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (!pattern) return;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            const bool zero = (pattern == 1 && name.find("input") != std::string::npos) ||
+                              (pattern == 2 && name.find("kernel") != std::string::npos);
+            if (!zero && pattern != 3) continue;
+            std::vector<float> values(ggml_nelements(t), 0.0f);
+            if (pattern == 3) {
+                const bool kernel = name.find("kernel") != std::string::npos;
+                for (size_t i = 0; i < values.size(); ++i) {
+                    values[i] = kernel ? (int(i % 7) - 3) * 0.0625f : (int(i % 9) - 4) * 0.125f;
+                }
+            }
+            ggml_backend_tensor_set(t, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+};
+
 // GGML_OP_CONV_2D_DW
 struct test_conv_2d_dw : public test_case {
     const std::array<int64_t, 4> ne_input;
@@ -13385,6 +13443,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 63, 24, 7}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
         test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 63, 12, 7}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
         test_cases.emplace_back(new test_dw_stride2_htp_f32({1, 1, 1, 2}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
+    }
+
+    // Direct F32 ordinary convolution: all real pointwise channel pairs at
+    // both spatial widths, the causal-padding 3x3 shapes, and bounded edges.
+    {
+        int case_id = 0;
+        for (const auto & channels : std::vector<std::array<int64_t, 2>>{
+                 {6, 6}, {6, 12}, {8, 16}, {12, 6}, {12, 12}, {12, 16}, {16, 8}, {16, 12}, {16, 16}}) {
+            for (int64_t width : {33, 65}) {
+                test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {width, 63, channels[0], 7}, 1, channels[1]));
+            }
+        }
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {129, 63, 1, 7}, 3, 12, {2, 1, 1, 2, 1, 1}));
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {129, 63, 12, 7}, 3, 1, {1, 1, 1, 2, 1, 1}));
+        const int64_t widths[] = {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129};
+        const int64_t inputs[] = {1, 3, 6, 16}, outputs[] = {1, 3, 4, 5, 6, 8, 12, 16};
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++,
+                {widths[i], int64_t(3 + i % 3), inputs[i % 4], int64_t(1 + i % 2)},
+                1, outputs[i % 8], {1, 1, 0, 0, 1, 1}, i % 2));
+        }
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            const int sx = 1 + i % 2, sy = 1 + i / 2 % 2;
+            const int dx = 1 + i / 3 % 2, dy = 1 + i / 4 % 2;
+            test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++,
+                {widths[i], int64_t(5 + i % 3), inputs[i % 4], int64_t(1 + i % 2)},
+                3, outputs[i % 8], {sx, sy, dx, 2, dx, dy}, i % 2));
+        }
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {1, 1, 1, 1}, 3, 3, {2, 2, 4, 5, 2, 2}));
+        for (int pattern : {1, 2, 3}) {
+            test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {65, 3, 6, 2}, 1, 5,
+                {1, 1, 0, 0, 1, 1}, true, pattern));
+            test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {33, 7, 3, 2}, 3, 3,
+                {2, 1, 1, 2, 1, 1}, true, pattern));
+        }
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {65, 5, 3, 2}, 1, 3, {2, 1, 1, 2, 1, 1}));
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {33, 7, 6, 2}, 1, 1, {1, 2, 2, 1, 2, 2}));
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {2, 2, 1, 3}, 1, 4, {2, 2, 0, 0, 1, 1}));
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {1, 1, 3, 2}, 1, 6, {1, 1, 4, 3, 2, 2}));
     }
 
     // conv_2d_dw whcn_v4 (wide 1-D rows) + its selection boundaries
