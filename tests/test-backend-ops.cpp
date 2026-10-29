@@ -8509,6 +8509,22 @@ struct test_direct_conv_htp_f32 : public test_conv_2d {
     }
 };
 
+// Optional eight-OC and spatial-window reuse, with the existing convolution
+// grading and independently named outputs for actual HTP profile association.
+struct test_blocked_conv_htp_f32 : public test_direct_conv_htp_f32 {
+    using test_direct_conv_htp_f32::test_direct_conv_htp_f32;
+
+    std::string vars() override {
+        return "suite=hexagon_blocked_conv_f32," + VARS_TO_STR3(case_id, offset, pattern) + "," + test_conv_2d::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_direct_conv_htp_f32::build_graph(ctx);
+        ggml_format_name(out, "hexagon_blocked_conv_%d", case_id);
+        return out;
+    }
+};
+
 // GGML_OP_CONV_2D_DW
 struct test_conv_2d_dw : public test_case {
     const std::array<int64_t, 4> ne_input;
@@ -13571,6 +13587,44 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {33, 7, 6, 2}, 1, 1, {1, 2, 2, 1, 2, 2}));
         test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {2, 2, 1, 3}, 1, 4, {2, 2, 0, 0, 1, 1}));
         test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {1, 1, 3, 2}, 1, 6, {1, 1, 4, 3, 2, 2}));
+    }
+
+    // Keep the published 53 direct-convolution fixtures intact. These tagged
+    // cases add production geometry, OC8/4/1 boundaries and exact staged tails.
+    {
+        int case_id = 0;
+        for (const auto & channels : std::vector<std::array<int64_t, 2>>{
+                 {6, 6}, {6, 12}, {8, 16}, {12, 6}, {12, 12}, {12, 16}, {16, 8}, {16, 12}, {16, 16}}) {
+            for (int64_t width : {33, 65})
+                test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {width, 63, channels[0], 7}, 1, channels[1]));
+        }
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {129, 63, 1, 7}, 3, 12, {2, 1, 1, 2, 1, 1}));
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {129, 63, 12, 7}, 3, 1, {1, 1, 1, 2, 1, 1}));
+        for (int64_t channels : {1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 16, 17}) {
+            test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {33, 5, 3, 2}, 1, channels,
+                {1, 1, 0, 0, 1, 1}, true));
+            test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {33, 5, 3, 2}, 3, channels,
+                {1, 1, 1, 1, 1, 1}, true));
+        }
+        const int64_t widths[] = {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129};
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            for (int sx : {1, 2}) {
+                const int dx = 1 + i % 2, dy = 1 + i / 2 % 2;
+                test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++,
+                    {widths[i], 7, 6, 2}, 3, sx == 1 ? 9 : 16,
+                    {sx, int(1 + i / 3 % 2), dx, 2, dx, dy}, true));
+            }
+        }
+        for (int pattern : {1, 2, 3}) {
+            test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {65, 5, 3, 2}, 1, 9,
+                {1, 1, 0, 0, 1, 1}, true, pattern));
+            test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {65, 5, 3, 2}, 3, 9,
+                {2, 1, 1, 2, 1, 1}, true, pattern));
+        }
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {1, 1, 1, 2}, 3, 8, {2, 2, 4, 5, 2, 2}));
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {1, 1, 3, 1}, 3, 16, {1, 1, 1, 1, 1, 1}));
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {65, 5, 3, 2}, 1, 9, {2, 1, 1, 2, 1, 1}));
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {33, 7, 6, 2}, 1, 16, {1, 2, 2, 1, 2, 2}));
     }
 
     // F32 stride-one depthwise row-window reuse; retain the original grading.

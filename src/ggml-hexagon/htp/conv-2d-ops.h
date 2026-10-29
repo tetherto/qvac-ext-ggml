@@ -24,6 +24,11 @@ struct htp_conv_f32_layout {
     bool flat_pointwise;
 };
 
+// Optional spatial staging plan; the original host eligibility is unchanged.
+struct htp_conv_f32_spatial_layout {
+    uint32_t jobs, threads, row_floats, input_bytes, worker_bytes, total_bytes;
+};
+
 struct htp_conv_f32_pointwise_layout {
     uint32_t jobs, threads, input_bytes, worker_bytes, total_bytes;
 };
@@ -162,6 +167,53 @@ static inline bool htp_conv_f32_plan_pointwise(const struct htp_conv_f32_layout 
     }
     const struct htp_conv_f32_pointwise_layout result = {(uint32_t)jobs, (uint32_t)threads, (uint32_t)input_bytes,
                                                          (uint32_t)worker_bytes, (uint32_t)total_bytes};
+    *out = result;
+    return true;
+}
+
+// Eight OC accumulators reuse one 32-position input vector. Never trade away
+// workers to fit this optional plan; the original one/four path remains valid.
+static inline bool htp_conv_f32_plan_pointwise_eight(const struct htp_conv_f32_layout * l, uint64_t vtcm_bytes,
+                                                     struct htp_conv_f32_pointwise_layout * out) {
+    struct htp_conv_f32_pointwise_layout base;
+    if (!out || !htp_conv_f32_plan_pointwise(l, vtcm_bytes, &base) || l->co < 8) return false;
+    const uint64_t worker = (uint64_t)base.input_bytes + 8 * HTP_CONV_F32_LANES * sizeof(float);
+    const uint64_t total = l->weights_bytes + base.threads * worker;
+    if (worker > UINT32_MAX || total > UINT32_MAX || total > vtcm_bytes) return false;
+    base.worker_bytes = (uint32_t)worker;
+    base.total_bytes = (uint32_t)total;
+    *out = base;
+    return true;
+}
+
+// Stage all CI/KY row windows once per spatial job, then reuse them across
+// output-channel blocks. SX=1 needs64floats/window; SX=2 needs96. Keep the
+// previous generic kernel when its worker count or VTCM budget cannot be kept.
+static inline bool htp_conv_f32_plan_spatial(const struct htp_conv_f32_layout * l, uint64_t vtcm_bytes,
+                                             struct htp_conv_f32_spatial_layout * out) {
+    if (!l || !out || l->flat_pointwise || l->kw != 3 || l->kh != 3 || !l->ci || !l->co || !l->n ||
+        !l->w || !l->h || !l->ow || !l->oh || !l->tiles || !l->threads || l->threads > 10 ||
+        l->sx < 1 || l->sx > 2 || l->sy < 1 || l->sy > 2 || l->dx < 1 || l->dx > 2 || l->dy < 1 || l->dy > 2 ||
+        (uint64_t)l->w * l->h != l->plane || (uint64_t)l->ow * l->oh != l->out_plane ||
+        ((uint64_t)l->ow + HTP_CONV_F32_LANES - 1) / HTP_CONV_F32_LANES != l->tiles) {
+        return false;
+    }
+    uint64_t jobs = l->tiles;
+    if (jobs > UINT32_MAX / l->oh) return false;
+    jobs *= l->oh;
+    if (jobs > UINT32_MAX / l->n) return false;
+    jobs *= l->n;
+    if (jobs < l->threads) return false;
+    const uint64_t span = (HTP_CONV_F32_LANES - 1) * l->sx + (l->kw - 1) * l->dx + 1;
+    const uint64_t row_floats = (span + HTP_CONV_F32_LANES - 1) / HTP_CONV_F32_LANES * HTP_CONV_F32_LANES;
+    const uint64_t row_group = (uint64_t)l->kh * row_floats * sizeof(float);
+    if (row_floats > HTP_CONV_F32_STAGE_FLOATS || l->ci > UINT32_MAX / row_group) return false;
+    const uint64_t input = l->ci * row_group;
+    const uint64_t worker = input + HTP_CONV_F32_LANES * sizeof(float);
+    const uint64_t total = l->weights_bytes + l->threads * worker;
+    if (worker > UINT32_MAX || total > UINT32_MAX || total > vtcm_bytes) return false;
+    const struct htp_conv_f32_spatial_layout result = {(uint32_t)jobs, l->threads, (uint32_t)row_floats,
+                                                       (uint32_t)input, (uint32_t)worker, (uint32_t)total};
     *out = result;
     return true;
 }

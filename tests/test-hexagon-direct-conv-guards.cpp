@@ -221,7 +221,127 @@ int main() {
     k = tensor(1, 1, 1, 1); x = tensor(0x400001, 1, 1, 1); y = tensor(0x400001, 1, 1, 1);
     CHECK(valid() && (uint64_t)layout.plane * sizeof(float) > 0xffffffu);
     CHECK(htp_conv_f32_plan_pointwise(&layout, 8 * 1024 * 1024, &staged));
+    // OC8 is optional: preserve the published pointwise worker count and the
+    // four-channel weight padding, including OC9/10/15/17 remainders.
+    htp_conv_f32_pointwise_layout eight;
+    for (uint32_t channels : {1u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 12u, 15u, 16u, 17u}) {
+        k = tensor(1, 1, 6, channels); x = tensor(65, 63, 6, 7); y = tensor(65, 63, channels, 7);
+        CHECK(valid());
+        CHECK(htp_conv_f32_plan_pointwise(&layout, 8 * 1024 * 1024, &staged));
+        const bool selected = htp_conv_f32_plan_pointwise_eight(&layout, 8 * 1024 * 1024, &eight);
+        CHECK(selected == (channels >= 8));
+        if (!selected) continue;
+        CHECK(eight.jobs == staged.jobs && eight.threads == staged.threads && eight.input_bytes == staged.input_bytes);
+        CHECK(eight.worker_bytes == staged.worker_bytes + 512);
+        CHECK(eight.total_bytes == layout.weights_bytes + eight.threads * eight.worker_bytes);
+        CHECK(!htp_conv_f32_plan_pointwise_eight(&layout, eight.total_bytes - 1, &eight));
+        CHECK(htp_conv_f32_plan_pointwise(&layout, staged.total_bytes, &staged));
+        CHECK(!htp_conv_f32_plan_pointwise_eight(&layout, staged.total_bytes, &eight));
+        for (uint32_t oc = 0; oc < channels;) {
+            const uint32_t remaining = channels - oc, block = remaining >= 8 ? 8 : 4;
+            const uint32_t actual = remaining < block ? remaining : block;
+            const uint32_t computed = actual == 1 ? 1 : block;
+            CHECK(oc + computed <= (channels + 3) / 4 * 4);
+            CHECK(computed != 8 || oc + 8 <= channels);
+            CHECK((uint64_t)(oc + computed) * layout.k_elements * sizeof(float) <= layout.weights_bytes);
+            for (uint32_t c = 0; c < actual; ++c) {
+                CHECK(c * 128 + 128 <= 8 * 128);
+                const uint64_t last = ((uint64_t)6 * channels + oc + c + 1) * layout.out_plane;
+                CHECK(last * sizeof(float) <= y.size);
+            }
+            oc += actual;
+        }
+    }
+
+    // Prove the complete source-layout mapping, including absent padded rows,
+    // dilation, vector tails, batch/channel separation and OC8/4/1 stores.
+    htp_conv_f32_spatial_layout spatial;
+    CHECK(!htp_conv_f32_plan_spatial(nullptr, UINT64_MAX, &spatial));
+    CHECK(!htp_conv_f32_plan_spatial(&layout, UINT64_MAX, nullptr));
+    for (uint32_t width : {1u, 2u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, 128u, 129u}) {
+        for (int sx : {1, 2}) for (int sy : {1, 2}) for (int dx : {1, 2}) for (int dy : {1, 2}) {
+            int32_t params[6] = {sx, sy, dx, 2, dx, dy};
+            const uint32_t ow = (width + 2 * dx - 2 * dx - 1) / sx + 1;
+            const uint32_t oh = (7 + 4 - 2 * dy - 1) / sy + 1;
+            auto kernel = tensor(3, 3, 3, 17), input = tensor(width, 7, 3, 2), output = tensor(ow, oh, 17, 2);
+            CHECK(htp_conv_f32_validate(&kernel, &input, &output, params, 6, 8 * 1024 * 1024, &layout));
+            const bool selected = htp_conv_f32_plan_spatial(&layout, 8 * 1024 * 1024, &spatial);
+            CHECK(selected == ((uint64_t)layout.tiles * oh * 2 >= layout.threads));
+            if (!selected) continue;
+            CHECK(spatial.threads == layout.threads && spatial.jobs == layout.tiles * oh * 2);
+            CHECK(spatial.row_floats == (sx == 1 ? 64u : 96u));
+            CHECK(spatial.input_bytes == 3 * 3 * spatial.row_floats * sizeof(float));
+            CHECK(spatial.worker_bytes == spatial.input_bytes + 128);
+            CHECK(spatial.total_bytes == layout.weights_bytes + spatial.threads * spatial.worker_bytes);
+            CHECK(spatial.input_bytes % 128 == 0 && spatial.worker_bytes % 128 == 0);
+            CHECK(!htp_conv_f32_plan_spatial(&layout, spatial.total_bytes - 1, &spatial));
+            CHECK(htp_conv_f32_plan_spatial(&layout, 8 * 1024 * 1024, &spatial));
+            const uint64_t old_budget = layout.total_bytes;
+            CHECK(!htp_conv_f32_plan_spatial(&layout, old_budget, &spatial));
+            htp_conv_f32_layout accepted;
+            CHECK(htp_conv_f32_validate(&kernel, &input, &output, params, 6, old_budget, &accepted));
+            for (uint32_t job : {0u, spatial.jobs / 2, spatial.jobs - 1}) {
+                const uint32_t start = job % layout.tiles * 32, oy = job / layout.tiles % oh;
+                const uint32_t n = job / layout.tiles / oh;
+                const uint32_t lanes = ow - start < 32 ? ow - start : 32;
+                const uint32_t span = (lanes - 1) * sx + 2 * dx + 1;
+                const int64_t ix = (int64_t)start * sx - dx;
+                for (uint32_t ci = 0; ci < 3; ++ci) for (uint32_t ky = 0; ky < 3; ++ky) {
+                    const int64_t iy = (int64_t)oy * sy + ky * dy - 2;
+                    std::array<float, 98> storage;
+                    storage.fill(-777.0f);
+                    float * stage = storage.data() + 1;
+                    for (uint32_t i = 0; i < spatial.row_floats; ++i) stage[i] = 0.0f;
+                    uint32_t first = 0, target = 0, count = 0;
+                    if (iy >= 0 && iy < 7) htp_conv_f32_row_window(width, ix, span, &first, &target, &count);
+                    CHECK(first + count <= width && target + count <= spatial.row_floats);
+                    for (uint32_t i = 0; i < count; ++i)
+                        stage[target + i] = float(1 + n * 100000 + ci * 10000 + iy * width + first + i);
+                    CHECK(storage.front() == -777.0f && stage[spatial.row_floats] == -777.0f);
+                    for (uint32_t kx = 0; kx < 3; ++kx) {
+                        CHECK(kx * dx + 31 * sx < spatial.row_floats);
+                        for (uint32_t lane = 0; lane < lanes; ++lane) {
+                            const int64_t source_x = ix + lane * sx + kx * dx;
+                            const float expected = iy >= 0 && iy < 7 && source_x >= 0 && source_x < width ?
+                                float(1 + n * 100000 + ci * 10000 + iy * width + source_x) : 0.0f;
+                            CHECK(stage[lane * sx + kx * dx] == expected);
+                        }
+                    }
+                }
+                for (uint32_t oc = 0; oc < 17;) {
+                    const uint32_t remaining = 17 - oc, block = remaining >= 8 ? 8 : 4;
+                    const uint32_t actual = remaining < block ? remaining : block;
+                    for (uint32_t c = 0; c < actual; ++c) {
+                        const uint64_t first = ((uint64_t)n * 17 + oc + c) * ow * oh + oy * ow + start;
+                        CHECK(first + lanes <= ((uint64_t)n * 17 + oc + c) * ow * oh + (oy + 1) * ow);
+                        CHECK((first + lanes) * sizeof(float) <= output.size);
+                    }
+                    oc += actual;
+                }
+            }
+        }
+    }
+    // Fewer spatial jobs cannot steal OC parallelism from the published path.
+    p[0] = p[1] = p[4] = p[5] = 1; p[2] = p[3] = 1;
+    k = tensor(3, 3, 3, 16); x = tensor(1, 1, 3, 1); y = tensor(1, 1, 16, 1);
+    CHECK(valid() && layout.threads == 4);
+    CHECK(!htp_conv_f32_plan_spatial(&layout, UINT64_MAX, &spatial));
+    p[2] = p[3] = 1;
+    k = tensor(3, 3, 3, 17); x = tensor(65, 7, 3, 2); y = tensor(65, 7, 17, 2);
+    CHECK(valid() && htp_conv_f32_plan_spatial(&layout, 8 * 1024 * 1024, &spatial));
+    for (uint32_t field = 0; field < 7; ++field) {
+        auto malformed = layout;
+        if (field == 0) malformed.ci = UINT32_MAX;
+        if (field == 1) malformed.threads = 0;
+        if (field == 2) malformed.threads = 11;
+        if (field == 3) malformed.weights_bytes = UINT32_MAX;
+        if (field == 4) malformed.sx = 3;
+        if (field == 5) malformed.tiles = UINT32_MAX;
+        if (field == 6) malformed.n = UINT32_MAX;
+        CHECK(!htp_conv_f32_plan_spatial(&malformed, UINT64_MAX, &spatial));
+    }
     std::puts("Direct F32 convolution shape/span/layout/padding/VTCM guards passed");
     std::puts("Direct F32 pointwise DMA jobs, VTCM fallback and bounded channel/tail rows passed");
+    std::puts("Direct F32 OC8 and shared spatial-window bounds, worker preservation and fallbacks passed");
     return 0;
 }
