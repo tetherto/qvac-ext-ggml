@@ -54,6 +54,7 @@ add_library(${HTP_LIB} SHARED
     depthwise-conv-1d-ops.c
     gru-ops.c
     conv-2d-ops.c
+    affine-prelu-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE

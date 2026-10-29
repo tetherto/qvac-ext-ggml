@@ -152,6 +152,7 @@ int op_depthwise_conv_1d(struct htp_ops_context * octx);
 int op_conv_taps_f32(struct htp_ops_context * octx);
 int op_gru(struct htp_ops_context * octx);
 int op_conv_2d(struct htp_ops_context * octx);
+int op_affine_prelu(struct htp_ops_context * octx);
 
 // Transposes a batch of row-major F32 matrices: dst row c, column r takes
 // source row r, column c. Returns false when the VTCM tiles do not fit.

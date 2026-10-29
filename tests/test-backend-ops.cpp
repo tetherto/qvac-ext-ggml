@@ -4887,6 +4887,59 @@ struct test_affine_prelu : public test_case {
     }
 };
 
+// F32 affine/PReLU: unchanged grading, real denoiser shapes and bounded tails.
+struct test_affine_prelu_htp_f32 : public test_affine_prelu {
+    const int case_id;
+    const bool offset;
+    const int pattern; // 0=random, 1=signed dyadic/zeros, 2=zero slope, 3=negative slope.
+
+    test_affine_prelu_htp_f32(int id, int64_t f, int64_t t, int64_t c, int64_t b,
+                               bool offset = false, int pattern = 0)
+        : test_affine_prelu(f, t, c, b), case_id(id), offset(offset), pattern(pattern) {}
+
+    std::string vars() override {
+        return "suite=hexagon_affine_prelu_f32," + VARS_TO_STR3(case_id, offset, pattern) + "," + test_affine_prelu::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const auto tensor = [&](std::array<int64_t, 4> ne, const char * name) {
+            ggml_tensor * result;
+            if (offset) {
+                ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0] * ne[1] * ne[2] * ne[3] + 1);
+                ggml_format_name(storage, "%s_storage", name);
+                result = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], ne[0] * sizeof(float),
+                    ne[0] * ne[1] * sizeof(float), ne[0] * ne[1] * ne[2] * sizeof(float), sizeof(float));
+            } else {
+                result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+            }
+            ggml_set_name(result, name);
+            return result;
+        };
+        ggml_tensor * result = ggml_affine_prelu(ctx, tensor({f, t, c, bc}, "affine_x"),
+            tensor({f, c, 1, 1}, "affine_aw"), tensor({f, c, 1, 1}, "affine_ab"), tensor({c, 1, 1, 1}, "affine_slope"));
+        ggml_format_name(result, "hexagon_affine_prelu_%d", case_id);
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (!pattern) return;
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            const std::string name = ggml_get_name(tensor);
+            if (name.find("affine_") != 0 || name.find("_storage") != std::string::npos) continue;
+            const bool slope = name == "affine_slope";
+            std::vector<float> values(ggml_nelements(tensor));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = (int(i % 17) - 8) * 0.125f;
+                if (i % 19 == 0) values[i] = -0.0f;
+                if (slope && pattern == 2) values[i] = 0.0f;
+                if (slope && pattern == 3) values[i] = -0.25f * (1 + i % 3);
+            }
+            ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+};
+
 // GGML_OP_SNAKE
 struct test_snake : public test_case {
     const int64_t t;  // time (ne0)
@@ -13502,6 +13555,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (int groups : {1, 2, 3, 4}) {
         test_cases.emplace_back(new test_channel_shuffle({8, 4, 12, 2}, groups));
+    }
+
+    {
+        int case_id = 0;
+        for (int64_t f : {33, 65, 129}) {
+            for (int64_t c : {12, 24, 32}) {
+                test_cases.emplace_back(new test_affine_prelu_htp_f32(case_id++, f, 63, c, 7));
+            }
+        }
+        for (int64_t f : {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129}) {
+            for (bool offset : {false, true}) {
+                test_cases.emplace_back(new test_affine_prelu_htp_f32(case_id++, f, 9, 3, 2, offset));
+            }
+        }
+        for (int pattern : {1, 2, 3}) {
+            for (int64_t f : {1, 32, 33, 65, 129}) {
+                test_cases.emplace_back(new test_affine_prelu_htp_f32(case_id++, f, 3, 3, 2, true, pattern));
+            }
+        }
     }
 
     test_cases.emplace_back(new test_affine_prelu(16, 10, 6, 2));

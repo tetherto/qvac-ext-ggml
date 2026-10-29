@@ -55,6 +55,7 @@
 #include "htp/unary-ops.h"
 #include "htp/gru-ops.h"
 #include "htp/conv-2d-ops.h"
+#include "htp/affine-prelu-ops.h"
 #include "htp_iface.h"
 #include "htp-drv.h"
 
@@ -4204,6 +4205,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_GATED_DELTA_NET: return HTP_OP_GATED_DELTA_NET;
         case GGML_OP_GRU:            return HTP_OP_GRU;
         case GGML_OP_CONV_2D:        return HTP_OP_CONV_2D;
+        case GGML_OP_AFFINE_PRELU:   return HTP_OP_AFFINE_PRELU;
         case GGML_OP_ROPE:            return HTP_OP_ROPE;
         case GGML_OP_REPEAT:          return HTP_OP_REPEAT;
         case GGML_OP_CUMSUM:          return HTP_OP_CUMSUM;
@@ -4987,6 +4989,40 @@ static bool ggml_hexagon_supported_conv_2d(const struct ggml_hexagon_session * s
     return true;
 }
 
+static bool ggml_hexagon_supported_affine_prelu(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    static_assert(HTP_AFFINE_F32_TYPE == GGML_TYPE_F32 && HTP_AFFINE_F32_TYPE == HTP_TYPE_F32,
+                  "affine/PReLU F32 protocol type mismatch");
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (i < 4 ? op->src[i] == nullptr : op->src[i] != nullptr) return false;
+    }
+    const ggml_tensor * tensors[5] = {op->src[0], op->src[1], op->src[2], op->src[3], op};
+    htp_affine_f32_tensor desc[5] = {};
+    for (int i = 0; i < 5; ++i) {
+        desc[i].type = tensors[i]->type;
+        desc[i].size = UINT32_MAX;
+        desc[i].address = (uintptr_t)tensors[i]->data;
+        for (int d = 0; d < 4; ++d) {
+            desc[i].ne[d] = tensors[i]->ne[d];
+            desc[i].nb[d] = tensors[i]->nb[d];
+        }
+    }
+    htp_affine_f32_layout layout;
+    if (!htp_affine_f32_validate(desc, HTP_MAX_NTHREADS, sess->vtcm_size, &layout)) return false;
+    for (int i = 0; i < 5; ++i) {
+        uint64_t bytes;
+        if (!htp_affine_f32_tensor_bytes(&desc[i], &bytes)) return false;
+        ggml_backend_buffer_t buffer = tensors[i]->buffer;
+        if (!buffer && tensors[i]->view_src) buffer = tensors[i]->view_src->buffer;
+        if (buffer && tensors[i]->data) {
+            const uintptr_t base = (uintptr_t)ggml_backend_buffer_get_base(buffer);
+            const uintptr_t address = (uintptr_t)tensors[i]->data;
+            const size_t size = ggml_backend_buffer_get_size(buffer);
+            if (address < base || address - base > size || bytes > size - (address - base)) return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
 
@@ -5033,6 +5069,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_CONV_2D:
             supp = ggml_hexagon_supported_conv_2d(sess, op);
+            break;
+
+        case GGML_OP_AFFINE_PRELU:
+            supp = ggml_hexagon_supported_affine_prelu(sess, op);
             break;
 
         case GGML_OP_MUL_MAT_ID:
