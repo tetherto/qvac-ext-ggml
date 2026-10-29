@@ -27,6 +27,8 @@ add_library(${HTP_LIB} SHARED
     binary-ops.c
     unary-ops.c
     sum-rows-ops.c
+    mean-ops.c
+    energy-ops.c
     softmax-ops.c
     act-ops.c
     rope-ops.c

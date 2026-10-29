@@ -153,6 +153,9 @@ struct htp_opnode {
     }
 
     std::string op_name() const {
+        if (opcode == HTP_OP_ENERGY_MEAN_F32) {
+            return "ENERGY_SQR_MEAN";
+        }
         if (opcode == HTP_OP_CONV_TAPS_F32) {
             return "CONV_TAPS_F32";
         }

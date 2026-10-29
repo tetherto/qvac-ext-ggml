@@ -762,6 +762,12 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_SUM_ROWS:
             return op_sum_rows(octx);
 
+        case HTP_OP_MEAN:
+            return op_mean(octx);
+
+        case HTP_OP_ENERGY_MEAN_F32:
+            return op_energy_mean_f32(octx);
+
         case HTP_OP_CPY:
             return op_cpy(octx);
 

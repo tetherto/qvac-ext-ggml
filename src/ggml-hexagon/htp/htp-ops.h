@@ -121,6 +121,8 @@ enum htp_op_code {
     HTP_OP_GRU,
     HTP_OP_CONV_2D,
     HTP_OP_AFFINE_PRELU,
+    HTP_OP_MEAN,
+    HTP_OP_ENERGY_MEAN_F32,
 
     HTP_OP_INVALID
 };

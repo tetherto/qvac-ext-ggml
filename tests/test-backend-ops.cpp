@@ -9937,6 +9937,152 @@ struct test_mean : public test_case {
     }
 };
 
+// Focused F32 MEAN coverage; retain the existing numerical grading.
+struct test_mean_htp_f32 : public test_case {
+    const int case_id;
+    const std::array<int64_t, 4> ne;
+    const bool offset;
+    const int row_padding;
+    const int pattern;
+    const bool legacy;
+
+    test_mean_htp_f32(int id, std::array<int64_t, 4> shape, bool offset = false,
+                      int row_padding = 0, int pattern = 0, bool legacy = false)
+        : case_id(id), ne(shape), offset(offset), row_padding(row_padding), pattern(pattern), legacy(legacy) {}
+
+    std::string vars() override {
+        return "suite=hexagon_mean_f32," + VARS_TO_STR6(case_id, ne, offset, row_padding, pattern, legacy);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const size_t row_bytes = (ne[0] + row_padding) * sizeof(float);
+        const int64_t storage_floats = (ne[0] + row_padding) * ne[1] * ne[2] * ne[3] + int(offset);
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, storage_floats);
+        ggml_set_name(storage, "mean_storage");
+        ggml_tensor * input = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], row_bytes,
+            row_bytes * ne[1], row_bytes * ne[1] * ne[2], offset ? sizeof(float) : 0);
+        ggml_set_name(input, "mean_input");
+        ggml_tensor * result = ggml_mean(ctx, input);
+        ggml_format_name(result, "hexagon_mean_%d", case_id);
+        if (legacy) {
+            ggml_tensor * old = ggml_scale(ctx, ggml_sum_rows(ctx, input), 1.0f / float(ne[0]));
+            ggml_format_name(old, "hexagon_mean_legacy_%d", case_id);
+            result = ggml_concat(ctx, result, old, 3);
+            ggml_format_name(result, "hexagon_mean_pair_%d", case_id);
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (std::string(ggml_get_name(tensor)) != "mean_storage") continue;
+            if (!pattern) {
+                init_tensor_uniform(tensor, -0.9f, 1.1f);
+                continue;
+            }
+            std::vector<float> values(ggml_nelements(tensor));
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (pattern == 1) values[i] = 0.0f;
+                if (pattern == 2) values[i] = (int(i % 17) - 8) * 0.125f + 0.0625f;
+                if (pattern == 3) values[i] = i % 2 ? -0.5f : 0.5f;
+                if (pattern == 4) values[i] = -0.0f;
+            }
+            ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t rows = ne[1] * ne[2] * ne[3];
+        const double reference_error = test_case::err(a, b, n);
+        // The paired graph also checks new MEAN against the old HTP graph;
+        // both use the standard unchanged NMSE threshold.
+        return legacy && n == 2 * rows ? std::max(reference_error, nmse(a, a + rows, rows)) : reference_error;
+    }
+};
+
+// Private energy pattern fusion uses existing CPU-legal GGML nodes. Whole
+// graph comparison is required so the HTP backend can see the complete chain.
+struct test_energy_htp_f32 : public test_case {
+    const int case_id;
+    const std::array<int64_t, 4> ne;
+    const bool channels, offset;
+    const int pattern, negative;
+    ggml_tensor * square = nullptr;
+    ggml_tensor * copied = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_energy_htp_f32(int id, std::array<int64_t, 4> shape, bool channels,
+                       bool offset = false, int pattern = 0, int negative = 0)
+        : case_id(id), ne(shape), channels(channels), offset(offset), pattern(pattern), negative(negative) {}
+
+    std::string vars() override {
+        const int expected_fused = negative >= 1 && negative <= 3 ? 0 : 1;
+        const int expected_cont = channels && (negative != 0 || ne[0] > 128) ? 1 : 0;
+        return "suite=hexagon_energy_f32," + VARS_TO_STR8(case_id, ne, channels, offset, pattern,
+                                                         negative, expected_fused, expected_cont);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (negative == 2) return {square, result};
+        if (negative == 4) return {copied, result};
+        return {result};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t padding = !channels && offset ? 1 : 0;
+        const int64_t count = (ne[0] + padding) * ne[1] * ne[2] * ne[3] + int(offset);
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, count);
+        ggml_set_name(storage, "energy_storage");
+        ggml_tensor * input;
+        if (channels) {
+            ggml_tensor * planes = ggml_view_4d(ctx, storage, ne[1], ne[0], ne[2], ne[3],
+                ne[1] * sizeof(float), ne[1] * ne[0] * sizeof(float),
+                ne[1] * ne[0] * ne[2] * sizeof(float), offset ? sizeof(float) : 0);
+            input = ggml_permute(ctx, planes, 1, 0, 2, 3);
+            ggml_set_name(input, "energy_source_planes");
+            copied = ggml_cont(ctx, input);
+            ggml_format_name(copied, "hexagon_energy_cont_%d", case_id);
+            input = copied;
+            if (negative == 4) ggml_set_output(copied);
+        } else {
+            const size_t stride = (ne[0] + padding) * sizeof(float);
+            input = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], stride,
+                                  stride * ne[1], stride * ne[1] * ne[2], offset ? sizeof(float) : 0);
+            ggml_set_name(input, "energy_source_rows");
+        }
+        square = ggml_sqr(ctx, input);
+        ggml_format_name(square, "hexagon_energy_square_%d", case_id);
+        if (negative == 2) ggml_set_output(square);
+        ggml_tensor * mean_input = negative == 3 ? ggml_add(ctx, square, square) : square;
+        ggml_tensor * mean = ggml_mean(ctx, mean_input);
+        ggml_format_name(mean, "hexagon_energy_%d", case_id);
+        result = mean;
+        if (negative == 1) {
+            result = ggml_concat(ctx, mean, ggml_sum_rows(ctx, square), 3);
+            ggml_format_name(result, "hexagon_energy_pair_%d", case_id);
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(ggml_get_name(t)) != "energy_storage") continue;
+            if (!pattern) { init_tensor_uniform(t, -0.9f, 1.1f); continue; }
+            std::vector<float> values(ggml_nelements(t));
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (pattern == 1) values[i] = 0.0f;
+                if (pattern == 2) values[i] = (int(i % 17) - 8) * 0.125f + 0.0625f;
+                if (pattern == 3) values[i] = -0.0f;
+                if (pattern == 4) values[i] = (i % 3 == 0 ? 0.001f : i % 3 == 1 ? -1.0f : 100.0f);
+            }
+            ggml_backend_tensor_set(t, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+};
+
 // GGML_OP_UPSCALE
 struct test_upscale : public test_case {
     const ggml_type type;
@@ -13691,6 +13837,62 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {1, 1, 1, 2}, 3, 2, {1, 2, 4, 4, 1, 1}));
         test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {1, 1, 3, 2}, 5, 4, {1, 3, 4, 6, 1, 1}));
+    }
+
+    // Production MEAN rows, vector tails, offset/row-padded views and legacy parity.
+    {
+        int case_id = 0;
+        const std::array<int64_t, 4> production[] = {
+            {65, 63, 12, 7}, {12, 4095, 7, 1}, {33, 63, 24, 7}, {24, 2079, 7, 1},
+            {33, 63, 32, 7}, {32, 2079, 7, 1}, {33, 63, 16, 7}, {16, 2079, 7, 1},
+            {129, 63, 1, 7}, {1, 8127, 7, 1},
+        };
+        for (const auto & shape : production) {
+            test_cases.emplace_back(new test_mean_htp_f32(case_id++, shape));
+        }
+        const int64_t widths[] = {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129};
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            for (bool offset : {false, true}) {
+                test_cases.emplace_back(new test_mean_htp_f32(case_id++, {widths[i], 5, 3, 2},
+                    offset, offset ? int(1 + i % 3) : 0));
+            }
+        }
+        for (int pattern : {1, 2, 3, 4}) {
+            for (int64_t width : {1, 12, 33, 65, 129}) {
+                test_cases.emplace_back(new test_mean_htp_f32(case_id++, {width, 3, 3, 2}, true, 1, pattern));
+            }
+        }
+        for (const auto & shape : production) {
+            test_cases.emplace_back(new test_mean_htp_f32(case_id++, shape, false, 0, 0, true));
+        }
+    }
+
+    // Square/mean source-layout fusion: actual production axes, vector tails,
+    // offset inputs and graph-semantic negatives; default grading is unchanged.
+    {
+        int case_id = 0;
+        for (const auto & shape : std::vector<std::array<int64_t, 4>>{
+                {65,63,12,7}, {33,63,24,7}, {33,63,32,7}, {33,63,16,7}, {129,63,1,7}})
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, shape, false));
+        for (const auto & shape : std::vector<std::array<int64_t, 4>>{
+                {12,4095,7,1}, {24,2079,7,1}, {32,2079,7,1}, {16,2079,7,1}, {1,8127,7,1}})
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, shape, true));
+        for (int64_t width : {1,2,31,32,33,63,64,65,127,128,129})
+            for (bool offset : {false,true})
+                test_cases.emplace_back(new test_energy_htp_f32(case_id++, {width,5,3,2}, false, offset));
+        const int64_t spatial[] = {1,31,32,33,63,64,65};
+        const int64_t channels[] = {1,3,12,16,24,32,12};
+        for (int i = 0; i < 7; ++i)
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, {channels[i],spatial[i],3,2}, true, true));
+        for (int pattern : {1,2,3,4}) {
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, {33,33,3,2}, false, true, pattern));
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, {24,65,3,2}, true, true, pattern));
+        }
+        for (bool channels : {false,true})
+            for (int negative : {1,2,3})
+                test_cases.emplace_back(new test_energy_htp_f32(case_id++, {24,65,3,2}, channels, true, 2, negative));
+        test_cases.emplace_back(new test_energy_htp_f32(case_id++, {24,65,3,2}, true, true, 2, 4));
+        test_cases.emplace_back(new test_energy_htp_f32(case_id++, {129,33,3,2}, true, true));
     }
 
     // conv_2d_dw whcn_v4 (wide 1-D rows) + its selection boundaries
