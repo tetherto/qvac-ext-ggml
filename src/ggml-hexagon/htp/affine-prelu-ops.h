@@ -19,6 +19,7 @@ struct htp_affine_f32_tensor {
 struct htp_affine_f32_layout {
     uint32_t f, t, c, b, tiles, jobs, threads;
     uint32_t coefficient_floats, plane_floats, plane_bytes, worker_bytes, total_bytes;
+    uint32_t padded_vector_reads;
 };
 
 static inline bool htp_affine_f32_tensor_bytes(const struct htp_affine_f32_tensor * tensor, uint64_t * bytes) {
@@ -81,12 +82,12 @@ static inline bool htp_affine_f32_validate(const struct htp_affine_f32_tensor te
     const uint64_t jobs = x[2] * x[3]; // <= elements, already bounded by tensor_bytes
     const uint64_t plane_elements = x[0] * x[1];
     const uint64_t coefficient_floats = tiles * HTP_AFFINE_F32_LANES;
-    const uint64_t plane_floats = (plane_elements + HTP_AFFINE_F32_LANES - 1) /
-                                  HTP_AFFINE_F32_LANES * HTP_AFFINE_F32_LANES;
+    uint64_t plane_floats = (plane_elements + HTP_AFFINE_F32_LANES - 1) /
+                            HTP_AFFINE_F32_LANES * HTP_AFFINE_F32_LANES;
     const uint64_t plane_bytes = plane_elements * sizeof(float);
     const uint64_t coefficient_bytes = x[0] * sizeof(float);
-    const uint64_t worker_bytes = 2 * (coefficient_floats + plane_floats) * sizeof(float) +
-                                  HTP_AFFINE_F32_TAIL_BYTES;
+    uint64_t worker_bytes = 2 * (coefficient_floats + plane_floats) * sizeof(float) +
+                            HTP_AFFINE_F32_TAIL_BYTES;
     if (!jobs || jobs > UINT32_MAX || coefficient_bytes > HTP_AFFINE_F32_DMA_MAX_BYTES ||
         plane_bytes > HTP_AFFINE_F32_DMA_MAX_BYTES || worker_bytes > UINT32_MAX) {
         return false;
@@ -100,11 +101,24 @@ static inline bool htp_affine_f32_validate(const struct htp_affine_f32_tensor te
     if (!threads) {
         return false;
     }
+    // Permit a complete 32-lane read beginning at any final-row tail. Keep
+    // the previous scratch-tail layout if extra padding would reduce its
+    // accepted worker count or minimum VTCM budget.
+    const uint64_t padded_plane_floats = (plane_elements + 2 * (HTP_AFFINE_F32_LANES - 1)) /
+                                         HTP_AFFINE_F32_LANES * HTP_AFFINE_F32_LANES;
+    const uint64_t padded_worker_bytes = 2 * (coefficient_floats + padded_plane_floats) * sizeof(float) +
+                                         HTP_AFFINE_F32_TAIL_BYTES;
+    uint32_t padded_vector_reads = 0;
+    if (padded_worker_bytes <= UINT32_MAX && threads <= budget / padded_worker_bytes) {
+        plane_floats = padded_plane_floats;
+        worker_bytes = padded_worker_bytes;
+        padded_vector_reads = 1;
+    }
     const struct htp_affine_f32_layout result = {(uint32_t)x[0], (uint32_t)x[1], (uint32_t)x[2], (uint32_t)x[3],
                                                  (uint32_t)tiles, (uint32_t)jobs, (uint32_t)threads,
                                                  (uint32_t)coefficient_floats, (uint32_t)plane_floats,
                                                  (uint32_t)plane_bytes, (uint32_t)worker_bytes,
-                                                 (uint32_t)(threads * worker_bytes)};
+                                                 (uint32_t)(threads * worker_bytes), padded_vector_reads};
     *layout = result;
     return true;
 }

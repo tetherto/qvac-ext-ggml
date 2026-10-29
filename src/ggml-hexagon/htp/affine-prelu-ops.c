@@ -11,12 +11,20 @@ struct htp_affine_f32_context {
     struct htp_affine_f32_layout layout;
 };
 
-static HVX_Vector load_tile(const float * source, uint32_t valid, float * scratch) {
+static inline __attribute__((always_inline)) HVX_Vector load_tile_bounded(const float * source, uint32_t valid,
+                                                                         float * scratch) {
     if (valid == HTP_AFFINE_F32_LANES) {
         return hvx_vmemu(source);
     }
-    memset(scratch, 0, 128);
-    memcpy(scratch, source, valid * sizeof(float));
+    hvx_vmem(scratch) = Q6_V_vzero();
+    // The low-VTCM fallback must not become a compiler-generated memcpy call
+    // inside the time loop. Volatile float accesses preserve exact bounds and
+    // avoid integer type-punning while copying only the valid input lanes.
+    volatile float * destination = scratch;
+    const volatile float * input = source;
+    for (uint32_t i = 0; i < valid; ++i) {
+        destination[i] = input[i];
+    }
     return hvx_vmem(scratch);
 }
 
@@ -49,6 +57,14 @@ static void affine_thread(unsigned int nth, unsigned int ith, void * data) {
         // Stage only valid source bytes. Zero the padded coefficient lanes so
         // every weight/bias vector can be loaded directly from aligned VTCM.
         memset(staged_weight, 0, 2 * l->coefficient_floats * sizeof(float));
+        // Zero the last one/two aligned input blocks before exact-size DMA
+        // restores their valid lanes. Full tail reads stay inside this private
+        // region; neither source DDR nor the next worker is read past its span.
+        const uint32_t plane_elements = l->plane_bytes / sizeof(float);
+        for (uint32_t at = plane_elements / HTP_AFFINE_F32_LANES * HTP_AFFINE_F32_LANES;
+             at < l->plane_floats; at += HTP_AFFINE_F32_LANES) {
+            hvx_vmem(staged_input + at) = zero;
+        }
         enqueue_copy(queue, staged_weight, aw + (size_t)channel * l->f, l->f * sizeof(float));
         enqueue_copy(queue, staged_bias, ab + (size_t)channel * l->f, l->f * sizeof(float));
         enqueue_copy(queue, staged_input, x + plane_offset, l->plane_bytes);
@@ -62,8 +78,9 @@ static void affine_thread(unsigned int nth, unsigned int ith, void * data) {
             const HVX_Vector bias = hvx_vmem(staged_bias + start);
             for (uint32_t t = 0; t < l->t; ++t) {
                 const size_t offset = (size_t)t * l->f + start;
-                const HVX_Vector value = load_tile(staged_input + offset, valid, scratch);
-                // Match the existing CPU and seven-op F32 graph rounding order.
+                const HVX_Vector value = l->padded_vector_reads ? hvx_vmemu(staged_input + offset) :
+                                         load_tile_bounded(staged_input + offset, valid, scratch);
+                // Keep the same F32 expression as the existing seven-op graph.
                 const HVX_Vector relu = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(value, zero), value, zero);
                 const HVX_Vector negative = hvx_vec_sub_f32_f32(value, relu);
                 const HVX_Vector prelu = hvx_vec_add_f32_f32(relu, hvx_vec_mul_f32_f32(slope, negative));
@@ -72,8 +89,7 @@ static void affine_thread(unsigned int nth, unsigned int ith, void * data) {
                 if (valid == HTP_AFFINE_F32_LANES) {
                     hvx_vmemu(staged_output + offset) = result;
                 } else {
-                    hvx_vmem(scratch + 32) = result;
-                    memcpy(staged_output + offset, scratch + 32, valid * sizeof(float));
+                    hvx_vec_store_u(staged_output + offset, valid * sizeof(float), result);
                 }
             }
         }

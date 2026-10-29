@@ -38,7 +38,8 @@ int main() {
             CHECK(layout.plane_bytes == f * 63 * sizeof(float) && layout.worker_bytes == worker_bytes);
             CHECK(layout.total_bytes == 6 * worker_bytes && layout.worker_bytes % 128 == 0);
             CHECK(htp_affine_f32_validate(tensors, 6, 6 * worker_bytes - 1, &layout));
-            CHECK(layout.threads == 5 && layout.total_bytes == 5 * worker_bytes);
+            CHECK(layout.threads == 5 && layout.total_bytes == 5 * layout.worker_bytes);
+            CHECK(layout.total_bytes < 6 * worker_bytes);
             CHECK(htp_affine_f32_validate(tensors, 6, worker_bytes, &layout));
             CHECK(layout.threads == 1 && layout.total_bytes == worker_bytes);
             CHECK(!htp_affine_f32_validate(tensors, 6, worker_bytes - 1, &layout));
@@ -114,15 +115,52 @@ int main() {
     std::array<htp_affine_f32_tensor, 5> large = {
         tensor(1, 0x3fffff, 1, 1), smallest, smallest, smallest, tensor(1, 0x3fffff, 1, 1)};
     CHECK(htp_affine_f32_validate(large.data(), 10, UINT64_MAX, &layout));
-    CHECK(layout.plane_bytes == 0xfffffc && layout.plane_floats == 0x400000);
+    CHECK(layout.plane_bytes == 0xfffffc && layout.plane_floats == 0x400020 && layout.padded_vector_reads == 1);
     CHECK(layout.threads == 1 && layout.total_bytes == layout.worker_bytes);
+    CHECK(htp_affine_f32_validate(large.data(), 10, layout.worker_bytes - 1, &layout));
+    CHECK(layout.padded_vector_reads == 0 && layout.plane_floats == 0x400000);
     CHECK(!htp_affine_f32_validate(large.data(), 10, layout.worker_bytes - 1, &layout));
     large[0] = large[4] = tensor(1, 0x400000, 1, 1);
     CHECK(!htp_affine_f32_validate(large.data(), 10, UINT64_MAX, &layout));
     large = {tensor(0x400000, 1, 1, 1), tensor(0x400000, 1, 1, 1),
              tensor(0x400000, 1, 1, 1), smallest, tensor(0x400000, 1, 1, 1)};
     CHECK(!htp_affine_f32_validate(large.data(), 10, UINT64_MAX, &layout));
+    // Exhaustively check every row/tile read and exact output interval for
+    // representative frequency/time tails, including the final physical row.
+    for (uint32_t f : {1u, 2u, 3u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, 128u, 129u}) {
+        for (uint32_t t : {1u, 2u, 3u, 31u, 32u, 33u, 63u, 64u, 65u}) {
+            std::array<htp_affine_f32_tensor, 5> tails = {
+                tensor(f, t, 3, 2), tensor(f, 3, 1, 1), tensor(f, 3, 1, 1),
+                tensor(3, 1, 1, 1), tensor(f, t, 3, 2)};
+            CHECK(htp_affine_f32_validate(tails.data(), 6, 1 << 20, &layout));
+            CHECK(layout.padded_vector_reads == 1 && layout.threads == 6);
+            const uint64_t elements = uint64_t{f} * t;
+            CHECK(layout.plane_floats == (elements + 62) / 32 * 32);
+            CHECK(layout.plane_floats - elements >= 31 && layout.plane_floats - elements <= 62);
+            const uint64_t zero_begin = elements / 32 * 32;
+            CHECK(layout.plane_floats - zero_begin == 32 || layout.plane_floats - zero_begin == 64);
+            for (uint32_t row = 0; row < t; ++row) {
+                for (uint32_t start = 0; start < f; start += 32) {
+                    const uint64_t at = uint64_t{row} * f + start;
+                    const uint64_t valid = f - start < 32 ? f - start : 32;
+                    CHECK(at + 32 <= layout.plane_floats); // Complete private input vector.
+                    CHECK(at + valid <= elements);        // Exact output/DDR DMA interval.
+                    const uint64_t aligned_store_end = (at * 4 + valid * 4 + 127) / 128 * 128;
+                    CHECK(aligned_store_end <= uint64_t{layout.plane_floats} * 4);
+                }
+            }
+            // Keep BF's acceptance, minimum budget and six-worker parallelism.
+            const uint32_t old_plane = (f * t + 31) / 32 * 32;
+            const uint32_t old_worker = 2 * (((f + 31) / 32 * 32) + old_plane) * 4 + 256;
+            CHECK(htp_affine_f32_validate(tails.data(), 6, 6 * old_worker, &layout));
+            CHECK(layout.threads == 6 && layout.worker_bytes == old_worker);
+            CHECK(htp_affine_f32_validate(tails.data(), 6, old_worker, &layout));
+            CHECK(layout.threads == 1 && layout.worker_bytes == old_worker);
+            CHECK(!htp_affine_f32_validate(tails.data(), 6, old_worker - 1, &layout));
+        }
+    }
     std::puts("affine/PReLU F32 layout, span, shape, alias, VTCM and overflow guards: PASS");
     std::puts("affine/PReLU whole-plane DMA bounds, padded storage and VTCM worker fitting: PASS");
+    std::puts("affine/PReLU padded vector tails, bounded stores and no-overread fallback: PASS");
     return 0;
 }
