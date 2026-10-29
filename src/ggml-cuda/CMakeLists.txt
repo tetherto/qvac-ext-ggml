@@ -26,6 +26,14 @@ if (CUDAToolkit_FOUND)
         #     for best performance and to also build real architectures for the most commonly used GPUs.
         if (GGML_NATIVE AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.6" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
             set(CMAKE_CUDA_ARCHITECTURES "native")
+        elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13" AND
+                CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+            # Match the CUDA 13 arm64 package: Spark only, to bound npm package size.
+            set(CMAKE_CUDA_ARCHITECTURES 121a-real)
+        elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13" AND
+                CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+            # Match qvac-fabric's x64 package; SM8x has cubins and Spark is arm64 only.
+            set(CMAKE_CUDA_ARCHITECTURES 75-virtual 80-real 86-real 89-real 90-virtual 120a-real)
         else()
             if (CUDAToolkit_VERSION VERSION_LESS "13")
                 list(APPEND CMAKE_CUDA_ARCHITECTURES 50-virtual 61-virtual 70-virtual)
