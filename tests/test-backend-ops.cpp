@@ -8952,6 +8952,40 @@ struct test_concat : public test_case {
     }
 };
 
+// Small-row CONCATs used by LavaSR GRUs. Distinct source offsets and row
+// padding exercise both the bounded packed path and the existing fallback.
+struct test_concat_pack_htp_f32 : public test_case {
+    const int case_id;
+    const std::array<int64_t, 4> ne;
+    const bool offset;
+    const int fallback; // 1=padded source rows, 2=unequal input widths.
+
+    test_concat_pack_htp_f32(int id, std::array<int64_t, 4> ne, bool offset = false, int fallback = 0)
+        : case_id(id), ne(ne), offset(offset), fallback(fallback) {}
+
+    std::string vars() override {
+        return "suite=hexagon_concat_packed_f32," + VARS_TO_STR4(case_id, ne, offset, fallback);
+    }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto input = [&](int64_t width, bool padded, size_t offset_words, const char * name) {
+            const size_t row_bytes = size_t(width + (padded ? 1 : 0)) * sizeof(float);
+            const size_t plane_bytes = row_bytes * ne[1], batch_bytes = plane_bytes * ne[2];
+            ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                int64_t(batch_bytes * ne[3] / sizeof(float) + offset_words));
+            ggml_set_name(storage, name);
+            return ggml_view_4d(ctx, storage, width, ne[1], ne[2], ne[3], row_bytes, plane_bytes,
+                                batch_bytes, offset_words * sizeof(float));
+        };
+        ggml_tensor * a = input(ne[0], fallback == 1, offset ? 1 : 0, "left");
+        ggml_tensor * b = input(ne[0] + (fallback == 2 ? 1 : 0), false, offset ? 3 : 0, "right");
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_format_name(out, "hexagon_concat_packed_%d", case_id);
+        return out;
+    }
+};
+
 // Bounded subsampler regressions, independently selectable with
 // -p speech_hotspot=. Keep the arithmetic reference in the CPU backend.
 struct test_speech_hotspot_matmul : public test_mul_mat {
@@ -14630,6 +14664,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // inplace with an offset
         test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
+    }
+
+    {
+        int case_id = 0;
+        for (int64_t width : {4, 8, 16}) {
+            for (int64_t rows : {1, 5, 7, 8, 9, 31, 32, 33}) {
+                for (bool offset : {false, true}) {
+                    test_cases.emplace_back(new test_concat_pack_htp_f32(case_id++, {width, rows, 1, 1}, offset));
+                }
+            }
+        }
+        for (auto ne : {std::array<int64_t, 4>{4, 441, 33, 1}, {8, 231, 63, 1},
+                        {8, 441, 33, 1}, {4, 441, 9, 1}}) {
+            test_cases.emplace_back(new test_concat_pack_htp_f32(case_id++, ne, true));
+        }
+        for (int64_t width : {4, 8, 16}) {
+            for (int fallback : {1, 2}) {
+                test_cases.emplace_back(new test_concat_pack_htp_f32(case_id++, {width, 33, 3, 2}, true, fallback));
+            }
+        }
     }
 
     for (int v : { 0, 1, 2, 3 }) {

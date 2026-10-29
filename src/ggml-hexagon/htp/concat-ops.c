@@ -7,7 +7,54 @@
 #include "htp-vtcm.h"
 #include "hvx-utils.h"
 #include "hex-fastdiv.h"
+#include "concat-pack-guards.h"
 #include <string.h>
+
+_Static_assert(HTP_CONCAT_PACK_F32_TYPE == HTP_TYPE_F32, "packed CONCAT F32 protocol type mismatch");
+
+struct htp_concat_pack_context {
+    const struct htp_ops_context * octx;
+    struct htp_concat_pack_layout layout;
+};
+
+static struct htp_concat_pack_tensor concat_pack_tensor(const struct htp_tensor * t) {
+    struct htp_concat_pack_tensor result = {.size = t->size, .address = t->data, .type = t->type};
+    for (int i = 0; i < 4; ++i) {
+        result.ne[i] = t->ne[i];
+        result.nb[i] = t->nb[i];
+    }
+    return result;
+}
+
+// Interleave whole small rows from two input vectors. All vector accesses are
+// full, in-bounds 128-byte blocks; scalar tails stop at the worker boundary.
+static void concat_packed_f32(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_concat_pack_context * c = (const struct htp_concat_pack_context *)data;
+    const uint32_t width = c->layout.row_elements, group = c->layout.rows_per_vector;
+    const uint32_t * a = (const uint32_t *)(uintptr_t)c->octx->src[0]->data;
+    const uint32_t * b = (const uint32_t *)(uintptr_t)c->octx->src[1]->data;
+    uint32_t * d = (uint32_t *)(uintptr_t)c->octx->dst->data;
+    uint32_t row, end;
+    htp_concat_pack_rows(&c->layout, ith, &row, &end);
+    for (; end - row >= group; row += group) {
+        const HVX_Vector va = *(const HVX_UVector *)(a + (size_t)row * width);
+        const HVX_Vector vb = *(const HVX_UVector *)(b + (size_t)row * width);
+        const HVX_VectorPair packed = Q6_W_vshuff_VVR(vb, va, -(int)(width * sizeof(float)));
+        uint8_t * destination = (uint8_t *)(d + (size_t)row * 2 * width);
+        *(HVX_UVector *)destination = Q6_V_lo_W(packed);
+        *(HVX_UVector *)(destination + 128) = Q6_V_hi_W(packed);
+    }
+    for (; row < end; ++row) {
+        volatile uint32_t * destination = d + (size_t)row * 2 * width;
+        const volatile uint32_t * left = a + (size_t)row * width;
+        const volatile uint32_t * right = b + (size_t)row * width;
+        for (uint32_t lane = 0; lane < width; ++lane) {
+            destination[lane] = left[lane];
+            destination[width + lane] = right[lane];
+        }
+    }
+    (void)nth;
+}
 
 struct htp_concat_context {
     struct htp_ops_context * octx;
@@ -271,6 +318,14 @@ int op_concat(struct htp_ops_context * octx) {
     int dim = octx->op_params[0];
 
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+        return HTP_STATUS_OK;
+    }
+
+    const struct htp_concat_pack_tensor packed_a = concat_pack_tensor(src0), packed_b = concat_pack_tensor(src1),
+                                        packed_d = concat_pack_tensor(dst);
+    struct htp_concat_pack_context packed = {.octx = octx};
+    if (htp_concat_pack_plan(&packed_a, &packed_b, &packed_d, dim, octx->n_threads, &packed.layout)) {
+        worker_pool_run_func(octx->ctx->worker_pool, concat_packed_f32, &packed, packed.layout.threads);
         return HTP_STATUS_OK;
     }
 

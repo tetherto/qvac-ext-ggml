@@ -630,6 +630,11 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_include_directories(${TEST_TARGET} PRIVATE ../src/ggml-hexagon/htp)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
+set(TEST_TARGET test-hexagon-concat-pack-guards)
+add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+target_include_directories(${TEST_TARGET} PRIVATE ../src/ggml-hexagon/htp)
+add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+
 set(TEST_TARGET test-hexagon-affine-prelu-guards)
 add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_include_directories(${TEST_TARGET} PRIVATE ../src/ggml-hexagon/htp)
