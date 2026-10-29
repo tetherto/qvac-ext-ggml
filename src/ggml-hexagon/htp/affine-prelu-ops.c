@@ -20,6 +20,12 @@ static HVX_Vector load_tile(const float * source, uint32_t valid, float * scratc
     return hvx_vmem(scratch);
 }
 
+static void enqueue_copy(dma_queue * queue, void * destination, const void * source, uint32_t bytes) {
+    while (!dma_queue_push_single_1d(queue, dma_make_ptr(destination, source), bytes)) {
+        dma_queue_flush(queue);
+    }
+}
+
 static void affine_thread(unsigned int nth, unsigned int ith, void * data) {
     const struct htp_affine_f32_context * context = (const struct htp_affine_f32_context *)data;
     const struct htp_affine_f32_layout * l = &context->layout;
@@ -29,33 +35,52 @@ static void affine_thread(unsigned int nth, unsigned int ith, void * data) {
     const float * ab = (const float *)(uintptr_t)octx->src[2]->data;
     const float * slopes = (const float *)(uintptr_t)octx->src[3]->data;
     float * output = (float *)(uintptr_t)octx->dst->data;
-    float * scratch = (float *)(octx->ctx->vtcm_base + (size_t)ith * HTP_AFFINE_F32_WORKER_BYTES);
+    float * staged_weight = (float *)(octx->ctx->vtcm_base + (size_t)ith * l->worker_bytes);
+    float * staged_bias = staged_weight + l->coefficient_floats;
+    float * staged_input = staged_bias + l->coefficient_floats;
+    float * staged_output = staged_input + l->plane_floats;
+    float * scratch = staged_output + l->plane_floats;
+    dma_queue * queue = octx->ctx->dma[ith];
+    dma_queue_flush(queue);
     const HVX_Vector zero = Q6_V_vzero();
-    for (uint32_t job = ith; job < l->jobs; job += nth) {
-        const uint32_t start = job % l->tiles * HTP_AFFINE_F32_LANES;
-        const uint32_t plane = job / l->tiles;
+    for (uint32_t plane = ith; plane < l->jobs; plane += nth) {
         const uint32_t channel = plane % l->c;
-        const uint32_t valid = l->f - start < HTP_AFFINE_F32_LANES ? l->f - start : HTP_AFFINE_F32_LANES;
-        const HVX_Vector weight = load_tile(aw + (size_t)channel * l->f + start, valid, scratch);
-        const HVX_Vector bias = load_tile(ab + (size_t)channel * l->f + start, valid, scratch + 32);
-        const HVX_Vector slope = hvx_vec_splat_f32(slopes[channel]);
-        for (uint32_t t = 0; t < l->t; ++t) {
-            const size_t offset = ((size_t)plane * l->t + t) * l->f + start;
-            const HVX_Vector value = load_tile(x + offset, valid, scratch + 64);
-            // Match the existing CPU and seven-op F32 graph rounding order.
-            const HVX_Vector relu = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(value, zero), value, zero);
-            const HVX_Vector negative = hvx_vec_sub_f32_f32(value, relu);
-            const HVX_Vector prelu = hvx_vec_add_f32_f32(relu, hvx_vec_mul_f32_f32(slope, negative));
-            const HVX_Vector affine = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(value, weight), bias);
-            const HVX_Vector result = hvx_vec_add_f32_f32(affine, prelu);
-            if (valid == HTP_AFFINE_F32_LANES) {
-                hvx_vmemu(output + offset) = result;
-            } else {
-                hvx_vmem(scratch + 96) = result;
-                memcpy(output + offset, scratch + 96, valid * sizeof(float));
+        const size_t plane_offset = (size_t)plane * l->f * l->t;
+        // Stage only valid source bytes. Zero the padded coefficient lanes so
+        // every weight/bias vector can be loaded directly from aligned VTCM.
+        memset(staged_weight, 0, 2 * l->coefficient_floats * sizeof(float));
+        enqueue_copy(queue, staged_weight, aw + (size_t)channel * l->f, l->f * sizeof(float));
+        enqueue_copy(queue, staged_bias, ab + (size_t)channel * l->f, l->f * sizeof(float));
+        enqueue_copy(queue, staged_input, x + plane_offset, l->plane_bytes);
+        enqueue_copy(queue, scratch, slopes + channel, sizeof(float));
+        dma_queue_flush(queue);
+        const HVX_Vector slope = hvx_vec_splat_f32(scratch[0]);
+        for (uint32_t tile = 0; tile < l->tiles; ++tile) {
+            const uint32_t start = tile * HTP_AFFINE_F32_LANES;
+            const uint32_t valid = l->f - start < HTP_AFFINE_F32_LANES ? l->f - start : HTP_AFFINE_F32_LANES;
+            const HVX_Vector weight = hvx_vmem(staged_weight + start);
+            const HVX_Vector bias = hvx_vmem(staged_bias + start);
+            for (uint32_t t = 0; t < l->t; ++t) {
+                const size_t offset = (size_t)t * l->f + start;
+                const HVX_Vector value = load_tile(staged_input + offset, valid, scratch);
+                // Match the existing CPU and seven-op F32 graph rounding order.
+                const HVX_Vector relu = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VsfVsf(value, zero), value, zero);
+                const HVX_Vector negative = hvx_vec_sub_f32_f32(value, relu);
+                const HVX_Vector prelu = hvx_vec_add_f32_f32(relu, hvx_vec_mul_f32_f32(slope, negative));
+                const HVX_Vector affine = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(value, weight), bias);
+                const HVX_Vector result = hvx_vec_add_f32_f32(affine, prelu);
+                if (valid == HTP_AFFINE_F32_LANES) {
+                    hvx_vmemu(staged_output + offset) = result;
+                } else {
+                    hvx_vmem(scratch + 32) = result;
+                    memcpy(staged_output + offset, scratch + 32, valid * sizeof(float));
+                }
             }
         }
+        enqueue_copy(queue, output + plane_offset, staged_output, l->plane_bytes);
+        dma_queue_flush(queue);
     }
+    dma_queue_flush(queue);
 }
 
 int op_affine_prelu(struct htp_ops_context * octx) {
@@ -82,6 +107,14 @@ int op_affine_prelu(struct htp_ops_context * octx) {
     struct htp_affine_f32_context context = {.octx = octx};
     if (!htp_affine_f32_validate(tensors, octx->n_threads, octx->ctx->vtcm_size, &context.layout)) {
         return HTP_STATUS_INVAL_PARAMS;
+    }
+    if (context.layout.total_bytes > UINTPTR_MAX - (uintptr_t)octx->ctx->vtcm_base) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+    for (uint32_t i = 0; i < context.layout.threads; ++i) {
+        if (!octx->ctx->dma[i]) {
+            return HTP_STATUS_INVAL_PARAMS;
+        }
     }
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
         return HTP_STATUS_OK;

@@ -7,7 +7,9 @@
 
 #define HTP_AFFINE_F32_TYPE 0u
 #define HTP_AFFINE_F32_LANES 32u
-#define HTP_AFFINE_F32_WORKER_BYTES (4u * 128u)
+#define HTP_AFFINE_F32_TAIL_BYTES (2u * 128u)
+// A 1D DMA descriptor has a 24-bit byte count on every supported DSP.
+#define HTP_AFFINE_F32_DMA_MAX_BYTES 0xffffffu
 
 struct htp_affine_f32_tensor {
     uint64_t ne[4], nb[4], size, address;
@@ -16,6 +18,7 @@ struct htp_affine_f32_tensor {
 
 struct htp_affine_f32_layout {
     uint32_t f, t, c, b, tiles, jobs, threads;
+    uint32_t coefficient_floats, plane_floats, plane_bytes, worker_bytes, total_bytes;
 };
 
 static inline bool htp_affine_f32_tensor_bytes(const struct htp_affine_f32_tensor * tensor, uint64_t * bytes) {
@@ -73,13 +76,35 @@ static inline bool htp_affine_f32_validate(const struct htp_affine_f32_tensor te
         }
     }
     const uint64_t tiles = (x[0] + HTP_AFFINE_F32_LANES - 1) / HTP_AFFINE_F32_LANES;
-    const uint64_t jobs = tiles * x[2] * x[3]; // <= elements, already bounded by tensor_bytes
-    const uint64_t threads = jobs < max_threads ? jobs : max_threads;
-    if (!jobs || jobs > UINT32_MAX || threads * HTP_AFFINE_F32_WORKER_BYTES > vtcm_bytes) {
+    // Assign complete channel/batch planes to workers. Coefficients and each
+    // contiguous F*T plane have independent 128-byte-aligned VTCM regions.
+    const uint64_t jobs = x[2] * x[3]; // <= elements, already bounded by tensor_bytes
+    const uint64_t plane_elements = x[0] * x[1];
+    const uint64_t coefficient_floats = tiles * HTP_AFFINE_F32_LANES;
+    const uint64_t plane_floats = (plane_elements + HTP_AFFINE_F32_LANES - 1) /
+                                  HTP_AFFINE_F32_LANES * HTP_AFFINE_F32_LANES;
+    const uint64_t plane_bytes = plane_elements * sizeof(float);
+    const uint64_t coefficient_bytes = x[0] * sizeof(float);
+    const uint64_t worker_bytes = 2 * (coefficient_floats + plane_floats) * sizeof(float) +
+                                  HTP_AFFINE_F32_TAIL_BYTES;
+    if (!jobs || jobs > UINT32_MAX || coefficient_bytes > HTP_AFFINE_F32_DMA_MAX_BYTES ||
+        plane_bytes > HTP_AFFINE_F32_DMA_MAX_BYTES || worker_bytes > UINT32_MAX) {
+        return false;
+    }
+    const uint64_t budget = vtcm_bytes < UINT32_MAX ? vtcm_bytes : UINT32_MAX;
+    const uint64_t fit_threads = budget / worker_bytes;
+    uint64_t threads = jobs < max_threads ? jobs : max_threads;
+    if (threads > fit_threads) {
+        threads = fit_threads;
+    }
+    if (!threads) {
         return false;
     }
     const struct htp_affine_f32_layout result = {(uint32_t)x[0], (uint32_t)x[1], (uint32_t)x[2], (uint32_t)x[3],
-                                                 (uint32_t)tiles, (uint32_t)jobs, (uint32_t)threads};
+                                                 (uint32_t)tiles, (uint32_t)jobs, (uint32_t)threads,
+                                                 (uint32_t)coefficient_floats, (uint32_t)plane_floats,
+                                                 (uint32_t)plane_bytes, (uint32_t)worker_bytes,
+                                                 (uint32_t)(threads * worker_bytes)};
     *layout = result;
     return true;
 }
