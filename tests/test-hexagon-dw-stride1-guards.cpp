@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 
 #define CHECK(value)                                                                                                   \
@@ -63,5 +64,46 @@ int main() {
                 }
             }
     std::puts("Depthwise KW3/KW5 stride1 selection/window/tap guards passed");
+    // Independently compare the full-vector/remainder copy plan with an exact
+    // byte-copy oracle. Redzones and per-chunk intervals cover partial rows,
+    // unaligned starts and the 31/32/33 and 63/64 element boundaries.
+    bool saw_vector = false, saw_remainder = false, saw_empty = false;
+    for (uint32_t width : {1u, 2u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, 128u, 129u}) {
+        std::array<uint32_t, 131> input;
+        input.fill(0xdeadbeefu);
+        for (uint32_t i = 0; i < width; ++i) {
+            input[i + 1] = i % 7 ? 0x3f800000u + i : 0x80000000u;
+        }
+        for (uint32_t span : {1u, 2u, 3u, 31u, 32u, 33u, 35u, 36u, 63u, 64u}) {
+            for (int64_t ix : {-65, -64, -63, -33, -32, -31, -5, -4, -2, -1, 0, 1, 2, 3,
+                               31, 32, 33, 63, 64, 65, 96, 127, 128, 129, 130}) {
+                uint32_t source, target, count;
+                htp_conv_dw_stride1_window(width, ix, span, &source, &target, &count);
+                CHECK(source + count <= width && target + count <= 64);
+                std::array<uint32_t, 66> actual = {}, expected = {};
+                actual[0] = expected[0] = 0x13579bdfu;
+                actual[65] = expected[65] = 0x2468ace0u;
+                std::memcpy(expected.data() + 1 + target, input.data() + 1 + source, count * sizeof(uint32_t));
+                uint32_t copied = 0;
+                for (; count - copied >= 32; copied += 32) {
+                    CHECK(source + copied + 32 <= width);
+                    CHECK(target + copied + 32 <= 64);
+                    std::memcpy(actual.data() + 1 + target + copied, input.data() + 1 + source + copied, 128);
+                    saw_vector = true;
+                }
+                for (; copied < count; ++copied) {
+                    CHECK(source + copied < width && target + copied < 64);
+                    actual[1 + target + copied] = input[1 + source + copied];
+                    saw_remainder = true;
+                }
+                saw_empty |= count == 0;
+                CHECK(actual == expected);
+                CHECK(actual[0] == 0x13579bdfu && actual[65] == 0x2468ace0u);
+                CHECK(input[0] == 0xdeadbeefu && input[width + 1] == 0xdeadbeefu);
+            }
+        }
+    }
+    CHECK(saw_vector && saw_remainder && saw_empty);
+    std::puts("Depthwise stride1 inline vector/remainder copy bounds and bit-preserving tails passed");
     return 0;
 }

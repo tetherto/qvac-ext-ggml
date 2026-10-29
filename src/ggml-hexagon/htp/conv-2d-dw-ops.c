@@ -269,6 +269,24 @@ static void conv_dw_planar_stride2_kw3_row(const struct htp_ops_context *octx, u
     }
 }
 
+static inline __attribute__((always_inline)) void conv_dw_copy_f32_bounded(float *destination, const float *source,
+                                                                          uint32_t count) {
+    // Copy a vector only when all 32 source/destination floats belong to the
+    // already validated row window. The remainder must not become a library
+    // call that spills the live convolution accumulator inside the KY loop.
+    while (count >= VLEN_FP32) {
+        hvx_vmemu(destination) = hvx_vmemu(source);
+        destination += VLEN_FP32;
+        source += VLEN_FP32;
+        count -= VLEN_FP32;
+    }
+    volatile float *tail_destination = destination;
+    const volatile float *tail_source = source;
+    for (uint32_t i = 0; i < count; ++i) {
+        tail_destination[i] = tail_source[i];
+    }
+}
+
 // Width-contiguous F32: a narrow row used to rebuild32 scalar samples for
 // each padded tap, then compute the final output positions one at a time.
 // Reuse a bounded two-vector window across all three/five horizontal taps.
@@ -299,15 +317,19 @@ static void conv_dw_planar_stride1_kw35_row(const struct htp_ops_context *octx, 
                 uint32_t source, target, count;
                 htp_conv_dw_stride1_window(x->ne[0], ix, lanes + k->ne[0] - 1, &source, &target, &count);
                 if (count) {
-                    memcpy(tile + target, conv_dw_input(x, source, iy, c, n), count * sizeof(float));
+                    conv_dw_copy_f32_bounded(tile + target, conv_dw_input(x, source, iy, c, n), count);
                 }
                 lo = ((const HVX_Vector *)tile)[0];
                 hi = ((const HVX_Vector *)tile)[1];
             }
             for (uint32_t kx = 0; kx < k->ne[0]; ++kx) {
                 const HVX_Vector values = Q6_V_valign_VVR(hi, lo, kx * sizeof(float));
-                const HVX_Vector weight = hvx_vec_splat_f32(conv_dw_weight(k, kx, ky, c));
-                // IEEE F32 between taps also keeps zero/padded windows safe.
+                // Eligibility guarantees F32 weights here. Keep their original
+                // strides without a dormant F16 conversion/call path.
+                const uint8_t *weight_pointer = (const uint8_t *)k->data +
+                                                kx * k->nb[0] + ky * k->nb[1] + c * k->nb[3];
+                const HVX_Vector weight = hvx_vec_splat_f32(*(const float *)weight_pointer);
+                // Keep the same F32 tap expression and zero-padded window behavior.
                 sum = hvx_vec_add_f32_f32(sum, hvx_vec_mul_f32_f32(values, weight));
             }
         }
