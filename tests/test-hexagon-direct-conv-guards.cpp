@@ -163,6 +163,65 @@ int main() {
     x = tensor(3, 3, 512, 1);
     y = tensor(1, 1, 512, 1);
     CHECK(!valid()); // Valid tensor spans but padded weights exceed VTCM.
+
+    htp_conv_f32_pointwise_layout staged;
+    CHECK(!htp_conv_f32_plan_pointwise(nullptr, UINT64_MAX, &staged));
+    CHECK(!htp_conv_f32_plan_pointwise(&layout, UINT64_MAX, nullptr));
+    for (uint32_t plane : {1u, 2u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, 128u, 129u, 2079u, 4095u}) {
+        for (uint32_t ci : {1u, 3u, 6u, 16u}) for (uint32_t co : {1u, 3u, 4u, 5u, 6u, 12u, 16u})
+            for (uint32_t batches : {1u, 2u, 7u}) {
+                auto kernel = tensor(1, 1, ci, co), input = tensor(plane, 1, ci, batches);
+                auto output = tensor(plane, 1, co, batches);
+                CHECK(htp_conv_f32_validate(&kernel, &input, &output, p, 6, 8 * 1024 * 1024, &layout));
+                CHECK(htp_conv_f32_plan_pointwise(&layout, 8 * 1024 * 1024, &staged));
+                const uint32_t tiles = (plane + 31) / 32;
+                CHECK(staged.jobs == tiles * batches);
+                CHECK(staged.threads == (staged.jobs < layout.threads ? staged.jobs : layout.threads));
+                CHECK(staged.input_bytes == ci * 128 && staged.worker_bytes == ci * 128 + 512);
+                CHECK(staged.total_bytes == layout.weights_bytes + staged.threads * staged.worker_bytes);
+                CHECK(staged.input_bytes % 128 == 0 && staged.worker_bytes % 128 == 0);
+                CHECK(htp_conv_f32_plan_pointwise(&layout, staged.total_bytes, &staged));
+                CHECK(!htp_conv_f32_plan_pointwise(&layout, staged.total_bytes - 1, &staged));
+                for (uint32_t n = 0; n < batches; ++n) for (uint32_t tile : {0u, tiles / 2, tiles - 1}) {
+                    const uint32_t start = tile * 32, lanes = plane - start < 32 ? plane - start : 32;
+                    CHECK(lanes > 0 && lanes <= 32 && start + lanes <= plane);
+                    for (uint32_t c = 0; c < ci; ++c) {
+                        const uint64_t first = ((uint64_t)n * ci + c) * plane + start;
+                        CHECK((first + lanes) * sizeof(float) <= input.size);
+                        CHECK((uint64_t)c * 128 + lanes * sizeof(float) <= staged.input_bytes);
+                    }
+                    for (uint32_t oc = 0; oc < co; oc += 4) {
+                        const uint32_t channels = co - oc < 4 ? co - oc : 4;
+                        for (uint32_t c = 0; c < channels; ++c) {
+                            const uint64_t first = ((uint64_t)n * co + oc + c) * plane + start;
+                            CHECK((first + lanes) * sizeof(float) <= output.size);
+                            CHECK(c * 128 + lanes * sizeof(float) <= 512);
+                        }
+                    }
+                }
+            }
+    }
+    // A smaller VTCM budget must keep the original accepted raw-DDR route.
+    k = tensor(1, 1, 6, 5); x = tensor(65, 63, 6, 7); y = tensor(65, 63, 5, 7);
+    CHECK(valid());
+    const uint64_t original_budget = layout.total_bytes;
+    CHECK(!htp_conv_f32_plan_pointwise(&layout, original_budget, &staged));
+    CHECK(htp_conv_f32_validate(&k, &x, &y, p, 6, original_budget, &layout));
+    const auto pointwise = layout;
+    for (uint32_t field : {0u, 1u, 2u, 3u}) {
+        auto malformed = pointwise;
+        if (field == 0) malformed.flat_pointwise = false;
+        if (field == 1) malformed.ci = UINT32_MAX;
+        if (field == 2) malformed.tiles = malformed.n = UINT32_MAX;
+        if (field == 3) malformed.weights_bytes = UINT32_MAX;
+        CHECK(!htp_conv_f32_plan_pointwise(&malformed, UINT64_MAX, &staged));
+    }
+    // Large row strides stay exact: dma_queue_copy_rows handles descriptor
+    // field limits with bounded 1-D rows instead of truncating a 2-D stride.
+    k = tensor(1, 1, 1, 1); x = tensor(0x400001, 1, 1, 1); y = tensor(0x400001, 1, 1, 1);
+    CHECK(valid() && (uint64_t)layout.plane * sizeof(float) > 0xffffffu);
+    CHECK(htp_conv_f32_plan_pointwise(&layout, 8 * 1024 * 1024, &staged));
     std::puts("Direct F32 convolution shape/span/layout/padding/VTCM guards passed");
+    std::puts("Direct F32 pointwise DMA jobs, VTCM fallback and bounded channel/tail rows passed");
     return 0;
 }

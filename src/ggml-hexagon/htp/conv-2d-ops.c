@@ -14,6 +14,7 @@ struct htp_conv_f32_context {
     struct htp_conv_f32_layout layout;
     const float * weights;
     uint8_t * scratch;
+    struct htp_conv_f32_pointwise_layout pointwise;
 };
 
 static struct htp_conv_f32_tensor conv_tensor(const struct htp_tensor * t) {
@@ -133,6 +134,63 @@ static void conv_thread(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
+// Keep the same one/four-channel specializations as the original kernel.
+#define DEFINE_POINTWISE_TILE(NAME, CHANNELS)                                                                          \
+    static void NAME(const struct htp_conv_f32_context * g, uint32_t oc, const float * input, float * output) {         \
+        const struct htp_conv_f32_layout * l = &g->layout;                                                             \
+        HVX_Vector sums[CHANNELS];                                                                                     \
+        _Pragma("unroll") for (uint32_t c = 0; c < CHANNELS; ++c) sums[c] = Q6_V_vzero();                              \
+        for (uint32_t ci = 0; ci < l->ci; ++ci) {                                                                      \
+            const HVX_Vector values = hvx_vmem(input + (size_t)ci * HTP_CONV_F32_LANES);                               \
+            _Pragma("unroll") for (uint32_t c = 0; c < CHANNELS; ++c) {                                                \
+                const HVX_Vector weight = hvx_vec_splat_f32(g->weights[ci + (size_t)l->k_elements * (oc + c)]);      \
+                sums[c] = hvx_vec_add_f32_f32(sums[c], hvx_vec_mul_f32_f32(values, weight));                           \
+            }                                                                                                          \
+        }                                                                                                              \
+        _Pragma("unroll") for (uint32_t c = 0; c < CHANNELS; ++c)                                                     \
+            hvx_vmem(output + c * HTP_CONV_F32_LANES) = sums[c];                                                       \
+    }
+
+DEFINE_POINTWISE_TILE(pointwise_tile_one, 1)
+DEFINE_POINTWISE_TILE(pointwise_tile_four, 4)
+#undef DEFINE_POINTWISE_TILE
+
+// Reuse a CI-by-32 spatial tile across every output-channel block. DDR is
+// accessed by bounded DMA rows; all vector loads and stores use private VTCM.
+static void conv_pointwise_thread(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_conv_f32_context * g = (const struct htp_conv_f32_context *)data;
+    const struct htp_conv_f32_layout * l = &g->layout;
+    const struct htp_conv_f32_pointwise_layout * p = &g->pointwise;
+    const float * source = (const float *)(uintptr_t)g->octx->src[1]->data;
+    float * output = (float *)(uintptr_t)g->octx->dst->data;
+    float * staged_input = (float *)(g->scratch + (size_t)ith * p->worker_bytes);
+    float * staged_output = staged_input + p->input_bytes / sizeof(float);
+    dma_queue * queue = g->octx->ctx->dma[ith];
+    dma_queue_flush(queue);
+    for (uint32_t job = ith; job < p->jobs; job += nth) {
+        const uint32_t start = job % l->tiles * HTP_CONV_F32_LANES;
+        const uint32_t n = job / l->tiles;
+        const uint32_t valid = l->out_plane - start < HTP_CONV_F32_LANES ?
+            l->out_plane - start : HTP_CONV_F32_LANES;
+        if (valid < HTP_CONV_F32_LANES) memset(staged_input, 0, p->input_bytes);
+        const float * input = source + (size_t)n * l->ci * l->plane + start;
+        dma_queue_copy_rows(queue, dma_make_ptr(staged_input, input), HTP_CONV_F32_LANES * sizeof(float),
+                            (size_t)l->plane * sizeof(float), valid * sizeof(float), l->ci);
+        for (uint32_t oc = 0; oc < l->co; oc += HTP_CONV_F32_OC_BLOCK) {
+            const uint32_t valid_oc = l->co - oc < HTP_CONV_F32_OC_BLOCK ? l->co - oc : HTP_CONV_F32_OC_BLOCK;
+            if (valid_oc == 1) {
+                pointwise_tile_one(g, oc, staged_input, staged_output);
+            } else {
+                pointwise_tile_four(g, oc, staged_input, staged_output);
+            }
+            float * destination = output + ((size_t)n * l->co + oc) * l->out_plane + start;
+            dma_queue_copy_rows(queue, dma_make_ptr(destination, staged_output), (size_t)l->out_plane * sizeof(float),
+                                HTP_CONV_F32_LANES * sizeof(float), valid * sizeof(float), valid_oc);
+        }
+    }
+    dma_queue_flush(queue);
+}
+
 int op_conv_2d(struct htp_ops_context * octx) {
     if (!octx || !octx->ctx || !octx->src[0] || !octx->src[1] || octx->src[2] || !octx->dst || !octx->src[0]->data ||
         !octx->src[1]->data || !octx->dst->data || !octx->ctx->vtcm_base || (uintptr_t)octx->ctx->vtcm_base % 128) {
@@ -150,6 +208,15 @@ int op_conv_2d(struct htp_ops_context * octx) {
     memcpy(weights, (const void *)(uintptr_t)octx->src[0]->data, layout.kernel_bytes);
     struct htp_conv_f32_context context = {
         .octx = octx, .layout = layout, .weights = weights, .scratch = octx->ctx->vtcm_base + layout.weights_bytes};
-    worker_pool_run_func(octx->ctx->worker_pool, conv_thread, &context, layout.threads);
+    bool staged = htp_conv_f32_plan_pointwise(&layout, octx->ctx->vtcm_size, &context.pointwise);
+    if (staged) {
+        staged = context.pointwise.total_bytes <= UINTPTR_MAX - (uintptr_t)octx->ctx->vtcm_base;
+        for (uint32_t i = 0; staged && i < context.pointwise.threads; ++i) staged = octx->ctx->dma[i] != NULL;
+    }
+    if (staged) {
+        worker_pool_run_func(octx->ctx->worker_pool, conv_pointwise_thread, &context, context.pointwise.threads);
+    } else {
+        worker_pool_run_func(octx->ctx->worker_pool, conv_thread, &context, layout.threads);
+    }
     return HTP_STATUS_OK;
 }

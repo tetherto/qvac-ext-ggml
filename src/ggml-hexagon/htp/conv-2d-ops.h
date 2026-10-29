@@ -24,6 +24,10 @@ struct htp_conv_f32_layout {
     bool flat_pointwise;
 };
 
+struct htp_conv_f32_pointwise_layout {
+    uint32_t jobs, threads, input_bytes, worker_bytes, total_bytes;
+};
+
 static inline bool htp_conv_f32_span_fits(uint64_t address, uint64_t bytes, uint64_t limit) {
     return address <= limit && bytes <= limit - address;
 }
@@ -136,6 +140,29 @@ static inline bool htp_conv_f32_validate(const struct htp_conv_f32_tensor * k, c
                                                (uint32_t)total,
                                                flat};
     *out = layout;
+    return true;
+}
+
+// Optional acceleration plan. A false result retains the existing convolution
+// kernel and does not change the host's supported-operation predicate.
+static inline bool htp_conv_f32_plan_pointwise(const struct htp_conv_f32_layout * l, uint64_t vtcm_bytes,
+                                               struct htp_conv_f32_pointwise_layout * out) {
+    if (!l || !out || !l->flat_pointwise || !l->ci || !l->co || !l->n || !l->tiles ||
+        !l->threads || l->threads > 10) {
+        return false;
+    }
+    const uint64_t jobs = (uint64_t)l->tiles * l->n;
+    const uint64_t threads = jobs < l->threads ? jobs : l->threads;
+    const uint64_t input_bytes = (uint64_t)l->ci * HTP_CONV_F32_LANES * sizeof(float);
+    const uint64_t worker_bytes = input_bytes + HTP_CONV_F32_OC_BLOCK * HTP_CONV_F32_LANES * sizeof(float);
+    const uint64_t total_bytes = l->weights_bytes + threads * worker_bytes;
+    if (!jobs || jobs > UINT32_MAX || input_bytes > UINT32_MAX || worker_bytes > UINT32_MAX ||
+        total_bytes > UINT32_MAX || total_bytes > vtcm_bytes) {
+        return false;
+    }
+    const struct htp_conv_f32_pointwise_layout result = {(uint32_t)jobs, (uint32_t)threads, (uint32_t)input_bytes,
+                                                         (uint32_t)worker_bytes, (uint32_t)total_bytes};
+    *out = result;
     return true;
 }
 
