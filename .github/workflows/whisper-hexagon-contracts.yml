@@ -12,6 +12,7 @@ on:
       - 'tests/test-backend-memory.cpp'
       - 'tests/test-unified-memory-props.cpp'
       - 'tests/test-hexagon-mul-mat-buffer.cpp'
+      - 'tests/test-hexagon-shared-buffer.cpp'
       - 'tests/test-hexagon-runtime-info.cpp'
       - 'tests/test-hexagon-runtime-info-device.cpp'
       - 'tests/CMakeLists.txt'
@@ -71,14 +72,14 @@ jobs:
         run: |
           cmake --build build-contracts --config Release --parallel 4 \
             --target test-backend-buffer-size test-backend-memory \
-            test-unified-memory-props test-hexagon-mul-mat-buffer \
+            test-unified-memory-props test-hexagon-mul-mat-buffer test-hexagon-shared-buffer \
             2>&1 | tee build.log
 
       - name: Run host regressions and explicitly skipped HTP fixtures
         id: tests
         run: |
           ctest --test-dir build-contracts -C Release \
-            -R '^(test-backend-buffer-size|test-backend-memory|test-unified-memory-props|test-hexagon-mul-mat-buffer(-nohostbuf)?)$' \
+            -R '^(test-backend-buffer-size|test-backend-memory|test-unified-memory-props|test-hexagon-shared-buffer|test-hexagon-mul-mat-buffer(-nohostbuf)?)$' \
             --verbose --output-on-failure --no-tests=error --timeout 600 \
             --output-junit contracts.xml 2>&1 | tee ctest.log
 
@@ -91,7 +92,7 @@ jobs:
           import xml.etree.ElementTree as ET
 
           cases = {t.attrib['name']: t for t in ET.parse('build-contracts/contracts.xml').iter('testcase')}
-          host = ['test-backend-buffer-size', 'test-backend-memory', 'test-unified-memory-props']
+          host = ['test-backend-buffer-size', 'test-backend-memory', 'test-unified-memory-props', 'test-hexagon-shared-buffer']
           device = ['test-hexagon-mul-mat-buffer', 'test-hexagon-mul-mat-buffer-nohostbuf']
           lines = []
           bad = []
