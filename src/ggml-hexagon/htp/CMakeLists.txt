@@ -27,6 +27,8 @@ add_library(${HTP_LIB} SHARED
     binary-ops.c
     unary-ops.c
     sum-rows-ops.c
+    mean-ops.c
+    energy-ops.c
     softmax-ops.c
     act-ops.c
     rope-ops.c
@@ -52,6 +54,9 @@ add_library(${HTP_LIB} SHARED
     flash-attn-f32-ops.c
     transpose-ops.c
     depthwise-conv-1d-ops.c
+    gru-ops.c
+    conv-2d-ops.c
+    affine-prelu-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE

@@ -762,6 +762,12 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_SUM_ROWS:
             return op_sum_rows(octx);
 
+        case HTP_OP_MEAN:
+            return op_mean(octx);
+
+        case HTP_OP_ENERGY_MEAN_F32:
+            return op_energy_mean_f32(octx);
+
         case HTP_OP_CPY:
             return op_cpy(octx);
 
@@ -815,6 +821,13 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_CONV_TAPS_F32:
             return op_conv_taps_f32(octx);
+
+        case HTP_OP_GRU:
+            return op_gru(octx);
+        case HTP_OP_CONV_2D:
+            return op_conv_2d(octx);
+        case HTP_OP_AFFINE_PRELU:
+            return op_affine_prelu(octx);
 
         case HTP_OP_CONCAT:
             return op_concat(octx);

@@ -122,6 +122,8 @@ int op_matmul_ffn(struct htp_ops_context * octx);
 int op_binary(struct htp_ops_context * octx);
 int op_unary(struct htp_ops_context * octx);
 int op_sum_rows(struct htp_ops_context * octx);
+int op_mean(struct htp_ops_context * octx);
+int op_energy_mean_f32(struct htp_ops_context * octx);
 int op_activations(struct htp_ops_context * octx);
 int op_softmax(struct htp_ops_context * octx);
 int op_add_id(struct htp_ops_context * octx);
@@ -150,6 +152,9 @@ int op_upscale(struct htp_ops_context * octx);
 int op_flash_attn_ext_f32(struct htp_ops_context * octx);
 int op_depthwise_conv_1d(struct htp_ops_context * octx);
 int op_conv_taps_f32(struct htp_ops_context * octx);
+int op_gru(struct htp_ops_context * octx);
+int op_conv_2d(struct htp_ops_context * octx);
+int op_affine_prelu(struct htp_ops_context * octx);
 
 // Transposes a batch of row-major F32 matrices: dst row c, column r takes
 // source row r, column c. Returns false when the VTCM tiles do not fit.

@@ -4802,6 +4802,22 @@ struct test_gru : public test_case {
     }
 };
 
+struct test_gru_htp_f32 : public test_gru {
+    using test_gru::test_gru;
+
+    std::string vars() override {
+        return "suite=hexagon_gru_f32," + test_gru::vars();
+    }
+};
+
+struct test_gru_htp_packed_f32 : public test_gru {
+    using test_gru::test_gru;
+
+    std::string vars() override {
+        return "suite=hexagon_gru_packed_f32," + test_gru::vars();
+    }
+};
+
 // GGML_OP_ZERO_UPSAMPLE
 struct test_zero_upsample : public test_case {
     const std::array<int64_t, 4> ne;
@@ -4868,6 +4884,59 @@ struct test_affine_prelu : public test_case {
         ggml_tensor * ab    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, f, c);
         ggml_tensor * slope = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c);
         return ggml_affine_prelu(ctx, x, aw, ab, slope);
+    }
+};
+
+// F32 affine/PReLU: unchanged grading, real denoiser shapes and bounded tails.
+struct test_affine_prelu_htp_f32 : public test_affine_prelu {
+    const int case_id;
+    const bool offset;
+    const int pattern; // 0=random, 1=signed dyadic/zeros, 2=zero slope, 3=negative slope.
+
+    test_affine_prelu_htp_f32(int id, int64_t f, int64_t t, int64_t c, int64_t b,
+                               bool offset = false, int pattern = 0)
+        : test_affine_prelu(f, t, c, b), case_id(id), offset(offset), pattern(pattern) {}
+
+    std::string vars() override {
+        return "suite=hexagon_affine_prelu_f32," + VARS_TO_STR3(case_id, offset, pattern) + "," + test_affine_prelu::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const auto tensor = [&](std::array<int64_t, 4> ne, const char * name) {
+            ggml_tensor * result;
+            if (offset) {
+                ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0] * ne[1] * ne[2] * ne[3] + 1);
+                ggml_format_name(storage, "%s_storage", name);
+                result = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], ne[0] * sizeof(float),
+                    ne[0] * ne[1] * sizeof(float), ne[0] * ne[1] * ne[2] * sizeof(float), sizeof(float));
+            } else {
+                result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+            }
+            ggml_set_name(result, name);
+            return result;
+        };
+        ggml_tensor * result = ggml_affine_prelu(ctx, tensor({f, t, c, bc}, "affine_x"),
+            tensor({f, c, 1, 1}, "affine_aw"), tensor({f, c, 1, 1}, "affine_ab"), tensor({c, 1, 1, 1}, "affine_slope"));
+        ggml_format_name(result, "hexagon_affine_prelu_%d", case_id);
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (!pattern) return;
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            const std::string name = ggml_get_name(tensor);
+            if (name.find("affine_") != 0 || name.find("_storage") != std::string::npos) continue;
+            const bool slope = name == "affine_slope";
+            std::vector<float> values(ggml_nelements(tensor));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = (int(i % 17) - 8) * 0.125f;
+                if (i % 19 == 0) values[i] = -0.0f;
+                if (slope && pattern == 2) values[i] = 0.0f;
+                if (slope && pattern == 3) values[i] = -0.25f * (1 + i % 3);
+            }
+            ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+        }
     }
 };
 
@@ -8382,6 +8451,80 @@ struct test_conv_2d : public test_case {
     }
 };
 
+// Bounded direct F32 HTP coverage. Inherit the existing convolution grading.
+struct test_direct_conv_htp_f32 : public test_conv_2d {
+    const int case_id;
+    const bool offset;
+    const int pattern; // 0=random, 1=zero input, 2=zero weights, 3=mixed-sign dyadic.
+
+    test_direct_conv_htp_f32(int id, std::array<int64_t, 4> input, int kernel, int64_t outputs,
+                            std::array<int, 6> p = {1, 1, 0, 0, 1, 1}, bool offset = false, int pattern = 0)
+        : test_conv_2d(input, {kernel, kernel, input[2], outputs}, GGML_TYPE_F32,
+                       p[0], p[1], p[2], p[3], p[4], p[5], false),
+          case_id(id), offset(offset), pattern(pattern) {}
+
+    std::string vars() override {
+        return "suite=hexagon_direct_conv_f32," + VARS_TO_STR3(case_id, offset, pattern) + "," + test_conv_2d::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out;
+        if (!offset) {
+            out = test_conv_2d::build_graph(ctx);
+        } else {
+            const auto view = [&](const std::array<int64_t, 4> & ne, const char * name) {
+                const int64_t elements = ne[0] * ne[1] * ne[2] * ne[3];
+                ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 1);
+                ggml_format_name(storage, "%s_storage", name);
+                ggml_tensor * tensor = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3],
+                    ne[0] * sizeof(float), ne[0] * ne[1] * sizeof(float),
+                    ne[0] * ne[1] * ne[2] * sizeof(float), sizeof(float));
+                ggml_set_name(tensor, name);
+                return tensor;
+            };
+            out = ggml_conv_2d_direct(ctx, view(ne_kernel, "kernel"), view(ne_input, "input"),
+                stride0, stride1, padding0, padding1, dilation0, dilation1);
+        }
+        ggml_format_name(out, "hexagon_direct_conv_%d", case_id);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (!pattern) return;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            const bool zero = (pattern == 1 && name.find("input") != std::string::npos) ||
+                              (pattern == 2 && name.find("kernel") != std::string::npos);
+            if (!zero && pattern != 3) continue;
+            std::vector<float> values(ggml_nelements(t), 0.0f);
+            if (pattern == 3) {
+                const bool kernel = name.find("kernel") != std::string::npos;
+                for (size_t i = 0; i < values.size(); ++i) {
+                    values[i] = kernel ? (int(i % 7) - 3) * 0.0625f : (int(i % 9) - 4) * 0.125f;
+                }
+            }
+            ggml_backend_tensor_set(t, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+};
+
+// Optional eight-OC and spatial-window reuse, with the existing convolution
+// grading and independently named outputs for actual HTP profile association.
+struct test_blocked_conv_htp_f32 : public test_direct_conv_htp_f32 {
+    using test_direct_conv_htp_f32::test_direct_conv_htp_f32;
+
+    std::string vars() override {
+        return "suite=hexagon_blocked_conv_f32," + VARS_TO_STR3(case_id, offset, pattern) + "," + test_conv_2d::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_direct_conv_htp_f32::build_graph(ctx);
+        ggml_format_name(out, "hexagon_blocked_conv_%d", case_id);
+        return out;
+    }
+};
+
 // GGML_OP_CONV_2D_DW
 struct test_conv_2d_dw : public test_case {
     const std::array<int64_t, 4> ne_input;
@@ -8424,6 +8567,101 @@ struct test_conv_2d_dw : public test_case {
             stride, stride, padding, padding, dilation, dilation);
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+// Asymmetric F32 depthwise geometries used by LavaSR. Keep the ordinary CPU
+// reference and grading; the tag selects this bounded suite on real HTP.
+struct test_dw_stride2_htp_f32 : public test_case {
+    const std::array<int64_t, 4> ne_input;
+    const std::array<int64_t, 4> ne_kernel;
+    const std::array<int, 6> params;
+    const bool cwhn;
+    const bool offset;
+    const int pattern; // 0=random, 1=silence, 2=zero weights
+
+    test_dw_stride2_htp_f32(std::array<int64_t, 4> ne, int kw, int kh,
+                           std::array<int, 6> p, bool cwhn = false, bool offset = false, int pattern = 0)
+        : ne_input(ne), ne_kernel({kw, kh, 1, ne[2]}), params(p),
+          cwhn(cwhn), offset(offset), pattern(pattern) {}
+
+    std::string vars() override {
+        return "suite=hexagon_dw_stride2_f32," + VARS_TO_STR6(ne_input, ne_kernel, params, cwhn, offset, pattern);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input;
+        if (offset) {
+            const int64_t elements = ne_input[0] * ne_input[1] * ne_input[2] * ne_input[3];
+            ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, elements + 8);
+            ggml_set_name(storage, "input_storage");
+            input = ggml_view_4d(ctx, storage, ne_input[0], ne_input[1], ne_input[2], ne_input[3],
+                ne_input[0] * sizeof(float), ne_input[0] * ne_input[1] * sizeof(float),
+                ne_input[0] * ne_input[1] * ne_input[2] * sizeof(float), sizeof(float));
+        } else {
+            input = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_input.data());
+        }
+        ggml_set_name(input, "input");
+        ggml_tensor * kernel = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_kernel.data());
+        ggml_set_name(kernel, "kernel");
+        if (cwhn) {
+            input = ggml_cont(ctx, ggml_permute(ctx, input, 1, 2, 0, 3));
+            input = ggml_permute(ctx, input, 2, 0, 1, 3);
+            kernel = ggml_cont(ctx, ggml_permute(ctx, kernel, 2, 3, 1, 0));
+            kernel = ggml_permute(ctx, kernel, 3, 2, 0, 1);
+        }
+        ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input,
+            params[0], params[1], params[2], params[3], params[4], params[5]);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        if (pattern == 0) return;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if ((pattern == 1 && (name == "input" || name == "input_storage")) ||
+                (pattern == 2 && name == "kernel")) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            }
+        }
+    }
+};
+
+struct test_dw_stride1_htp_f32 : public test_dw_stride2_htp_f32 {
+    const int case_id;
+
+    test_dw_stride1_htp_f32(int id, std::array<int64_t, 4> ne, int kw, int kh,
+                          std::array<int, 6> p, bool offset = false, int pattern = 0)
+        : test_dw_stride2_htp_f32(ne, kw, kh, p, false, offset, pattern), case_id(id) {}
+
+    std::string vars() override {
+        return "suite=hexagon_dw_stride1_f32," + VAR_TO_STR(case_id) + "," +
+               VARS_TO_STR6(ne_input, ne_kernel, params, cwhn, offset, pattern);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_dw_stride2_htp_f32::build_graph(ctx);
+        ggml_format_name(out, "hexagon_dw_stride1_%d", case_id);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dw_stride2_htp_f32::initialize_tensors(ctx);
+        if (pattern < 3) return;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            const bool input = name.find("input") != std::string::npos;
+            const bool kernel = name == "kernel";
+            if ((!input && !kernel) || (pattern == 4 && !input)) continue;
+            std::vector<float> values(ggml_nelements(t));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = pattern == 4 ? (i % 2 ? -0.0f : 0.0f) :
+                    kernel ? (int(i % 7) - 3) * 0.0625f : (int(i % 13) - 6) * 0.125f;
+            }
+            ggml_backend_tensor_set(t, values.data(), 0, values.size() * sizeof(float));
+        }
     }
 };
 
@@ -8710,6 +8948,40 @@ struct test_concat : public test_case {
         ggml_tensor * out = ggml_concat(ctx, a, b, dim);
         ggml_set_name(out, "out");
 
+        return out;
+    }
+};
+
+// Small-row CONCATs used by LavaSR GRUs. Distinct source offsets and row
+// padding exercise both the bounded packed path and the existing fallback.
+struct test_concat_pack_htp_f32 : public test_case {
+    const int case_id;
+    const std::array<int64_t, 4> ne;
+    const bool offset;
+    const int fallback; // 1=padded source rows, 2=unequal input widths.
+
+    test_concat_pack_htp_f32(int id, std::array<int64_t, 4> ne, bool offset = false, int fallback = 0)
+        : case_id(id), ne(ne), offset(offset), fallback(fallback) {}
+
+    std::string vars() override {
+        return "suite=hexagon_concat_packed_f32," + VARS_TO_STR4(case_id, ne, offset, fallback);
+    }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto input = [&](int64_t width, bool padded, size_t offset_words, const char * name) {
+            const size_t row_bytes = size_t(width + (padded ? 1 : 0)) * sizeof(float);
+            const size_t plane_bytes = row_bytes * ne[1], batch_bytes = plane_bytes * ne[2];
+            ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                int64_t(batch_bytes * ne[3] / sizeof(float) + offset_words));
+            ggml_set_name(storage, name);
+            return ggml_view_4d(ctx, storage, width, ne[1], ne[2], ne[3], row_bytes, plane_bytes,
+                                batch_bytes, offset_words * sizeof(float));
+        };
+        ggml_tensor * a = input(ne[0], fallback == 1, offset ? 1 : 0, "left");
+        ggml_tensor * b = input(ne[0] + (fallback == 2 ? 1 : 0), false, offset ? 3 : 0, "right");
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_format_name(out, "hexagon_concat_packed_%d", case_id);
         return out;
     }
 };
@@ -9661,6 +9933,152 @@ struct test_mean : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             init_tensor_uniform(t, -0.9f, 1.1f);
+        }
+    }
+};
+
+// Focused F32 MEAN coverage; retain the existing numerical grading.
+struct test_mean_htp_f32 : public test_case {
+    const int case_id;
+    const std::array<int64_t, 4> ne;
+    const bool offset;
+    const int row_padding;
+    const int pattern;
+    const bool legacy;
+
+    test_mean_htp_f32(int id, std::array<int64_t, 4> shape, bool offset = false,
+                      int row_padding = 0, int pattern = 0, bool legacy = false)
+        : case_id(id), ne(shape), offset(offset), row_padding(row_padding), pattern(pattern), legacy(legacy) {}
+
+    std::string vars() override {
+        return "suite=hexagon_mean_f32," + VARS_TO_STR6(case_id, ne, offset, row_padding, pattern, legacy);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const size_t row_bytes = (ne[0] + row_padding) * sizeof(float);
+        const int64_t storage_floats = (ne[0] + row_padding) * ne[1] * ne[2] * ne[3] + int(offset);
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, storage_floats);
+        ggml_set_name(storage, "mean_storage");
+        ggml_tensor * input = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], row_bytes,
+            row_bytes * ne[1], row_bytes * ne[1] * ne[2], offset ? sizeof(float) : 0);
+        ggml_set_name(input, "mean_input");
+        ggml_tensor * result = ggml_mean(ctx, input);
+        ggml_format_name(result, "hexagon_mean_%d", case_id);
+        if (legacy) {
+            ggml_tensor * old = ggml_scale(ctx, ggml_sum_rows(ctx, input), 1.0f / float(ne[0]));
+            ggml_format_name(old, "hexagon_mean_legacy_%d", case_id);
+            result = ggml_concat(ctx, result, old, 3);
+            ggml_format_name(result, "hexagon_mean_pair_%d", case_id);
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (std::string(ggml_get_name(tensor)) != "mean_storage") continue;
+            if (!pattern) {
+                init_tensor_uniform(tensor, -0.9f, 1.1f);
+                continue;
+            }
+            std::vector<float> values(ggml_nelements(tensor));
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (pattern == 1) values[i] = 0.0f;
+                if (pattern == 2) values[i] = (int(i % 17) - 8) * 0.125f + 0.0625f;
+                if (pattern == 3) values[i] = i % 2 ? -0.5f : 0.5f;
+                if (pattern == 4) values[i] = -0.0f;
+            }
+            ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t rows = ne[1] * ne[2] * ne[3];
+        const double reference_error = test_case::err(a, b, n);
+        // The paired graph also checks new MEAN against the old HTP graph;
+        // both use the standard unchanged NMSE threshold.
+        return legacy && n == 2 * rows ? std::max(reference_error, nmse(a, a + rows, rows)) : reference_error;
+    }
+};
+
+// Private energy pattern fusion uses existing CPU-legal GGML nodes. Whole
+// graph comparison is required so the HTP backend can see the complete chain.
+struct test_energy_htp_f32 : public test_case {
+    const int case_id;
+    const std::array<int64_t, 4> ne;
+    const bool channels, offset;
+    const int pattern, negative;
+    ggml_tensor * square = nullptr;
+    ggml_tensor * copied = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_energy_htp_f32(int id, std::array<int64_t, 4> shape, bool channels,
+                       bool offset = false, int pattern = 0, int negative = 0)
+        : case_id(id), ne(shape), channels(channels), offset(offset), pattern(pattern), negative(negative) {}
+
+    std::string vars() override {
+        const int expected_fused = negative >= 1 && negative <= 3 ? 0 : 1;
+        const int expected_cont = channels && (negative != 0 || ne[0] > 128) ? 1 : 0;
+        return "suite=hexagon_energy_f32," + VARS_TO_STR8(case_id, ne, channels, offset, pattern,
+                                                         negative, expected_fused, expected_cont);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (negative == 2) return {square, result};
+        if (negative == 4) return {copied, result};
+        return {result};
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t padding = !channels && offset ? 1 : 0;
+        const int64_t count = (ne[0] + padding) * ne[1] * ne[2] * ne[3] + int(offset);
+        ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, count);
+        ggml_set_name(storage, "energy_storage");
+        ggml_tensor * input;
+        if (channels) {
+            ggml_tensor * planes = ggml_view_4d(ctx, storage, ne[1], ne[0], ne[2], ne[3],
+                ne[1] * sizeof(float), ne[1] * ne[0] * sizeof(float),
+                ne[1] * ne[0] * ne[2] * sizeof(float), offset ? sizeof(float) : 0);
+            input = ggml_permute(ctx, planes, 1, 0, 2, 3);
+            ggml_set_name(input, "energy_source_planes");
+            copied = ggml_cont(ctx, input);
+            ggml_format_name(copied, "hexagon_energy_cont_%d", case_id);
+            input = copied;
+            if (negative == 4) ggml_set_output(copied);
+        } else {
+            const size_t stride = (ne[0] + padding) * sizeof(float);
+            input = ggml_view_4d(ctx, storage, ne[0], ne[1], ne[2], ne[3], stride,
+                                  stride * ne[1], stride * ne[1] * ne[2], offset ? sizeof(float) : 0);
+            ggml_set_name(input, "energy_source_rows");
+        }
+        square = ggml_sqr(ctx, input);
+        ggml_format_name(square, "hexagon_energy_square_%d", case_id);
+        if (negative == 2) ggml_set_output(square);
+        ggml_tensor * mean_input = negative == 3 ? ggml_add(ctx, square, square) : square;
+        ggml_tensor * mean = ggml_mean(ctx, mean_input);
+        ggml_format_name(mean, "hexagon_energy_%d", case_id);
+        result = mean;
+        if (negative == 1) {
+            result = ggml_concat(ctx, mean, ggml_sum_rows(ctx, square), 3);
+            ggml_format_name(result, "hexagon_energy_pair_%d", case_id);
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(ggml_get_name(t)) != "energy_storage") continue;
+            if (!pattern) { init_tensor_uniform(t, -0.9f, 1.1f); continue; }
+            std::vector<float> values(ggml_nelements(t));
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (pattern == 1) values[i] = 0.0f;
+                if (pattern == 2) values[i] = (int(i % 17) - 8) * 0.125f + 0.0625f;
+                if (pattern == 3) values[i] = -0.0f;
+                if (pattern == 4) values[i] = (i % 3 == 0 ? 0.001f : i % 3 == 1 ? -1.0f : 100.0f);
+            }
+            ggml_backend_tensor_set(t, values.data(), 0, values.size() * sizeof(float));
         }
     }
 };
@@ -13251,6 +13669,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gru(64, 1, 17, true));
     test_cases.emplace_back(new test_gru(128, 2, 33, false));    // H at the GPU shared-mem cap
     test_cases.emplace_back(new test_gru(96, 2, 9, true));       // H not a multiple of the warp size
+    // Focused F32 Hexagon coverage: tiny/odd/full-width hidden states, batch
+    // independence, sequence boundaries, reverse storage and saturated gates.
+    for (const auto & shape : std::vector<std::array<int64_t, 3>>{
+             {1, 3, 1}, {2, 17, 63}, {3, 5, 7}, {7, 3, 11}, {16, 7, 17}, {31, 2, 9},
+             {32, 1, 33}, {63, 5, 2}, {64, 3, 63}, {127, 2, 7}, {128, 1, 17}}) {
+        for (bool reverse : {false, true}) {
+            test_cases.emplace_back(new test_gru_htp_f32(shape[0], shape[1], shape[2], reverse,
+                shape[0] == 64 && reverse ? 150.0f : 1.0f));
+        }
+    }
+    // Small-hidden packed HTP workers: complete and partial tiles, fallback
+    // below one tile, reverse storage and the denoiser's actual B/L shapes.
+    for (int64_t h : {4, 8}) {
+        for (const auto & shape : std::vector<std::array<int64_t, 2>>{
+                 {1, 9}, {3, 17}, {4, 17}, {5, 33}, {7, 63}, {8, 9}, {9, 17}, {11, 33},
+                 {17, 33}, {31, 63}, {32, 9}, {33, 17}, {231, 63}, {441, 33}}) {
+            for (bool reverse : {false, true}) {
+                test_cases.emplace_back(new test_gru_htp_packed_f32(h, shape[0], shape[1], reverse));
+            }
+        }
+    }
+    for (int64_t l : {9, 17}) {
+        for (bool reverse : {false, true}) {
+            test_cases.emplace_back(new test_gru_htp_packed_f32(4, 441, l, reverse));
+        }
+    }
     test_cases.emplace_back(new test_gru(96, 2, 33, true));      // long L with H > typical warp size
     test_cases.emplace_back(new test_gru(4, 1953, 33, true));    // LavaSR denoiser DPGRNN shape (tiny H, huge B)
     test_cases.emplace_back(new test_gru(2, 31, 63, false));     // LavaSR cTFA shape
@@ -13260,6 +13704,196 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gru(3, 100, 7, false));         // ragged lanes (128 % 3 = 2 idle) + tail
     test_cases.emplace_back(new test_gru(48, 5, 9, true));           // PB=2, slot spans the wave64 boundary
     test_cases.emplace_back(new test_gru(2, 300, 11, true));         // small-H variant, multi-WG + tail
+
+    // Planar KW3/SX2 F32 path: actual LavaSR output widths 33/65, full and
+    // partial vector tails, vertical skipped rows, batch/channel independence,
+    // generalized KH/SY, and explicit unchanged fallback geometries.
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 63, 24, 7}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 63, 12, 7}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({33, 9, 3, 2}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({64, 5, 1, 1}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({127, 5, 2, 3}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({1, 1, 1, 2}, 3, 2, {2, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({2, 2, 3, 1}, 3, 2, {2, 1, 2, 2, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 5, 3, 2}, 3, 1, {2, 1, 1, 0, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 7, 3, 2}, 3, 3, {2, 2, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 7, 4, 3}, 3, 4, {2, 3, 1, 2, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 7, 3, 2}, 3, 2, {2, 1, 1, 2, 1, 2}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 5, 2, 1}, 3, 2, {2, 1, 2, 1, 2, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 5, 3, 2}, 3, 2, {1, 1, 1, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 7, 3, 2}, 5, 2, {2, 1, 2, 1, 1, 1}));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 7, 8, 2}, 3, 2, {2, 1, 1, 1, 1, 1}, true));
+    test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 7, 3, 2}, 3, 2, {2, 1, 1, 1, 1, 1}, false, true));
+    for (int pattern : {1, 2}) {
+        test_cases.emplace_back(new test_dw_stride2_htp_f32({65, 63, 24, 7}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
+        test_cases.emplace_back(new test_dw_stride2_htp_f32({129, 63, 12, 7}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
+        test_cases.emplace_back(new test_dw_stride2_htp_f32({1, 1, 1, 2}, 3, 2, {2, 1, 1, 1, 1, 1}, false, false, pattern));
+    }
+
+    // Direct F32 ordinary convolution: all real pointwise channel pairs at
+    // both spatial widths, the causal-padding 3x3 shapes, and bounded edges.
+    {
+        int case_id = 0;
+        for (const auto & channels : std::vector<std::array<int64_t, 2>>{
+                 {6, 6}, {6, 12}, {8, 16}, {12, 6}, {12, 12}, {12, 16}, {16, 8}, {16, 12}, {16, 16}}) {
+            for (int64_t width : {33, 65}) {
+                test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {width, 63, channels[0], 7}, 1, channels[1]));
+            }
+        }
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {129, 63, 1, 7}, 3, 12, {2, 1, 1, 2, 1, 1}));
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {129, 63, 12, 7}, 3, 1, {1, 1, 1, 2, 1, 1}));
+        const int64_t widths[] = {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129};
+        const int64_t inputs[] = {1, 3, 6, 16}, outputs[] = {1, 3, 4, 5, 6, 8, 12, 16};
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++,
+                {widths[i], int64_t(3 + i % 3), inputs[i % 4], int64_t(1 + i % 2)},
+                1, outputs[i % 8], {1, 1, 0, 0, 1, 1}, i % 2));
+        }
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            const int sx = 1 + i % 2, sy = 1 + i / 2 % 2;
+            const int dx = 1 + i / 3 % 2, dy = 1 + i / 4 % 2;
+            test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++,
+                {widths[i], int64_t(5 + i % 3), inputs[i % 4], int64_t(1 + i % 2)},
+                3, outputs[i % 8], {sx, sy, dx, 2, dx, dy}, i % 2));
+        }
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {1, 1, 1, 1}, 3, 3, {2, 2, 4, 5, 2, 2}));
+        for (int pattern : {1, 2, 3}) {
+            test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {65, 3, 6, 2}, 1, 5,
+                {1, 1, 0, 0, 1, 1}, true, pattern));
+            test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {33, 7, 3, 2}, 3, 3,
+                {2, 1, 1, 2, 1, 1}, true, pattern));
+        }
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {65, 5, 3, 2}, 1, 3, {2, 1, 1, 2, 1, 1}));
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {33, 7, 6, 2}, 1, 1, {1, 2, 2, 1, 2, 2}));
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {2, 2, 1, 3}, 1, 4, {2, 2, 0, 0, 1, 1}));
+        test_cases.emplace_back(new test_direct_conv_htp_f32(case_id++, {1, 1, 3, 2}, 1, 6, {1, 1, 4, 3, 2, 2}));
+    }
+
+    // Keep the published 53 direct-convolution fixtures intact. These tagged
+    // cases add production geometry, OC8/4/1 boundaries and exact staged tails.
+    {
+        int case_id = 0;
+        for (const auto & channels : std::vector<std::array<int64_t, 2>>{
+                 {6, 6}, {6, 12}, {8, 16}, {12, 6}, {12, 12}, {12, 16}, {16, 8}, {16, 12}, {16, 16}}) {
+            for (int64_t width : {33, 65})
+                test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {width, 63, channels[0], 7}, 1, channels[1]));
+        }
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {129, 63, 1, 7}, 3, 12, {2, 1, 1, 2, 1, 1}));
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {129, 63, 12, 7}, 3, 1, {1, 1, 1, 2, 1, 1}));
+        for (int64_t channels : {1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 16, 17}) {
+            test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {33, 5, 3, 2}, 1, channels,
+                {1, 1, 0, 0, 1, 1}, true));
+            test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {33, 5, 3, 2}, 3, channels,
+                {1, 1, 1, 1, 1, 1}, true));
+        }
+        const int64_t widths[] = {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129};
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            for (int sx : {1, 2}) {
+                const int dx = 1 + i % 2, dy = 1 + i / 2 % 2;
+                test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++,
+                    {widths[i], 7, 6, 2}, 3, sx == 1 ? 9 : 16,
+                    {sx, int(1 + i / 3 % 2), dx, 2, dx, dy}, true));
+            }
+        }
+        for (int pattern : {1, 2, 3}) {
+            test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {65, 5, 3, 2}, 1, 9,
+                {1, 1, 0, 0, 1, 1}, true, pattern));
+            test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {65, 5, 3, 2}, 3, 9,
+                {2, 1, 1, 2, 1, 1}, true, pattern));
+        }
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {1, 1, 1, 2}, 3, 8, {2, 2, 4, 5, 2, 2}));
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {1, 1, 3, 1}, 3, 16, {1, 1, 1, 1, 1, 1}));
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {65, 5, 3, 2}, 1, 9, {2, 1, 1, 2, 1, 1}));
+        test_cases.emplace_back(new test_blocked_conv_htp_f32(case_id++, {33, 7, 6, 2}, 1, 16, {1, 2, 2, 1, 2, 2}));
+    }
+
+    // F32 stride-one depthwise row-window reuse; retain the original grading.
+    {
+        int case_id = 0;
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 24, 7}, 3, 2, {1, 1, 1, 1, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 32, 7}, 5, 1, {1, 1, 2, 0, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 16, 7}, 5, 1, {1, 1, 2, 0, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 32, 7}, 5, 1, {1, 1, 2, 0, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 24, 7}, 5, 1, {1, 1, 2, 0, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 63, 24, 7}, 3, 2, {1, 1, 1, 1, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {65, 63, 12, 7}, 3, 2, {1, 1, 1, 1, 1, 1}));
+        const int64_t widths[] = {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129};
+        const int64_t channels[] = {1, 3, 12, 24};
+        for (int kw : {3, 5}) {
+            for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+                const int kh = kw == 3 ? 2 : 1;
+                test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++,
+                    {widths[i], int64_t(5 + i % 3), channels[i % 4], int64_t(1 + i % 2)},
+                    kw, kh, {1, int(1 + i % 3), kw / 2, kh - 1, 1, 1}, i % 2));
+            }
+        }
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {65, 7, 3, 3}, 3, 4, {1, 3, 1, 3, 1, 1}, true));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {64, 7, 4, 2}, 5, 3, {1, 2, 4, 2, 1, 1}, true));
+        for (int pattern : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 7, 3, 2}, 3, 2,
+                {1, 1, 1, 1, 1, 1}, true, pattern));
+            test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {33, 5, 4, 2}, 5, 1,
+                {1, 1, 2, 0, 1, 1}, true, pattern));
+        }
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {1, 1, 1, 2}, 3, 2, {1, 2, 4, 4, 1, 1}));
+        test_cases.emplace_back(new test_dw_stride1_htp_f32(case_id++, {1, 1, 3, 2}, 5, 4, {1, 3, 4, 6, 1, 1}));
+    }
+
+    // Production MEAN rows, vector tails, offset/row-padded views and legacy parity.
+    {
+        int case_id = 0;
+        const std::array<int64_t, 4> production[] = {
+            {65, 63, 12, 7}, {12, 4095, 7, 1}, {33, 63, 24, 7}, {24, 2079, 7, 1},
+            {33, 63, 32, 7}, {32, 2079, 7, 1}, {33, 63, 16, 7}, {16, 2079, 7, 1},
+            {129, 63, 1, 7}, {1, 8127, 7, 1},
+        };
+        for (const auto & shape : production) {
+            test_cases.emplace_back(new test_mean_htp_f32(case_id++, shape));
+        }
+        const int64_t widths[] = {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129};
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            for (bool offset : {false, true}) {
+                test_cases.emplace_back(new test_mean_htp_f32(case_id++, {widths[i], 5, 3, 2},
+                    offset, offset ? int(1 + i % 3) : 0));
+            }
+        }
+        for (int pattern : {1, 2, 3, 4}) {
+            for (int64_t width : {1, 12, 33, 65, 129}) {
+                test_cases.emplace_back(new test_mean_htp_f32(case_id++, {width, 3, 3, 2}, true, 1, pattern));
+            }
+        }
+        for (const auto & shape : production) {
+            test_cases.emplace_back(new test_mean_htp_f32(case_id++, shape, false, 0, 0, true));
+        }
+    }
+
+    // Square/mean source-layout fusion: actual production axes, vector tails,
+    // offset inputs and graph-semantic negatives; default grading is unchanged.
+    {
+        int case_id = 0;
+        for (const auto & shape : std::vector<std::array<int64_t, 4>>{
+                {65,63,12,7}, {33,63,24,7}, {33,63,32,7}, {33,63,16,7}, {129,63,1,7}})
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, shape, false));
+        for (const auto & shape : std::vector<std::array<int64_t, 4>>{
+                {12,4095,7,1}, {24,2079,7,1}, {32,2079,7,1}, {16,2079,7,1}, {1,8127,7,1}})
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, shape, true));
+        for (int64_t width : {1,2,31,32,33,63,64,65,127,128,129})
+            for (bool offset : {false,true})
+                test_cases.emplace_back(new test_energy_htp_f32(case_id++, {width,5,3,2}, false, offset));
+        const int64_t spatial[] = {1,31,32,33,63,64,65};
+        const int64_t channels[] = {1,3,12,16,24,32,12};
+        for (int i = 0; i < 7; ++i)
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, {channels[i],spatial[i],3,2}, true, true));
+        for (int pattern : {1,2,3,4}) {
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, {33,33,3,2}, false, true, pattern));
+            test_cases.emplace_back(new test_energy_htp_f32(case_id++, {24,65,3,2}, true, true, pattern));
+        }
+        for (bool channels : {false,true})
+            for (int negative : {1,2,3})
+                test_cases.emplace_back(new test_energy_htp_f32(case_id++, {24,65,3,2}, channels, true, 2, negative));
+        test_cases.emplace_back(new test_energy_htp_f32(case_id++, {24,65,3,2}, true, true, 2, 4));
+        test_cases.emplace_back(new test_energy_htp_f32(case_id++, {129,33,3,2}, true, true));
+    }
 
     // conv_2d_dw whcn_v4 (wide 1-D rows) + its selection boundaries
     test_cases.emplace_back(new test_conv_2d_dw({1031, 1, 512, 1}, {7, 1, 1, 512}, GGML_TYPE_F32, 1, 0, 1, false)); // enhancer-class row
@@ -13279,6 +13913,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (int groups : {1, 2, 3, 4}) {
         test_cases.emplace_back(new test_channel_shuffle({8, 4, 12, 2}, groups));
+    }
+
+    {
+        int case_id = 0;
+        for (int64_t f : {33, 65, 129}) {
+            for (int64_t c : {12, 24, 32}) {
+                test_cases.emplace_back(new test_affine_prelu_htp_f32(case_id++, f, 63, c, 7));
+            }
+        }
+        for (int64_t f : {1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129}) {
+            for (bool offset : {false, true}) {
+                test_cases.emplace_back(new test_affine_prelu_htp_f32(case_id++, f, 9, 3, 2, offset));
+            }
+        }
+        for (int pattern : {1, 2, 3}) {
+            for (int64_t f : {1, 32, 33, 65, 129}) {
+                test_cases.emplace_back(new test_affine_prelu_htp_f32(case_id++, f, 3, 3, 2, true, pattern));
+            }
+        }
     }
 
     test_cases.emplace_back(new test_affine_prelu(16, 10, 6, 2));
@@ -14213,6 +14866,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // inplace with an offset
         test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
+    }
+
+    {
+        int case_id = 0;
+        for (int64_t width : {4, 8, 16}) {
+            for (int64_t rows : {1, 5, 7, 8, 9, 31, 32, 33}) {
+                for (bool offset : {false, true}) {
+                    test_cases.emplace_back(new test_concat_pack_htp_f32(case_id++, {width, rows, 1, 1}, offset));
+                }
+            }
+        }
+        for (auto ne : {std::array<int64_t, 4>{4, 441, 33, 1}, {8, 231, 63, 1},
+                        {8, 441, 33, 1}, {4, 441, 9, 1}}) {
+            test_cases.emplace_back(new test_concat_pack_htp_f32(case_id++, ne, true));
+        }
+        for (int64_t width : {4, 8, 16}) {
+            for (int fallback : {1, 2}) {
+                test_cases.emplace_back(new test_concat_pack_htp_f32(case_id++, {width, 33, 3, 2}, true, fallback));
+            }
+        }
     }
 
     for (int v : { 0, 1, 2, 3 }) {
