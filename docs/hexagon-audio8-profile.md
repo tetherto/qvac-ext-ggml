@@ -1,9 +1,11 @@
 # Audio8 matmul profiling and correctness
 
 The initial investigation proposed routing Audio8's large fused `MUL_MAT+ADD` to
-HMX. An HMX fused implementation exists, but **current Audio8 codec matmuls
-request F32 precision and stay on HVX**. Historical HMX dispatch does not
-establish the route taken by the current application.
+HMX. The historical application captures below requested F32 codec matmul
+precision and stayed on HVX after the precision guards were corrected.
+Audio8 subsequently enabled eligible F16-staging HMX synthesis products by
+default in Speech PR #333; see [current synthesis precision](hexagon-conv-taps-f32.md).
+Each historical capture retains its recorded application/runtime identity.
 
 ## Dispatch investigation
 
@@ -449,18 +451,18 @@ python3 ../hexagon-26715-build/summarize-benchmark.py \
   ../hexagon-26715-build/results/benchmark-device
 ```
 
-## Current application routing
+## Historical application routing, October 8
 
-In the speech checkout, `engines/tts/src/audio8/codec_ops.cpp` sets
+In the captured speech revisions, `engines/tts/src/audio8/codec_ops.cpp` set
 `GGML_PREC_F32` on both `sum_taps` and `causal_conv_transpose` matmuls. These
 requests were present in the original Audio8 implementation (`09566de3`).
-The current ggml HMX eligibility check rejects that precision because HMX
+The ggml HMX eligibility check rejects that precision because HMX
 multiplies in F16 (`be3edbd6`). Fused parameter selection also preserves the
 original MUL_MAT node's precision (`ccb67cb8`); older code passed the ADD node,
 which could bypass that check. Both ggml fixes are in the merged `8c85fb0f` base.
 
 Fusion requires either an HMX kernel or a single activation row. Consequently,
-the large current codec products use separate HVX `MUL_MAT` and ADD operations.
+the large codec products in those captures used separate HVX `MUL_MAT` and ADD operations.
 The October 8 three-frame `hex-base-profile.log` confirms zero `MUL_MAT+ADD`
 calls; its largest codec products (`192:192 x 192:3072`,
 `96:96 x 96:6144`, and `384:384 x 384:768`) are labelled `hvx-tiled`.
@@ -468,10 +470,10 @@ This trace used `OPSTAGE=3`, but preceded the quantized host-buffer correction
 below and produced invalid outputs, so it establishes dispatch, not valid
 end-to-end performance.
 
-Preserve the explicit F32 requirement. Relaxing the HMX row threshold alone
-does not make these products eligible. Any future precision change would need
-separate application-level correctness evidence and must not silently override
-`GGML_PREC_F32` in the backend.
+The backend must preserve an explicit F32 request. Relaxing the HMX row
+threshold alone does not make these products eligible. The later
+[application precision change](hexagon-conv-taps-f32.md) has its own evidence;
+it does not override `GGML_PREC_F32` in the backend.
 
 A fresh S3 trace after both correctness fixes, with `OPSTAGE=3`, `OPPOLL=1`,
 and `PROFILE=1`, also records zero `MUL_MAT+ADD` calls. It generated 70 frames.
@@ -487,7 +489,7 @@ These groups account for about 82% of the 29,765,246,194 leaf cycles. Inclusive
 batch cycles were 30,285,894,686 and must not be added to leaf cycles. Codec
 synthesis took 13,132.9 ms of the reported 21,078.9 ms inference time. Logging
 affects these timings; use the unprofiled S1 measurements above for the baseline.
-The trace identifies current F32 codec matmuls as follow-up profiling targets;
+The trace identified those F32 codec matmuls as follow-up profiling targets;
 it does not establish cross-backend parity or justify changing precision.
 Local evidence is `results/hex-corrected-S3-profile.log` and its parsed
 `results/hex-corrected-S3-profile.json` under the build directory above.
@@ -656,9 +658,9 @@ activation tiles, and partial output-column tiles. They use the existing
 matmul NMSE tolerance of `5e-4`; they do not certify end-to-end speech parity.
 Perf mode uses the four exact shapes above with each ADD operand type.
 These synthetic graphs use default matmul precision to exercise the existing
-fused implementation; they do not reproduce the current codec's explicit F32
-precision requirement. Passing them does not authorize routing the real codec
-through HMX.
+fused implementation; they do not reproduce the captured codec's explicit F32
+precision requirement. Their results are separate from the later
+[Audio8 HMX synthesis validation](hexagon-conv-taps-f32.md).
 
 `PROFILE=3` exposes `HVX_A_PREP`, `HVX_W_PREP`, `HVX_O_PROC`, `HMX_COMP`, and
 DMA events. These distinguish conversion/output work from HMX multiplication.
