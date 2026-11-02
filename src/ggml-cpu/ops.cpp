@@ -8256,6 +8256,80 @@ static void ggml_compute_forward_conv_2d_dw_cwhn(
     }
 }
 
+#ifdef GGML_SIMD
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC push_options
+#    pragma GCC optimize("fp-contract=off")
+#elif defined(_MSC_VER)
+#    pragma fp_contract(off)
+#endif
+
+static float ggml_conv_1d_dw_edge_f32(
+        const float * src, const float * kernel, int64_t x,
+        const ggml_conv_2d_dw_params & p) {
+    float sum = 0.0f;
+    for (int64_t tap = 0; tap < p.knl_w; ++tap) {
+        const int64_t sx = x - p.pad_x + tap;
+        if (sx >= 0 && sx < p.src_w) {
+            sum += kernel[tap] * src[sx];
+        }
+    }
+    return sum;
+}
+
+// Vectorize independent time samples; only the padded edges need bounds checks.
+static void ggml_conv_1d_dw_row_f32(
+        const float * src, const float * kernel, float * dst,
+        const ggml_conv_2d_dw_params & p) {
+#if defined(__clang__)
+    #pragma clang fp contract(off)
+#endif
+#if defined(__ARM_FEATURE_SVE)
+    const int64_t lanes = svcntw();
+#else
+    const int64_t lanes = GGML_F32_EPR;
+#endif
+    const int64_t interior_begin = std::min(p.dst_w, int64_t(p.pad_x));
+    const int64_t interior_end = std::min(p.dst_w, p.src_w + p.pad_x - p.knl_w + 1);
+    int64_t x = 0;
+    for (; x < interior_begin; ++x) {
+        dst[x] = ggml_conv_1d_dw_edge_f32(src, kernel, x, p);
+    }
+    for (; x + lanes <= interior_end; x += lanes) {
+        GGML_F32_VEC sum = GGML_F32_VEC_ZERO;
+        for (int64_t tap = 0; tap < p.knl_w; ++tap) {
+            const GGML_F32_VEC weight = GGML_F32_VEC_SET1(kernel[tap]);
+            const GGML_F32_VEC values = GGML_F32_VEC_LOAD(src + x - p.pad_x + tap);
+            sum = GGML_F32_VEC_ADD(sum, GGML_F32_VEC_MUL(weight, values));
+        }
+        GGML_F32_VEC_STORE(dst + x, sum);
+    }
+    for (; x < p.dst_w; ++x) {
+        dst[x] = ggml_conv_1d_dw_edge_f32(src, kernel, x, p);
+    }
+}
+
+static void ggml_compute_forward_conv_1d_dw_whcn_f32(
+        const ggml_compute_params * params, const ggml_tensor * src,
+        const ggml_tensor * kernel, ggml_tensor * dst,
+        const ggml_conv_2d_dw_params & p) {
+    const int64_t rows = p.channels * p.batch;
+    const int64_t rows_per_thread = (rows + params->nth - 1) / params->nth;
+    const int64_t begin = params->ith * rows_per_thread;
+    const int64_t end = std::min(begin + rows_per_thread, rows);
+    for (int64_t row = begin; row < end; ++row) {
+        ggml_conv_1d_dw_row_f32((const float *) src->data + row*p.src_w,
+            (const float *) kernel->data + (row%p.channels)*p.knl_w,
+            (float *) dst->data + row*p.dst_w, p);
+    }
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC pop_options
+#elif defined(_MSC_VER)
+#    pragma fp_contract(on)
+#endif
+#endif
+
 static void ggml_compute_forward_conv_2d_dw_whcn(
         const ggml_compute_params * params,
         const ggml_tensor * src,
@@ -8326,6 +8400,13 @@ void ggml_compute_forward_conv_2d_dw(
     GGML_ASSERT(dst->ne[3] == p.batch);
 
     if (ggml_is_contiguous(src)) {
+#ifdef GGML_SIMD
+        if (kernel->type == GGML_TYPE_F32 && p.src_h == 1 && p.knl_h == 1 &&
+            p.stride_x == 1 && p.dilation_x == 1 && p.pad_y == 0) {
+            ggml_compute_forward_conv_1d_dw_whcn_f32(params, src, kernel, dst, p);
+            return;
+        }
+#endif
         ggml_compute_forward_conv_2d_dw_whcn(params, src, kernel, dst, p);
     } else if (ggml_is_contiguous_channels(src)) {
         GGML_ASSERT(kernel->nb[0] >= kernel->nb[2] && kernel->nb[1] >= kernel->nb[0]);
