@@ -429,6 +429,7 @@ if (NOT GGML_BACKEND_DL)
 
     set(TEST_TARGET test-col2im-1d)
     add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
+    target_include_directories(${TEST_TARGET} PRIVATE ../src/ggml-hexagon/htp)
     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
