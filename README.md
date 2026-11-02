@@ -24,6 +24,9 @@ and work with statically linked or dynamically loaded CPU backends. These querie
 do not allocate tensor buffers or execution workspace. Backend workspace support is
 optional; unsupported backends report zero.
 
+The experimental [planar CPU depthwise-convolution optimization](docs/cpu-depthwise-convolution.md)
+includes kernel benchmarks, model timings, and numerical validation limits.
+
 ## Build
 
 ```bash
