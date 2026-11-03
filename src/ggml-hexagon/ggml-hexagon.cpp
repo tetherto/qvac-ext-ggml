@@ -936,6 +936,12 @@ static void repack_tiled_mxfp4(void * data, const ggml_tensor * t, size_t size) 
     GGML_UNUSED(size);
 }
 
+static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                   const ggml_tensor *   tensor,
+                                                   void *                data,
+                                                   size_t                offset,
+                                                   size_t                size);
+
 static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    ggml_tensor *         tensor,
                                                    const void *          data,
@@ -950,6 +956,17 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // non-host (repack) buffers may store the DSP's tiled quantized layout.
     if (ggml_backend_buffer_is_host(buffer)) {
         memcpy((char *) tensor->data + offset, data, size);
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    GGML_ASSERT(offset <= nbytes && size <= nbytes - offset);
+    if (ggml_hexagon_is_repack_type(tensor->type) && (offset != 0 || size != nbytes)) {
+        // A tiled buffer has no canonical byte range to update in place.
+        std::vector<uint8_t> canonical(nbytes);
+        ggml_backend_hexagon_buffer_get_tensor(buffer, tensor, canonical.data(), 0, nbytes);
+        memcpy(canonical.data() + offset, data, size);
+        ggml_backend_hexagon_buffer_set_tensor(buffer, tensor, canonical.data(), 0, nbytes);
         return;
     }
 
@@ -1003,6 +1020,15 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     if (ggml_backend_buffer_is_host(buffer)) {
         memcpy(data, (const char *) tensor->data + offset, size);
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    GGML_ASSERT(offset <= nbytes && size <= nbytes - offset);
+    if (ggml_hexagon_is_repack_type(tensor->type) && (offset != 0 || size != nbytes)) {
+        std::vector<uint8_t> canonical(nbytes);
+        ggml_backend_hexagon_buffer_get_tensor(buffer, tensor, canonical.data(), 0, nbytes);
+        memcpy(data, canonical.data() + offset, size);
         return;
     }
 
