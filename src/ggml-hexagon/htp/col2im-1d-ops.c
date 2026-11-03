@@ -4,6 +4,7 @@
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
+#include "col2im-1d-layout.h"
 #include "hex-dma.h"
 #include "htp-ctx.h"
 #include "htp-ops.h"
@@ -95,39 +96,11 @@ static void col2im_1d_thread(unsigned int nth, unsigned int ith, void * data) {
 // outputs therefore read one fixed pattern of column offsets per phase r,
 // so each tap group is one word gather from the staged column block, which
 // a single DMA brings in with zero rows for columns outside the signal.
-#define COL2IM_1D_VTCM_MAX_BAND 256
-#define COL2IM_1D_VTCM_MIN_BAND 32
-#define COL2IM_1D_MAX_STRIDE    32
-
 struct htp_col2im_1d_vtcm {
-    struct htp_col2im_1d_context base;
-    uint32_t                     taps_per_output;
-    uint32_t                     band;
-    uint32_t                     off_tmp;
-    uint32_t                     off_out;
-    uint32_t                     bytes_per_thread;
-    uint32_t                     plan_bytes;
-    HVX_Vector *                 phase_offsets;
+    struct htp_col2im_1d_context     base;
+    struct htp_col2im_1d_vtcm_layout layout;
+    HVX_Vector *                    phase_offsets;
 };
-
-static uint32_t col2im_1d_band_cols(const struct htp_col2im_1d_vtcm * v, uint32_t band) {
-    return band / v->base.stride + v->taps_per_output + 1;
-}
-
-static bool col2im_1d_vtcm_fit(struct htp_col2im_1d_vtcm * v, uint32_t n_threads, size_t vtcm_size) {
-    const uint32_t k_oc = v->base.kernel * v->base.channels;
-    v->plan_bytes       = v->base.stride * VLEN;
-    for (uint32_t band = COL2IM_1D_VTCM_MAX_BAND; band >= COL2IM_1D_VTCM_MIN_BAND; band /= 2) {
-        v->band             = band;
-        v->off_tmp          = hex_round_up((size_t) col2im_1d_band_cols(v, band) * k_oc * sizeof(float), VLEN);
-        v->off_out          = v->off_tmp + v->taps_per_output * VLEN;
-        v->bytes_per_thread = v->off_out + hex_round_up((size_t) v->base.channels * band * sizeof(float), VLEN);
-        if (v->plan_bytes + (size_t) v->bytes_per_thread * n_threads <= vtcm_size) {
-            return true;
-        }
-    }
-    return false;
-}
 
 static void col2im_1d_vtcm_phase(const struct htp_col2im_1d_vtcm * v, uint32_t r) {
     const uint32_t k_oc = v->base.kernel * v->base.channels;
@@ -168,13 +141,13 @@ static HVX_Vector col2im_1d_vtcm_chunk(const struct htp_col2im_1d_vtcm * v, HVX_
     const uint32_t k_oc  = v->base.kernel * v->base.channels;
     const int64_t  q0    = a / v->base.stride;
     const uint32_t r     = (uint32_t) (a - q0 * v->base.stride);
-    for (uint32_t j = 0; j < v->taps_per_output; j++) {
+    for (uint32_t j = 0; j < v->layout.taps_per_output; j++) {
         const float *  rt     = cols + (q0 - j - col_first) * k_oc + oc * v->base.kernel + j * v->base.stride;
         const uint32_t region = (uint32_t) ((const uint8_t *) cols_end - (const uint8_t *) rt) - 1;
         Q6_vgather_ARMVw(&tmp[j], (size_t) rt, region, v->phase_offsets[r]);
     }
     HVX_Vector sum = tmp[0];
-    for (uint32_t j = 1; j < v->taps_per_output; j++) {
+    for (uint32_t j = 1; j < v->layout.taps_per_output; j++) {
         sum = hvx_vec_add_f32_f32(sum, tmp[j]);
     }
     return sum;
@@ -193,25 +166,25 @@ static void col2im_1d_vtcm_band(const struct htp_col2im_1d_vtcm * v, unsigned in
     const struct htp_ops_context * octx = v->base.octx;
     const struct htp_tensor *      dst  = octx->dst;
     const uint32_t                 k_oc = v->base.kernel * v->base.channels;
-    const uint32_t                 t0   = band * v->band;
-    const uint32_t                 n    = MIN(v->band, dst->ne[0] - t0);
+    const uint32_t                 t0   = band * v->layout.band;
+    const uint32_t                 n    = MIN(v->layout.band, dst->ne[0] - t0);
 
     const int64_t a0        = (int64_t) t0 + v->base.crop;
-    const int64_t col_first = a0 / v->base.stride - (int64_t) v->taps_per_output + 1;
+    const int64_t col_first = a0 / v->base.stride - (int64_t) v->layout.taps_per_output + 1;
     const int64_t col_end   = (a0 + hex_round_up(n, VLEN_FP32) - 1) / v->base.stride + 1;
 
-    uint8_t *    base = octx->ctx->vtcm_base + v->plan_bytes + (size_t) ith * v->bytes_per_thread;
+    uint8_t *    base = octx->ctx->vtcm_base + v->layout.plan_bytes + (size_t) ith * v->layout.bytes_per_thread;
     float *      cols = (float *) base;
-    HVX_Vector * tmp  = (HVX_Vector *) (base + v->off_tmp);
-    float *      out  = (float *) (base + v->off_out);
+    HVX_Vector * tmp  = (HVX_Vector *) (base + v->layout.off_tmp);
+    float *      out  = (float *) (base + v->layout.off_out);
     dma_queue *  q    = octx->ctx->dma[ith];
 
     const float * cols_end = cols + (col_end - col_first) * k_oc;
     col2im_1d_vtcm_stage(v, q, cols, col_first, col_end);
     for (uint32_t oc = 0; oc < v->base.channels; oc++) {
-        col2im_1d_vtcm_channel(v, tmp, out + oc * v->band, cols, cols_end, col_first, oc, a0, n);
+        col2im_1d_vtcm_channel(v, tmp, out + oc * v->layout.band, cols, cols_end, col_first, oc, a0, n);
     }
-    dma_queue_copy_rows(q, dma_make_ptr((uint8_t *) dst->data + t0 * sizeof(float), out), dst->nb[1], v->band * sizeof(float),
+    dma_queue_copy_rows(q, dma_make_ptr((uint8_t *) dst->data + t0 * sizeof(float), out), dst->nb[1], v->layout.band * sizeof(float),
                         n * sizeof(float), v->base.channels);
 }
 
@@ -229,15 +202,16 @@ static bool col2im_1d_run_vtcm(struct htp_ops_context * octx, const struct htp_c
     const struct htp_tensor * src = octx->src[0];
     const struct htp_tensor * dst = octx->dst;
     if (src->type != HTP_TYPE_F32 || src->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
-        cctx->kernel % cctx->stride != 0 || cctx->stride > COL2IM_1D_MAX_STRIDE) {
+        cctx->kernel % cctx->stride != 0) {
         return false;
     }
-    struct htp_col2im_1d_vtcm v = { .base = *cctx, .taps_per_output = cctx->kernel / cctx->stride };
-    if (!col2im_1d_vtcm_fit(&v, octx->n_threads, octx->ctx->vtcm_size)) {
+    struct htp_col2im_1d_vtcm v = { .base = *cctx };
+    if (!htp_col2im_1d_vtcm_layout_build(cctx->kernel, cctx->channels, cctx->stride,
+                                       octx->n_threads, octx->ctx->vtcm_size, &v.layout)) {
         return false;
     }
     col2im_1d_vtcm_plan(&v);
-    v.base.n_bands          = (dst->ne[0] + v.band - 1) / v.band;
+    v.base.n_bands          = (dst->ne[0] + v.layout.band - 1) / v.layout.band;
     const uint32_t threads  = MIN(octx->n_threads, v.base.n_bands);
     v.base.bands_per_thread = (v.base.n_bands + threads - 1) / threads;
     worker_pool_run_func(octx->ctx->worker_pool, col2im_1d_vtcm_thread, &v, threads);

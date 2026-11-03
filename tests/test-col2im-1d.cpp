@@ -10,6 +10,7 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml-cpp.h>
+#include "col2im-1d-layout.h"
 
 #include <cmath>
 #include <cstdio>
@@ -95,8 +96,39 @@ static bool test_col2im_1d(int64_t K, int64_t OC, int64_t T_in, int s0, int p0) 
     return passed;
 }
 
+static bool test_hexagon_layout() {
+#define CHECK_LAYOUT(value) do { if (!(value)) { printf("FAIL layout line %d: %s\n", __LINE__, #value); return false; } } while (0)
+    const size_t budget = 8 * 1024 * 1024;
+    htp_col2im_1d_vtcm_layout layout = {};
+
+    // Oversized staging must not wrap into a small worker allocation.
+    ggml_context_ptr ctx{ggml_init({4 * ggml_tensor_overhead(), nullptr, true})};
+    CHECK_LAYOUT(ctx != nullptr);
+    ggml_tensor * cols = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 320 * 5808, 1);
+    ggml_tensor * out = ggml_col2im_1d(ctx.get(), cols, 1, 5808, 0);
+    CHECK_LAYOUT(ggml_nbytes(cols) == 7434240 && ggml_nbytes(out) == 7434240);
+    CHECK_LAYOUT(!htp_col2im_1d_vtcm_layout_build(320, 5808, 1, 6, budget, &layout));
+
+    CHECK_LAYOUT(htp_col2im_1d_vtcm_layout_build(16, 1, 4, 6, budget, &layout));
+    CHECK_LAYOUT(layout.band == 256 && layout.taps_per_output == 4 && layout.off_tmp == 4480 &&
+                 layout.off_out == 4992 && layout.bytes_per_thread == 6016 && layout.plan_bytes == 512);
+    CHECK_LAYOUT(htp_col2im_1d_vtcm_layout_build(16, 1, 4, 6, 9728, &layout));
+    CHECK_LAYOUT(layout.band == 32 && layout.bytes_per_thread == 1536);
+    CHECK_LAYOUT(!htp_col2im_1d_vtcm_layout_build(16, 1, 4, 6, 9727, &layout));
+    CHECK_LAYOUT(!htp_col2im_1d_vtcm_layout_build(16, 1, 4, 0, budget, &layout));
+    CHECK_LAYOUT(!htp_col2im_1d_vtcm_layout_build(16, 0, 4, 6, budget, &layout));
+    CHECK_LAYOUT(!htp_col2im_1d_vtcm_layout_build(16, 1, 0, 6, budget, &layout));
+    CHECK_LAYOUT(!htp_col2im_1d_vtcm_layout_build(7, 1, 4, 6, budget, &layout));
+    CHECK_LAYOUT(!htp_col2im_1d_vtcm_layout_build(16, 1, 4, 6, 0, &layout));
+    CHECK_LAYOUT(!htp_col2im_1d_vtcm_layout_build(UINT32_MAX, UINT32_MAX, 1, 6, SIZE_MAX, &layout));
+    printf("Hexagon col2im layout guards: PASSED\n");
+#undef CHECK_LAYOUT
+    return true;
+}
+
 int main() {
     bool ok = true;
+    ok &= test_hexagon_layout();
     ok &= test_col2im_1d(/*K=*/4, /*OC=*/3, /*T_in=*/10, /*s0=*/2, /*p0=*/1);
     ok &= test_col2im_1d(/*K=*/7, /*OC=*/1, /*T_in=*/32, /*s0=*/4, /*p0=*/2); // mono, stride 4
     ok &= test_col2im_1d(/*K=*/3, /*OC=*/8, /*T_in=*/16, /*s0=*/1, /*p0=*/0); // no stride/pad
