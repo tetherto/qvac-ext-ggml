@@ -2,6 +2,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -37,23 +38,25 @@ static bool check_buffer(ggml_backend_buffer_type_t buft, ggml_backend_t cpu, gg
     ggml_backend_tensor_copy(weight, copy);
     ggml_backend_tensor_get(copy, actual.data(), 0, size);
     const bool copy_ok = actual == canonical;
-    bool partial_ok = true;
-    if (host) {
-        // Streaming loaders may transfer canonical blocks at nonzero offsets.
-        const size_t offset = ggml_row_size(type, k);
-        const size_t chunk = offset;
-        std::vector<uint8_t> row(chunk);
-        ggml_backend_tensor_get(weight, row.data(), offset, chunk);
-        partial_ok = std::memcmp(row.data(), canonical.data() + offset, chunk) == 0;
-        ggml_backend_tensor_set(weight, canonical.data(), offset, chunk);
-        ggml_backend_tensor_get(weight, actual.data(), 0, size);
-        std::memcpy(canonical.data() + offset, canonical.data(), chunk);
-        partial_ok = actual == canonical && partial_ok;
-    }
+    // Streaming loaders may transfer canonical blocks at nonzero offsets.
+    // Keep the GET destination full-sized so a broken repacker can be detected
+    // by its sentinel tail without corrupting the caller's allocation.
+    const size_t offset = ggml_row_size(type, k);
+    const size_t chunk = offset;
+    std::vector<uint8_t> row(size, 0xA5);
+    ggml_backend_tensor_get(weight, row.data(), offset, chunk);
+    bool partial_ok = std::memcmp(row.data(), canonical.data() + offset, chunk) == 0 &&
+                      std::all_of(row.begin() + chunk, row.end(), [](uint8_t v) { return v == 0xA5; });
+    std::vector<uint8_t> update = canonical;
+    std::memcpy(update.data(), canonical.data() + 2 * offset, chunk);
+    ggml_backend_tensor_set(weight, update.data(), offset, chunk);
+    ggml_backend_tensor_get(weight, actual.data(), 0, size);
+    std::memcpy(canonical.data() + offset, update.data(), chunk);
+    partial_ok = actual == canonical && partial_ok;
     const bool ok = api_ok && host_ok && copy_ok && partial_ok;
     std::printf("%s %s: API=%s host-bytes=%s CPU-copy=%s partial=%s\n", ggml_backend_buft_name(buft),
                 ggml_type_name(type), api_ok ? "OK" : "FAIL", host ? (host_ok ? "OK" : "FAIL") : "N/A",
-                copy_ok ? "OK" : "FAIL", host ? (partial_ok ? "OK" : "FAIL") : "N/A");
+                copy_ok ? "OK" : "FAIL", partial_ok ? "OK" : "FAIL");
     ggml_backend_buffer_free(copy_buffer);
     ggml_free(copy_ctx);
     ggml_backend_buffer_free(buffer);
