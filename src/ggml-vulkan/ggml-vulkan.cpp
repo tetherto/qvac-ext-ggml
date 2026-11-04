@@ -421,6 +421,7 @@ class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static void ggml_vk_register_exit_teardown();
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
@@ -1308,8 +1309,42 @@ struct vk_device_struct {
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
-    ~vk_device_struct() {
+    bool shut_down = false;
+    bool destroyed = false;
+
+    void wait_idle() {
+        try {
+            device.waitIdle();
+        } catch (const vk::SystemError & e) {
+            VK_LOG_DEBUG("waitIdle before destroying device " << name << " failed: " << e.what());
+        }
+    }
+
+    bool allocator_is_empty() {
+        if (allocator == VK_NULL_HANDLE) {
+            return true;
+        }
+        VmaTotalStatistics stats = {};
+        vmaCalculateStatistics(allocator, &stats);
+        return stats.total.statistics.allocationCount == 0;
+    }
+
+    void destroy_allocator() {
+        if (allocator_is_empty()) {
+            vmaDestroyAllocator(allocator);
+            return;
+        }
+        VK_LOG_DEBUG("device " << name << " still holds allocations; leaving its allocator to the driver");
+    }
+
+    void shutdown() {
+        if (shut_down || !device) {
+            return;
+        }
+        shut_down = true;
         VK_LOG_DEBUG("destroy device " << name);
+
+        wait_idle();
 
         device.destroyFence(fence);
 
@@ -1335,18 +1370,20 @@ struct vk_device_struct {
 
         device.destroyDescriptorSetLayout(dsl);
 
-        // Destroy the VkPipelineCache handle here if it's still alive.  The
-        // on-disk persistence happens earlier, in ggml_vk_cleanup(), because
-        // this destructor is not reliably reached at process exit: pipelines
-        // and helpers hold shared_ptr<vk_device_struct> refs that keep the
-        // refcount above 0 until well after the Vulkan dispatcher is gone.
+        // The on-disk persistence of the pipeline cache happens in ggml_vk_cleanup(),
+        // while the backend that filled it is still alive; here only the handle goes.
         if (pipeline_cache) {
             device.destroyPipelineCache(pipeline_cache);
             pipeline_cache = VK_NULL_HANDLE;
         }
-        vmaDestroyAllocator(allocator);
+        destroy_allocator();
 
         device.destroy();
+        destroyed = true;
+    }
+
+    ~vk_device_struct() {
+        shutdown();
     }
 };
 
@@ -1482,7 +1519,7 @@ struct vk_buffer_struct {
     vk_device device;
 
     ~vk_buffer_struct() {
-        if (size == 0) {
+        if (size == 0 || (device && device->destroyed)) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
@@ -8759,6 +8796,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+        ggml_vk_register_exit_teardown();
 
         if (device->device_fault) {
             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
@@ -9272,6 +9310,36 @@ static bool ggml_vk_instance_debug_utils_ext_available(const std::vector<vk::Ext
 static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev);
 
 static DispatchLoaderDynamic ggml_vk_default_dispatcher_instance;
+
+static void ggml_vk_shutdown_devices() {
+    for (auto & device : vk_instance.devices) {
+        if (device) {
+            device->shutdown();
+        }
+    }
+}
+
+static void ggml_vk_instance_destroy() {
+    if (!vk_instance_initialized || !vk_instance.instance) {
+        return;
+    }
+    VK_LOG_DEBUG("ggml_vk_instance_destroy()");
+    ggml_vk_shutdown_devices();
+    vk_instance.instance.destroy();
+    vk_instance.instance = vk::Instance{};
+}
+
+// Exit handlers run in reverse order of registration, and the driver registers its own
+// when the instance or a device loads it. Registering after that destroys devices and
+// the instance first: the NVIDIA Tegra driver otherwise unmaps the code of a worker
+// thread that only vkDestroyDevice stops. Not on Windows, where exit handlers of a DLL
+// run under the loader lock and Vulkan calls there can deadlock.
+static void ggml_vk_register_exit_teardown() {
+#ifndef _WIN32
+    std::atexit(ggml_vk_instance_destroy);
+#endif
+}
+
 DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
     return ggml_vk_default_dispatcher_instance;
 }
@@ -9370,6 +9438,7 @@ static void ggml_vk_instance_init() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance);
 
     std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+    ggml_vk_register_exit_teardown();
 
     // Emulate behavior of CUDA_VISIBLE_DEVICES for Vulkan
     char * devices_env = getenv("GGML_VK_VISIBLE_DEVICES");
@@ -20071,6 +20140,9 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 // Clean up on backend free
 static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    if (ctx->device->destroyed) {
+        return;
+    }
 
     // Persist the optional on-disk pipeline cache while the device shared_ptr
     // and the Vulkan dispatcher are still valid.  Doing this from
