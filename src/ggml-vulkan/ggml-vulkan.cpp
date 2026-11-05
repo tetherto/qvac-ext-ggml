@@ -23673,21 +23673,29 @@ static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t 
     };
 }
 
+static void ggml_vk_destroy_events(const vk_device & device, const std::vector<vk::Event> & events) {
+    for (const auto & event : events) {
+        device->device.destroyEvent(event);
+    }
+}
+
+static void ggml_vk_destroy_event_handles(const vk_device & device, const vk_event * vkev) {
+    device->device.destroySemaphore(vkev->tl_semaphore.s);
+    ggml_vk_destroy_events(device, vkev->events_free);
+    ggml_vk_destroy_events(device, vkev->events_submitted);
+    if (vkev->has_event) {
+        device->device.destroyEvent(vkev->event);
+    }
+}
+
 static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
 
     vk_event *vkev = (vk_event *)event->context;
 
-    device->device.destroySemaphore(vkev->tl_semaphore.s);
-    for (auto& event : vkev->events_free) {
-        device->device.destroyEvent(event);
-    }
-    for (auto& event : vkev->events_submitted) {
-        device->device.destroyEvent(event);
-    }
-    if (vkev->has_event) {
-        device->device.destroyEvent(vkev->event);
+    if (!device->destroyed) {
+        ggml_vk_destroy_event_handles(device, vkev);
     }
     delete vkev;
     delete event;
@@ -23792,9 +23800,15 @@ static size_t ggml_backend_vk_reg_get_device_count(ggml_backend_reg_t reg) {
     return ggml_backend_vk_get_device_count();
 }
 
+template <typename T>
+static T & ggml_vk_never_destroyed() {
+    static T * value = new T();
+    return *value;
+}
+
 static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg, size_t device) {
-    static std::vector<std::unique_ptr<ggml_backend_device>> devices;
-    static std::vector<std::unique_ptr<ggml_backend_vk_device_context>> contexts;
+    auto & devices = ggml_vk_never_destroyed<std::vector<std::unique_ptr<ggml_backend_device>>>();
+    auto & contexts = ggml_vk_never_destroyed<std::vector<std::unique_ptr<ggml_backend_vk_device_context>>>();
 
     static bool initialized = false;
 
