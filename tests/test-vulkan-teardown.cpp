@@ -59,7 +59,9 @@ static bool run_on(ggml_backend_dev_t device, bool keep_buffer) {
     }
     ggml_backend_buffer_t buffer = alloc_from(ggml_backend_get_default_buffer_type(backend));
     const bool allocated = buffer != nullptr;
-    if (allocated && !keep_buffer) {
+    if (keep_buffer) {
+        retained.device_buffer = buffer;
+    } else {
         ggml_backend_buffer_free(buffer);
     }
     ggml_backend_free(backend);
@@ -68,6 +70,10 @@ static bool run_on(ggml_backend_dev_t device, bool keep_buffer) {
 
 static bool is_mode(const char * mode, const char * flag) {
     return std::strcmp(mode, flag) == 0;
+}
+
+static bool frees_at_exit(const char * mode) {
+    return is_mode(mode, keep_buffer_flag) || is_mode(mode, free_after_teardown_flag);
 }
 
 static bool run_mode(ggml_backend_dev_t device, const char * mode) {
@@ -79,7 +85,7 @@ static bool run_mode(ggml_backend_dev_t device, const char * mode) {
 
 int main(int argc, char ** argv) {
     const char * mode = argc > 1 ? argv[1] : default_mode;
-    if (is_mode(mode, free_after_teardown_flag)) {
+    if (frees_at_exit(mode)) {
         std::atexit(free_retained);
     }
     ggml_backend_load_all();
