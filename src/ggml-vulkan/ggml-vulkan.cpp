@@ -80,6 +80,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -244,6 +245,7 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #endif // GGML_VULKAN_DEBUG
 
 struct ggml_backend_vk_context;
+struct vk_event;
 
 #define MAX_PARAMETER_COUNT 12
 // Max number of adds that can be fused without exceeding MAX_PARAMETER_COUNT.
@@ -421,6 +423,8 @@ class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static ggml_status ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static void ggml_vk_register_exit_teardown();
+static void ggml_vk_release_live_children(vk_device_struct & device);
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
@@ -845,6 +849,31 @@ static constexpr uint32_t CPY_TRANSPOSE_LARGE_SMEM_BYTES =
 // Measured cache-spill crossover: the tiled pipelines win once the tensors
 // leave the last-level cache.
 static constexpr uint64_t TILED_PIPELINE_MIN_BYTES = 32ull * 1024 * 1024;
+
+template <typename T>
+class vk_live_set {
+public:
+    void add(T * item) {
+        std::lock_guard<std::mutex> guard(mutex);
+        items.insert(item);
+    }
+
+    void remove(T * item) {
+        std::lock_guard<std::mutex> guard(mutex);
+        items.erase(item);
+    }
+
+    std::vector<T *> take_all() {
+        std::lock_guard<std::mutex> guard(mutex);
+        std::vector<T *> taken(items.begin(), items.end());
+        items.clear();
+        return taken;
+    }
+
+private:
+    std::mutex mutex;
+    std::unordered_set<T *> items;
+};
 
 struct vk_device_struct {
     std::recursive_mutex mutex;
@@ -1308,8 +1337,47 @@ struct vk_device_struct {
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
-    ~vk_device_struct() {
+    vk_live_set<ggml_backend_vk_context> live_backends;
+    vk_live_set<vk_event> live_events;
+    vk_live_set<vk_buffer_struct> live_buffers;
+
+    bool shut_down = false;
+    bool destroyed = false;
+
+    void wait_idle() {
+        try {
+            device.waitIdle();
+        } catch (const vk::SystemError & e) {
+            VK_LOG_DEBUG("waitIdle before destroying device " << name << " failed: " << e.what());
+        }
+    }
+
+    bool allocator_is_empty() {
+        if (allocator == VK_NULL_HANDLE) {
+            return true;
+        }
+        VmaTotalStatistics stats = {};
+        vmaCalculateStatistics(allocator, &stats);
+        return stats.total.statistics.allocationCount == 0;
+    }
+
+    void destroy_allocator() {
+        if (allocator_is_empty()) {
+            vmaDestroyAllocator(allocator);
+            return;
+        }
+        VK_LOG_DEBUG("device " << name << " still holds allocations; leaving its allocator to the driver");
+    }
+
+    void shutdown() {
+        if (shut_down || !device) {
+            return;
+        }
+        shut_down = true;
         VK_LOG_DEBUG("destroy device " << name);
+
+        wait_idle();
+        ggml_vk_release_live_children(*this);
 
         device.destroyFence(fence);
 
@@ -1335,18 +1403,20 @@ struct vk_device_struct {
 
         device.destroyDescriptorSetLayout(dsl);
 
-        // Destroy the VkPipelineCache handle here if it's still alive.  The
-        // on-disk persistence happens earlier, in ggml_vk_cleanup(), because
-        // this destructor is not reliably reached at process exit: pipelines
-        // and helpers hold shared_ptr<vk_device_struct> refs that keep the
-        // refcount above 0 until well after the Vulkan dispatcher is gone.
+        // The on-disk persistence of the pipeline cache happens in ggml_vk_cleanup(),
+        // while the backend that filled it is still alive; here only the handle goes.
         if (pipeline_cache) {
             device.destroyPipelineCache(pipeline_cache);
             pipeline_cache = VK_NULL_HANDLE;
         }
-        vmaDestroyAllocator(allocator);
+        destroy_allocator();
 
         device.destroy();
+        destroyed = true;
+    }
+
+    ~vk_device_struct() {
+        shutdown();
     }
 };
 
@@ -1480,14 +1550,25 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+    bool released = false;
+
+    bool owns_allocation() const {
+        return size != 0 && !released;
+    }
+
+    void release() {
+        vmaDestroyBuffer(device->allocator, buffer, allocation);
+        released = true;
+    }
 
     ~vk_buffer_struct() {
-        if (size == 0) {
+        if (!owns_allocation()) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
-        vmaDestroyBuffer(device->allocator, buffer, allocation);
+        device->live_buffers.remove(this);
+        release();
     }
 };
 
@@ -3331,8 +3412,14 @@ struct vk_instance_t {
     vk_device devices[GGML_VK_MAX_DEVICES];
 };
 
+template <typename T>
+static T & ggml_vk_never_destroyed() {
+    static T * value = new T();
+    return *value;
+}
+
 static bool vk_instance_initialized = false;
-static vk_instance_t vk_instance;
+static vk_instance_t & vk_instance = ggml_vk_never_destroyed<vk_instance_t>();
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
 static size_t vk_skip_checks;
@@ -4231,6 +4318,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, const vk::BufferCreate
     vmaGetAllocationMemoryProperties(device->allocator, buf->allocation, reinterpret_cast<VkMemoryPropertyFlags *>(&buf->memory_property_flags));
 
     buf->device = device;
+    device->live_buffers.add(buf.get());
     buf->size = buffer_info.size;
 
     if (device->buffer_device_address && (buffer_info.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
@@ -4292,6 +4380,7 @@ static vk_buffer ggml_vk_create_buffer_aligned(vk_device& device, const vk::Buff
     vmaGetAllocationMemoryProperties(device->allocator, buf->allocation, reinterpret_cast<VkMemoryPropertyFlags *>(&buf->memory_property_flags));
 
     buf->device = device;
+    device->live_buffers.add(buf.get());
     buf->size = buffer_info.size;
 
     if (device->buffer_device_address && (buffer_info.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
@@ -8759,6 +8848,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+        ggml_vk_register_exit_teardown();
 
         if (device->device_fault) {
             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
@@ -9272,6 +9362,36 @@ static bool ggml_vk_instance_debug_utils_ext_available(const std::vector<vk::Ext
 static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev);
 
 static DispatchLoaderDynamic ggml_vk_default_dispatcher_instance;
+
+static void ggml_vk_shutdown_devices() {
+    for (auto & device : vk_instance.devices) {
+        if (device) {
+            device->shutdown();
+        }
+    }
+}
+
+static void ggml_vk_instance_destroy() {
+    if (!vk_instance_initialized || !vk_instance.instance) {
+        return;
+    }
+    VK_LOG_DEBUG("ggml_vk_instance_destroy()");
+    ggml_vk_shutdown_devices();
+    vk_instance.instance.destroy();
+    vk_instance.instance = vk::Instance{};
+}
+
+// Exit handlers run in reverse order of registration, and the driver registers its own
+// when the instance or a device loads it. Registering after that destroys devices and
+// the instance first: the NVIDIA Tegra driver otherwise unmaps the code of a worker
+// thread that only vkDestroyDevice stops. Not on Windows, where exit handlers of a DLL
+// run under the loader lock and Vulkan calls there can deadlock.
+static void ggml_vk_register_exit_teardown() {
+#ifndef _WIN32
+    std::atexit(ggml_vk_instance_destroy);
+#endif
+}
+
 DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
     return ggml_vk_default_dispatcher_instance;
 }
@@ -9370,6 +9490,7 @@ static void ggml_vk_instance_init() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance);
 
     std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+    ggml_vk_register_exit_teardown();
 
     // Emulate behavior of CUDA_VISIBLE_DEVICES for Vulkan
     char * devices_env = getenv("GGML_VK_VISIBLE_DEVICES");
@@ -9579,6 +9700,8 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     if (vk_perf_logger_enabled) {
         ctx->perf_logger = std::unique_ptr<vk_perf_logger>(new vk_perf_logger());
     }
+
+    ctx->device->live_backends.add(ctx);
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
     const char* skip_checks = getenv("GGML_VULKAN_SKIP_CHECKS");
@@ -20071,6 +20194,9 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 // Clean up on backend free
 static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    if (ctx->device->destroyed) {
+        return;
+    }
 
     // Persist the optional on-disk pipeline cache while the device shared_ptr
     // and the Vulkan dispatcher are still valid.  Doing this from
@@ -20120,6 +20246,10 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
+    }
+    if (ctx->query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->query_pool);
+        ctx->query_pool = nullptr;
     }
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
@@ -20422,6 +20552,7 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
+    ctx->device->live_backends.remove(ctx);
     ggml_vk_cleanup(ctx);
 
     delete ctx;
@@ -23594,11 +23725,27 @@ static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t 
     vk::SemaphoreCreateInfo ci{};
     ci.setPNext(&tci);
     vkev->tl_semaphore = { device->device.createSemaphore(ci), 0 };
+    device->live_events.add(vkev);
 
     return new ggml_backend_event {
         /* .device  = */ dev,
         /* .context = */ vkev,
     };
+}
+
+static void ggml_vk_destroy_events(vk::Device device, const std::vector<vk::Event> & events) {
+    for (const auto & event : events) {
+        device.destroyEvent(event);
+    }
+}
+
+static void ggml_vk_destroy_event_handles(vk::Device device, const vk_event * vkev) {
+    device.destroySemaphore(vkev->tl_semaphore.s);
+    ggml_vk_destroy_events(device, vkev->events_free);
+    ggml_vk_destroy_events(device, vkev->events_submitted);
+    if (vkev->has_event) {
+        device.destroyEvent(vkev->event);
+    }
 }
 
 static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
@@ -23607,18 +23754,36 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
 
     vk_event *vkev = (vk_event *)event->context;
 
-    device->device.destroySemaphore(vkev->tl_semaphore.s);
-    for (auto& event : vkev->events_free) {
-        device->device.destroyEvent(event);
-    }
-    for (auto& event : vkev->events_submitted) {
-        device->device.destroyEvent(event);
-    }
-    if (vkev->has_event) {
-        device->device.destroyEvent(vkev->event);
+    device->live_events.remove(vkev);
+    if (!device->destroyed) {
+        ggml_vk_destroy_event_handles(device->device, vkev);
     }
     delete vkev;
     delete event;
+}
+
+static void ggml_vk_release_backends(vk_device_struct & device) {
+    for (auto * ctx : device.live_backends.take_all()) {
+        ggml_vk_cleanup(ctx);
+    }
+}
+
+static void ggml_vk_release_events(vk_device_struct & device) {
+    for (auto * vkev : device.live_events.take_all()) {
+        ggml_vk_destroy_event_handles(device.device, vkev);
+    }
+}
+
+static void ggml_vk_release_buffers(vk_device_struct & device) {
+    for (auto * buf : device.live_buffers.take_all()) {
+        buf->release();
+    }
+}
+
+static void ggml_vk_release_live_children(vk_device_struct & device) {
+    ggml_vk_release_backends(device);
+    ggml_vk_release_events(device);
+    ggml_vk_release_buffers(device);
 }
 
 static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
@@ -23721,8 +23886,8 @@ static size_t ggml_backend_vk_reg_get_device_count(ggml_backend_reg_t reg) {
 }
 
 static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg, size_t device) {
-    static std::vector<std::unique_ptr<ggml_backend_device>> devices;
-    static std::vector<std::unique_ptr<ggml_backend_vk_device_context>> contexts;
+    auto & devices = ggml_vk_never_destroyed<std::vector<std::unique_ptr<ggml_backend_device>>>();
+    auto & contexts = ggml_vk_never_destroyed<std::vector<std::unique_ptr<ggml_backend_vk_device_context>>>();
 
     static bool initialized = false;
 
