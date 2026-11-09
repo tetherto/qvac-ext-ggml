@@ -3460,12 +3460,106 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static int ggml_cuda_try_fuse_q4_input_scale(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_SCALE ||
+        cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT || cgraph->nodes[i + 1]->src[1] != cgraph->nodes[i]) {
+        return 0;
+    }
+    const ggml_tensor * scale = cgraph->nodes[i];
+    const ggml_tensor * raw = scale->src[0];
+    ggml_tensor * mm = cgraph->nodes[i + 1];
+    const ggml_tensor * weight = mm->src[0];
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+    uint32_t scale_bits, bias_bits;
+    memcpy(&scale_bits, scale->op_params, sizeof(scale_bits));
+    memcpy(&bias_bits, (const char *) scale->op_params + sizeof(float), sizeof(bias_bits));
+
+    const auto same_device = [&](const ggml_tensor * tensor) {
+        return tensor && tensor->data && tensor->buffer &&
+            tensor->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device);
+    };
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a_start = (uintptr_t) a->data;
+        const uintptr_t b_start = (uintptr_t) b->data;
+        const size_t a_size = ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+        const size_t b_size = ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+        return a_start <= b_start ? b_start - a_start < a_size : a_start - b_start < b_size;
+    };
+
+    // Restrict this optimization to the two H3 MLP projection shapes measured on SM1200.
+    if (!raw || !weight) {
+        return 0;
+    } else if (cc != GGML_CUDA_CC_BLACKWELL) {
+        return 0;
+    } else if (weight->type != GGML_TYPE_Q4_K || raw->type != GGML_TYPE_F32 ||
+               scale->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
+        return 0;
+    } else if (!((weight->ne[0] == 5376 && weight->ne[1] == 28672) ||
+                 (weight->ne[0] == 14336 && weight->ne[1] == 5376))) {
+        return 0;
+    } else if (weight->ne[2] != 1 || weight->ne[3] != 1 || raw->ne[2] != 1 || raw->ne[3] != 1 ||
+               scale->ne[2] != 1 || scale->ne[3] != 1 || mm->ne[2] != 1 || mm->ne[3] != 1) {
+        return 0;
+    } else if (raw->ne[1] < 512) {
+        return 0;
+    } else if (!ggml_is_contiguous(weight) || !ggml_is_contiguous(raw) || !ggml_is_contiguous(scale) ||
+               !ggml_is_contiguous(mm) || !ggml_are_same_shape(raw, scale) ||
+               raw->ne[0] != weight->ne[0] || mm->ne[0] != weight->ne[1] || mm->ne[1] != raw->ne[1]) {
+        return 0;
+    } else if (scale_bits != 0x3c000000u || bias_bits != 0) {
+        return 0;
+    } else if (scale->view_src) {
+        return 0;
+    } else if ((scale->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
+        return 0;
+    } else if ((mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i + 1) != 1) {
+        return 0;
+    } else if (!same_device(raw) || !same_device(scale) || !same_device(weight) || !same_device(mm)) {
+        return 0;
+    } else if ((uintptr_t) raw->data % alignof(float4) != 0) {
+        return 0;
+    } else if (ggml_get_op_params_i32(mm, 1) != GGML_HINT_NONE || ggml_get_op_params_i32(mm, 0) != GGML_PREC_F32) {
+        return 0;
+    } else if (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE && weight->view_src &&
+               ggml_nbytes(weight) != ggml_backend_buffer_get_alloc_size(weight->buffer, weight)) {
+        return 0;
+    } else if (ggml_cuda_should_use_mmvf(weight->type, cc, weight->ne, weight->nb, raw->ne[1]) ||
+               ggml_cuda_should_use_mmf(weight->type, cc, warp_size, weight->ne, weight->nb, raw->ne[1], false) ||
+               ggml_cuda_should_use_mmvq(weight->type, cc, raw->ne[1]) ||
+               !ggml_cuda_should_use_mmq(weight->type, cc, raw->ne[1], 0)) {
+        return 0;
+    } else if (!ggml_can_fuse_subgraph(cgraph, i, {GGML_OP_SCALE, GGML_OP_MUL_MAT}, {i + 1})) {
+        return 0;
+    } else {
+        const int out_nodes[] = {i + 1};
+        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            return 0;
+        } else if (overlap(mm, raw) || overlap(mm, weight)) {
+            // Also cover leaf inputs, which the existing fusion checker skips.
+            return 0;
+        }
+    }
+
+    ggml_cuda_mul_mat_q_affine(*cuda_ctx, weight, raw, mm,
+        ggml_get_op_params_f32(scale, 0), ggml_get_op_params_f32(scale, 1));
+    return 1;
+}
+#endif
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
         return 0;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ggml_cuda_try_fuse_q4_input_scale(cuda_ctx, cgraph, i)) {
+        return 1;
+    }
+#endif
 
     ggml_tensor * node = cgraph->nodes[i];
 
