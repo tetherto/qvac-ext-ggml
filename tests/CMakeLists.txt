@@ -1,3 +1,8 @@
+add_executable(test-h3-segment-pattern test-h3-segment-pattern.cpp)
+target_include_directories(test-h3-segment-pattern PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-h3-segment-pattern PRIVATE ggml-base)
+add_test(NAME test-h3-segment-pattern COMMAND test-h3-segment-pattern)
+
 add_executable(test-h3-norm-rope-pattern test-h3-norm-rope-pattern.cpp)
 target_include_directories(test-h3-norm-rope-pattern PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-h3-norm-rope-pattern PRIVATE ggml-base)
@@ -5,6 +10,35 @@ add_test(NAME test-h3-norm-rope-pattern COMMAND test-h3-norm-rope-pattern)
 
 if (GGML_CUDA AND TARGET ggml-cuda)
     find_package(CUDAToolkit REQUIRED)
+    add_executable(test-cuda-h3-segment test-cuda-h3-segment.cpp)
+    target_include_directories(test-cuda-h3-segment PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-cuda-h3-segment PRIVATE ggml CUDA::cudart)
+    if (GGML_BACKEND_DL)
+        add_dependencies(test-cuda-h3-segment ggml-cuda)
+    else()
+        target_link_libraries(test-cuda-h3-segment PRIVATE ggml-cuda)
+    endif()
+    add_test(NAME test-cuda-h3-segment COMMAND test-cuda-h3-segment --expect-fusion)
+    add_test(NAME test-cuda-h3-segment-default
+        COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_CUDA_H3_SEGMENT_FUSION
+        $<TARGET_FILE:test-cuda-h3-segment> --expect-fusion)
+    add_test(NAME test-cuda-h3-segment-disabled COMMAND test-cuda-h3-segment)
+    add_test(NAME test-cuda-h3-segment-global-disabled COMMAND test-cuda-h3-segment)
+    add_test(NAME test-cuda-h3-segment-concurrent-fallback
+        COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_CUDA_H3_SEGMENT_FUSION
+        $<TARGET_FILE:test-cuda-h3-segment>)
+    set_tests_properties(test-cuda-h3-segment test-cuda-h3-segment-default test-cuda-h3-segment-disabled test-cuda-h3-segment-global-disabled test-cuda-h3-segment-concurrent-fallback
+        PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-cuda-h3-segment PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_SEGMENT_FUSION=1;GGML_CUDA_H3_SEGMENT_TRACE=1")
+    set_tests_properties(test-cuda-h3-segment-default PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_SEGMENT_TRACE=1")
+    set_tests_properties(test-cuda-h3-segment-disabled PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_SEGMENT_FUSION=0;GGML_CUDA_H3_SEGMENT_TRACE=1")
+    set_tests_properties(test-cuda-h3-segment-global-disabled PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_SEGMENT_FUSION=1;GGML_CUDA_H3_SEGMENT_TRACE=1;GGML_CUDA_DISABLE_FUSION=1")
+    set_tests_properties(test-cuda-h3-segment-concurrent-fallback PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_SEGMENT_TRACE=1;GGML_CUDA_GRAPH_OPT=1")
     add_executable(test-cuda-h3-norm-rope test-cuda-h3-norm-rope.cpp)
     target_include_directories(test-cuda-h3-norm-rope PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-cuda-h3-norm-rope PRIVATE ggml CUDA::cudart)

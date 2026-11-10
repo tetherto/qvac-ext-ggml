@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/h3-norm-rope.h"
+#include "ggml-cuda/h3-segment-fusion.h"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -3610,6 +3611,46 @@ static int ggml_cuda_try_fuse_h3_norm_rope(ggml_backend_cuda_context * cuda_ctx,
 }
 #endif
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static int ggml_cuda_try_fuse_h3_segment(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * graph, int first) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_H3_SEGMENT_FUSION");
+        const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
+        return (!value || strcmp(value, "1") == 0) && !(graph_opt && atoi(graph_opt) == 1);
+    }();
+    if (!enabled || graph->nodes[first]->op != GGML_OP_MUL ||
+        ggml_cuda_info().devices[cuda_ctx->device].cc != GGML_CUDA_CC_BLACKWELL ||
+        !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    ggml_cuda_h3::segment_fusion_match match;
+    if (!ggml_cuda_h3::match_segment_fusion(graph, first, match)) {
+        return 0;
+    }
+    const auto resident = [&](const ggml_tensor * tensor) {
+        return tensor && tensor->data && tensor->buffer &&
+            tensor->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) &&
+            (uintptr_t) tensor->data % alignof(float4) == 0 &&
+            (!tensor->view_src || (tensor->view_src->data &&
+             tensor->data == (const char *) tensor->view_src->data + tensor->view_offs));
+    };
+    if (!resident(match.base) || !resident(match.update) || !resident(match.scale) ||
+        !resident(match.output) || (match.shift && !resident(match.shift)) ||
+        !ggml_cuda_h3::segment_memory_safe(match)) {
+        return 0;
+    }
+    ggml_cuda_op_h3_segment(*cuda_ctx, match.base, match.update, match.scale, match.shift, match.output);
+    static const bool trace = getenv("GGML_CUDA_H3_SEGMENT_TRACE") &&
+        strcmp(getenv("GGML_CUDA_H3_SEGMENT_TRACE"), "1") == 0;
+    if (trace) {
+        GGML_LOG_INFO("h3_segment_fusion kind=%s nodes=%d width=%" PRId64 " tokens=%" PRId64 " batch=%" PRId64 "\n",
+            match.shift ? "modulation" : "residual", match.last - first + 1,
+            match.update->ne[0], match.update->ne[1], match.update->ne[2]);
+    }
+    return match.last - first;
+}
+#endif
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3618,6 +3659,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (const int skipped = ggml_cuda_try_fuse_h3_segment(cuda_ctx, cgraph, i)) {
+        return skipped;
+    }
     if (const int skipped = ggml_cuda_try_fuse_h3_norm_rope(cuda_ctx, cgraph, i)) {
         return skipped;
     }
