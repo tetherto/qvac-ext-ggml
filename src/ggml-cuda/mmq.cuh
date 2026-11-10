@@ -1492,4 +1492,12 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
+void ggml_cuda_mul_mat_q_affine(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        ggml_tensor * dst, float input_scale, float input_bias);
+
+void ggml_cuda_mul_mat_q_swiglu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weight, const ggml_tensor * packed,
+        const ggml_tensor * activation, ggml_tensor * dst, float input_scale, float input_bias, bool upstream_affine = false);
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

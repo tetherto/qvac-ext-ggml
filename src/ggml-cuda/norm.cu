@@ -154,6 +154,66 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void h3_norm_rope_f32(
+        const float * input, const float * weight, const float * pe, float * output,
+        int ncols, int nheads, int ntokens, int rotation, float eps,
+        int64_t s1, int64_t s2, int64_t s3,
+        int64_t p0, int64_t p1, int64_t p2, int64_t p3) {
+    ggml_cuda_pdl_lc();
+    const int tid = threadIdx.x;
+    const int64_t row = blockIdx.x;
+    const int head = row % nheads;
+    const int token = (row / nheads) % ntokens;
+    const int batch = row / (int64_t(nheads) * ntokens);
+    const float * x = input + batch * s3 + token * s2 + head * s1;
+    float * dst = output + ((int64_t(batch) * nheads + head) * ntokens + token) * ncols;
+    float tmp = 0.f;
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += 256) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    const int half = rotation / 2;
+    if (tid < half) {
+        const float a = scale * x[tid] * weight[tid];
+        const float b = scale * x[tid + half] * weight[tid + half];
+        const float * coefficients = pe + int64_t(token) * p3 + int64_t(tid) * p2;
+        const float first_a = __fmul_rn(a, coefficients[0]);
+        const float first_b = __fmul_rn(b, coefficients[p0]);
+        const float second_a = __fmul_rn(a, coefficients[p1]);
+        const float second_b = __fmul_rn(b, coefficients[p0 + p1]);
+        dst[tid] = __fadd_rn(first_a, first_b);
+        dst[tid + half] = __fadd_rn(second_a, second_b);
+    } else if (tid >= rotation && tid < ncols) {
+        dst[tid] = scale * x[tid] * weight[tid];
+    }
+}
+
+void ggml_cuda_op_h3_norm_rope(ggml_backend_cuda_context & ctx,
+                               const ggml_tensor * input,
+                               const ggml_tensor * weight,
+                               const ggml_tensor * pe,
+                               ggml_tensor * output,
+                               int rotation, float eps) {
+    const int64_t rows = input->ne[1] * input->ne[2] * input->ne[3];
+    const ggml_cuda_kernel_launch_params launch = {
+        dim3((unsigned int) rows), dim3(256), 32 * sizeof(float), ctx.stream()
+    };
+    ggml_cuda_kernel_launch(h3_norm_rope_f32, launch,
+        (const float *) input->data, (const float *) weight->data, (const float *) pe->data,
+        (float *) output->data, (int) input->ne[0], (int) input->ne[1], (int) input->ne[2], rotation, eps,
+        (int64_t) (input->nb[1] / sizeof(float)), (int64_t) (input->nb[2] / sizeof(float)),
+        (int64_t) (input->nb[3] / sizeof(float)), (int64_t) (pe->nb[0] / sizeof(float)),
+        (int64_t) (pe->nb[1] / sizeof(float)), (int64_t) (pe->nb[2] / sizeof(float)),
+        (int64_t) (pe->nb[3] / sizeof(float)));
+}
+#endif
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
