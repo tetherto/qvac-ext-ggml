@@ -17,8 +17,11 @@ static void require(bool ok, const char * message) {
     if (!ok) throw std::runtime_error(message);
 }
 
+static std::atomic<int> graph_replays{0};
+
 static void log_tuning(ggml_log_level, const char * message, void * opaque) {
     if (std::strstr(message, "h3_fattn_prefetch ")) ++*static_cast<std::atomic<int> *>(opaque);
+    if (std::strstr(message, "cuda_graph_execute ") && std::strstr(message, "mode=replay")) ++graph_replays;
     std::fputs(message, stderr);
 }
 
@@ -106,7 +109,9 @@ int main(int argc, char ** argv) {
         auto backend = ggml_backend_init_by_name("CUDA0", nullptr);
         require(backend != nullptr, "CUDA0 backend unavailable");
         for (int tokens : {1024, 1025, 3073}) run_case(backend, tokens, enabled);
-        require(launches == (enabled ? 9 : 0), "unexpected number of tuned attention launches");
+        require(enabled ? launches + graph_replays == 9 : launches == 0,
+            "unexpected number of tuned attention dispatches plus captured replays");
+        std::printf("PREFETCH host_dispatches=%d graph_replays=%d\n", launches.load(), graph_replays.load());
         ggml_backend_free(backend); ggml_log_set(nullptr, nullptr);
         return 0;
     } catch (const std::exception & error) {

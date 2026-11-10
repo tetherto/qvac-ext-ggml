@@ -76,10 +76,11 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-template <bool input_affine>
+template <bool input_affine, bool input_swiglu = false, bool upstream_affine = false>
 static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst, const float input_scale, const float input_bias) {
+    static_assert(!upstream_affine || input_swiglu, "upstream scaling requires SwiGLU");
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -144,8 +145,13 @@ static void ggml_cuda_mul_mat_q_impl(
             const int64_t s13 = src1->nb[3] / ts_src1;
             if constexpr (input_affine) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-                quantize_mmq_q8_1_affine_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13,
-                                            ne10_padded, ne11, ne12, ne13, input_scale, input_bias, stream);
+                if constexpr (input_swiglu) {
+                    quantize_mmq_q8_1_swiglu_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13,
+                                                ne10_padded, ne11, ne12, ne13, input_scale, input_bias, stream, upstream_affine);
+                } else {
+                    quantize_mmq_q8_1_affine_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13,
+                                                ne10_padded, ne11, ne12, ne13, input_scale, input_bias, stream);
+                }
 #else
                 static_assert(!input_affine, "affine MMQ input quantization is CUDA-only");
 #endif
@@ -262,6 +268,19 @@ void ggml_cuda_mul_mat_q_affine(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         ggml_tensor * dst, const float input_scale, const float input_bias) {
     ggml_cuda_mul_mat_q_impl<true>(ctx, src0, src1, nullptr, dst, input_scale, input_bias);
+}
+
+void ggml_cuda_mul_mat_q_swiglu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weight, const ggml_tensor * packed,
+        const ggml_tensor * activation, ggml_tensor * dst, const float input_scale, const float input_bias, const bool upstream_affine) {
+    ggml_tensor input = *activation;
+    input.data = packed->data;
+    memcpy(input.nb, packed->nb, sizeof(input.nb));
+    if (upstream_affine) {
+        ggml_cuda_mul_mat_q_impl<true, true, true>(ctx, weight, &input, nullptr, dst, input_scale, input_bias);
+    } else {
+        ggml_cuda_mul_mat_q_impl<true, true>(ctx, weight, &input, nullptr, dst, input_scale, input_bias);
+    }
 }
 #endif
 

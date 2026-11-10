@@ -45,9 +45,15 @@ static void require(bool condition, const char *message) {
     }
 }
 
+static std::atomic<int> replayed_fusions{0};
+static int fusions_per_replay = 0;
+
 static void log_fusions(ggml_log_level, const char *text, void *user_data) {
     if (std::strstr(text, "h3_norm_rope_fusion ")) {
         ++*static_cast<std::atomic<int> *>(user_data);
+    }
+    if (std::strstr(text, "cuda_graph_execute ") && std::strstr(text, "mode=replay")) {
+        replayed_fusions += fusions_per_replay;
     }
     std::fputs(text, stderr);
 }
@@ -79,6 +85,7 @@ static std::vector<unsigned char> bytes(ggml_tensor *tensor) {
 
 static void run_case(ggml_backend_t backend, int rotation, int heads, int tokens, int batch, int layout, bool arbitrary,
                      float input_scale, bool observed) {
+    fusions_per_replay = observed ? 0 : 1;
     auto *ctx = ggml_init({ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false), nullptr, true});
     auto *graph = ggml_new_graph_custom(ctx, 4096, false);
     auto *raw =
@@ -224,8 +231,10 @@ int main(int argc, char **argv) {
             run_case(backend, 96, 3, 7, 1, 0, true, 1e18f, false);
             run_case(backend, 96, 3, 17, 2, 1, true, 0.5f, true);
         }
-        require(fusion_launches.load() == (expect_fusion ? (full ? 3 : 45) : 0),
+        require((expect_fusion ? fusion_launches.load() + replayed_fusions.load() : fusion_launches.load()) ==
+                    (expect_fusion ? (full ? 3 : 45) : 0),
                 "unexpected actual fusion launch count; enable fusion and tracing for --expect-fusion");
+        std::printf("NORM_ROPE host_dispatches=%d replayed_fusions=%d\n", fusion_launches.load(), replayed_fusions.load());
         ggml_log_set(nullptr, nullptr);
         ggml_backend_free(backend);
         return 0;

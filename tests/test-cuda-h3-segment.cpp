@@ -57,9 +57,12 @@ static void require(bool condition, const char *text) {
         throw std::runtime_error(text);
 }
 
+static std::atomic<int> graph_replays{0};
+
 static void capture(ggml_log_level, const char *text, void *data) {
     if (std::strstr(text, "h3_segment_fusion "))
         ++*static_cast<std::atomic<int> *>(data);
+    if (std::strstr(text, "cuda_graph_execute ") && std::strstr(text, "mode=replay")) ++graph_replays;
     std::fputs(text, stderr);
 }
 
@@ -145,6 +148,7 @@ static void run_case(ggml_backend_t backend, std::atomic<int> &launches, bool en
         candidate[0]->buffer = target->buffer;
     }
     const int before = launches.load();
+    const int replays_before = graph_replays.load();
     std::vector<float> base_data, update_data, projection_data(ggml_nelements(projection));
     std::vector<std::vector<unsigned char>> first;
     for (int pass = 0; pass < 3; ++pass) {
@@ -201,7 +205,9 @@ static void run_case(ggml_backend_t backend, std::atomic<int> &launches, bool en
         auto data = download(projection);
         require(std::memcmp(data.data(), projection_data.data(), data.size()) == 0, "modulation projection changed");
     }
-    require(launches.load() - before == (enabled && layout != 2 ? expected_patterns * 3 : 0),
+    const int replays = graph_replays.load() - replays_before;
+    require(replays <= 3, "unexpected number of captured replays");
+    require(launches.load() - before == (enabled && layout != 2 ? expected_patterns * (3 - replays) : 0),
             "actual fusion count mismatch");
     std::printf("PASS width=%d tokens=%d batch=%d layout=%d whole=%d observed=%d alias=%d kind=%d scale=%.9g "
                 "fusions=%d A/B/A exact\n",

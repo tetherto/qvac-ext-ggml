@@ -79,6 +79,11 @@ if (GGML_CUDA AND TARGET ggml-cuda)
         ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_FUSION=1;GGML_CUDA_H3_NORM_ROPE_TRACE=1")
     set_tests_properties(test-cuda-h3-norm-rope-disabled PROPERTIES
         ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_FUSION=0;GGML_CUDA_H3_NORM_ROPE_TRACE=1")
+    set_property(TEST test-cuda-h3-fattn-enabled test-cuda-h3-fattn-disabled test-cuda-h3-fattn-default
+        test-cuda-h3-segment test-cuda-h3-segment-default test-cuda-h3-segment-disabled
+        test-cuda-h3-segment-global-disabled test-cuda-h3-segment-concurrent-fallback
+        test-cuda-h3-norm-rope test-cuda-h3-norm-rope-disabled
+        APPEND PROPERTY ENVIRONMENT "GGML_CUDA_GRAPH_TRACE=1")
 endif()
 
 add_executable(test-mul-mat-convrot test-mul-mat-convrot.cpp)
@@ -250,8 +255,35 @@ if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     add_executable(test-cuda-mmq-scale test-cuda-mmq-scale.cu)
+    add_executable(test-cuda-h3-swiglu-quant test-cuda-h3-swiglu-quant.cu)
+    if (GGML_CUDA_GRAPHS)
+        target_compile_definitions(test-cuda-mmq-scale PRIVATE GGML_CUDA_USE_GRAPHS)
+        target_compile_definitions(test-cuda-h3-swiglu-quant PRIVATE GGML_CUDA_USE_GRAPHS)
+    endif()
+    target_include_directories(test-cuda-h3-swiglu-quant PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-cuda-h3-swiglu-quant PRIVATE ggml ggml-cuda)
+    if (GGML_STATIC)
+        target_link_libraries(test-cuda-h3-swiglu-quant PRIVATE CUDA::cudart_static)
+        set_target_properties(test-cuda-h3-swiglu-quant PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+    else()
+        target_link_libraries(test-cuda-h3-swiglu-quant PRIVATE CUDA::cudart)
+        set_target_properties(test-cuda-h3-swiglu-quant PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+    endif()
+    set_target_properties(test-cuda-h3-swiglu-quant PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
+    add_test(NAME test-cuda-h3-swiglu-quant COMMAND test-cuda-h3-swiglu-quant)
+    add_test(NAME test-cuda-h3-swiglu-quant-default
+        COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_CUDA_H3_SWIGLU_QUANT_FUSION $<TARGET_FILE:test-cuda-h3-swiglu-quant>)
+    add_test(NAME test-cuda-h3-swiglu-quant-disabled COMMAND test-cuda-h3-swiglu-quant)
+    add_test(NAME test-cuda-h3-swiglu-quant-global-disabled COMMAND test-cuda-h3-swiglu-quant)
+    set_tests_properties(test-cuda-h3-swiglu-quant test-cuda-h3-swiglu-quant-default test-cuda-h3-swiglu-quant-disabled
+        test-cuda-h3-swiglu-quant-global-disabled PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-cuda-h3-swiglu-quant PROPERTIES ENVIRONMENT "GGML_CUDA_H3_SWIGLU_QUANT_FUSION=1")
+    set_tests_properties(test-cuda-h3-swiglu-quant-disabled PROPERTIES ENVIRONMENT "GGML_CUDA_H3_SWIGLU_QUANT_FUSION=0")
+    set_tests_properties(test-cuda-h3-swiglu-quant-global-disabled PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_SWIGLU_QUANT_FUSION=1;GGML_CUDA_DISABLE_FUSION=1")
     if (GGML_CUDA_FORCE_CUBLAS)
         target_compile_definitions(test-cuda-mmq-scale PRIVATE GGML_TEST_MMQ_SCALE_FORCE_CUBLAS)
+        target_compile_definitions(test-cuda-h3-swiglu-quant PRIVATE GGML_TEST_H3_SWIGLU_FORCE_CUBLAS)
     endif()
     target_include_directories(test-cuda-mmq-scale PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-cuda-mmq-scale PRIVATE ggml ggml-cuda)
