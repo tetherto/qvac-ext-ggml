@@ -1,3 +1,8 @@
+add_executable(test-h3-fattn-pattern test-h3-fattn-pattern.cpp)
+target_include_directories(test-h3-fattn-pattern PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-h3-fattn-pattern PRIVATE ggml-base)
+add_test(NAME test-h3-fattn-pattern COMMAND test-h3-fattn-pattern)
+
 add_executable(test-h3-segment-pattern test-h3-segment-pattern.cpp)
 target_include_directories(test-h3-segment-pattern PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-h3-segment-pattern PRIVATE ggml-base)
@@ -10,6 +15,26 @@ add_test(NAME test-h3-norm-rope-pattern COMMAND test-h3-norm-rope-pattern)
 
 if (GGML_CUDA AND TARGET ggml-cuda)
     find_package(CUDAToolkit REQUIRED)
+    add_executable(test-cuda-h3-fattn test-cuda-h3-fattn.cpp)
+    target_include_directories(test-cuda-h3-fattn PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-cuda-h3-fattn PRIVATE ggml CUDA::cudart)
+    if (GGML_BACKEND_DL)
+        add_dependencies(test-cuda-h3-fattn ggml-cuda)
+    else()
+        target_link_libraries(test-cuda-h3-fattn PRIVATE ggml-cuda)
+    endif()
+    add_test(NAME test-cuda-h3-fattn-enabled COMMAND test-cuda-h3-fattn --expect-prefetch)
+    add_test(NAME test-cuda-h3-fattn-disabled COMMAND test-cuda-h3-fattn)
+    add_test(NAME test-cuda-h3-fattn-default
+        COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_CUDA_H3_FATTN_PREFETCH
+        $<TARGET_FILE:test-cuda-h3-fattn> --expect-prefetch)
+    set_tests_properties(test-cuda-h3-fattn-enabled test-cuda-h3-fattn-disabled test-cuda-h3-fattn-default
+        PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-cuda-h3-fattn-enabled PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_FATTN_PREFETCH=1;GGML_CUDA_H3_FATTN_TRACE=1")
+    set_tests_properties(test-cuda-h3-fattn-disabled PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_FATTN_PREFETCH=0;GGML_CUDA_H3_FATTN_TRACE=1")
+    set_tests_properties(test-cuda-h3-fattn-default PROPERTIES ENVIRONMENT "GGML_CUDA_H3_FATTN_TRACE=1")
     add_executable(test-cuda-h3-segment test-cuda-h3-segment.cpp)
     target_include_directories(test-cuda-h3-segment PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-cuda-h3-segment PRIVATE ggml CUDA::cudart)
