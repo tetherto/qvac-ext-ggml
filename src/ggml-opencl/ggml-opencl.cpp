@@ -7156,6 +7156,10 @@ static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx
         if (!ggml_is_contiguous(gn->src[0]) || !ggml_is_contiguous(w) || !ggml_is_contiguous(b)) {
             return false;
         }
+
+        if (gn->src[0]->ne[3] != 1 || !ggml_are_same_shape(w, gn) || !ggml_are_same_shape(b, gn)) {
+            return false;
+        }
     }
 
     return true;
@@ -13450,7 +13454,13 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
     size_t global_work_size[] = {(size_t)n_groups*sgs, 1, 1};
     size_t local_work_size[] = {(size_t)sgs, 1, 1};
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    for (int64_t i3 = 0; i3 < src0->ne[3]; ++i3) {
+        const cl_ulong offset0_i3 = offset0 + i3*src0->nb[3];
+        const cl_ulong offsetd_i3 = offsetd + i3*dst->nb[3];
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0_i3));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd_i3));
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
 }
 
 static void ggml_cl_l2_norm(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -15790,7 +15800,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             const int n_q_chunk = std::min(chunk_rows, n_q - q_base);
             if (q_base > 0 || n_q_chunk != n_q) {
                 const cl_ulong offset_q_chunk    = offset_q + (cl_ulong)q_base * q_nb1;
-                const cl_ulong offset_o_chunk    = offset_o + (cl_ulong)q_base * o_nb1;
+                const cl_ulong offset_o_chunk    = offset_o + (cl_ulong)q_base * o_nb2;
                 const cl_ulong offset_mask_chunk = mask ? offset_mask + (cl_ulong)q_base * mask_nb1 : offset_mask;
                 CL_CHECK(clSetKernelArg(kernel, 1,  sizeof(cl_ulong), &offset_q_chunk));
                 CL_CHECK(clSetKernelArg(kernel, 7,  sizeof(cl_ulong), &offset_o_chunk));
