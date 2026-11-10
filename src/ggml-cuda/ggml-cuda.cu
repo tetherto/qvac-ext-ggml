@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/h3-norm-rope.h"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -3548,6 +3549,67 @@ static int ggml_cuda_try_fuse_q4_input_scale(ggml_backend_cuda_context * cuda_ct
 }
 #endif
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static int ggml_cuda_try_fuse_h3_norm_rope(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * graph, int first) {
+    static const bool enabled = getenv("GGML_CUDA_H3_NORM_ROPE_FUSION") &&
+        strcmp(getenv("GGML_CUDA_H3_NORM_ROPE_FUSION"), "1") == 0;
+    if (!enabled || graph->nodes[first]->op != GGML_OP_RMS_NORM ||
+        ggml_cuda_info().devices[cuda_ctx->device].cc != GGML_CUDA_CC_BLACKWELL) {
+        return 0;
+    }
+    ggml_cuda_h3::norm_rope_match match;
+    if (!ggml_cuda_h3::match_norm_rope(graph, first, match)) {
+        return 0;
+    }
+    const auto same_device = [&](const ggml_tensor * tensor) {
+        return tensor && tensor->data && tensor->buffer &&
+            tensor->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) &&
+            (uintptr_t) tensor->data % alignof(float) == 0;
+    };
+    const auto valid_view = [](const ggml_tensor * tensor) {
+        return !tensor->view_src || (tensor->view_src->data &&
+            tensor->data == (const char *) tensor->view_src->data + tensor->view_offs);
+    };
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t ap = (uintptr_t) a->data;
+        const uintptr_t bp = (uintptr_t) b->data;
+        const size_t as = ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+        const size_t bs = ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+        return ap <= bp ? bp - ap < as : ap - bp < bs;
+    };
+    if (!same_device(match.input) || !same_device(match.weight) || !same_device(match.pe) ||
+        !same_device(match.output) || !valid_view(match.input) || !valid_view(match.pe) ||
+        overlap(match.output, match.input) || overlap(match.output, match.weight) || overlap(match.output, match.pe)) {
+        return 0;
+    }
+    for (int i = first; i <= match.last; ++i) {
+        const auto * node = graph->nodes[i];
+        if (!node->data || !node->buffer || !valid_view(node)) {
+            return 0;
+        }
+        for (const auto * source : node->src) {
+            if (source && (!source->data || !source->buffer)) {
+                return 0;
+            }
+        }
+    }
+    const int outputs[] = {match.last};
+    const int count = match.last - first + 1;
+    if (!ggml_cuda_check_fusion_memory_ranges(graph, first, count, outputs, 1)) {
+        return 0;
+    }
+    ggml_cuda_op_h3_norm_rope(*cuda_ctx, match.input, match.weight, match.pe, match.output,
+                              match.rotation, ggml_get_op_params_f32(graph->nodes[first], 0));
+    static const bool trace = getenv("GGML_CUDA_H3_NORM_ROPE_TRACE") &&
+        strcmp(getenv("GGML_CUDA_H3_NORM_ROPE_TRACE"), "1") == 0;
+    if (trace) {
+        GGML_LOG_INFO("h3_norm_rope_fusion nodes=%d rotation=%d heads=%" PRId64 " tokens=%" PRId64 " batch=%" PRId64 "\n",
+            count, match.rotation, match.input->ne[1], match.input->ne[2], match.input->ne[3]);
+    }
+    return count - 1;
+}
+#endif
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3556,6 +3618,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (const int skipped = ggml_cuda_try_fuse_h3_norm_rope(cuda_ctx, cgraph, i)) {
+        return skipped;
+    }
     if (ggml_cuda_try_fuse_q4_input_scale(cuda_ctx, cgraph, i)) {
         return 1;
     }

@@ -1,3 +1,27 @@
+add_executable(test-h3-norm-rope-pattern test-h3-norm-rope-pattern.cpp)
+target_include_directories(test-h3-norm-rope-pattern PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-h3-norm-rope-pattern PRIVATE ggml-base)
+add_test(NAME test-h3-norm-rope-pattern COMMAND test-h3-norm-rope-pattern)
+
+if (GGML_CUDA AND TARGET ggml-cuda)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(test-cuda-h3-norm-rope test-cuda-h3-norm-rope.cpp)
+    target_include_directories(test-cuda-h3-norm-rope PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-cuda-h3-norm-rope PRIVATE ggml CUDA::cudart)
+    if (GGML_BACKEND_DL)
+        add_dependencies(test-cuda-h3-norm-rope ggml-cuda)
+    else()
+        target_link_libraries(test-cuda-h3-norm-rope PRIVATE ggml-cuda)
+    endif()
+    add_test(NAME test-cuda-h3-norm-rope COMMAND test-cuda-h3-norm-rope --expect-fusion)
+    add_test(NAME test-cuda-h3-norm-rope-disabled COMMAND test-cuda-h3-norm-rope)
+    set_tests_properties(test-cuda-h3-norm-rope test-cuda-h3-norm-rope-disabled PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-cuda-h3-norm-rope PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_FUSION=1;GGML_CUDA_H3_NORM_ROPE_TRACE=1")
+    set_tests_properties(test-cuda-h3-norm-rope-disabled PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_FUSION=0;GGML_CUDA_H3_NORM_ROPE_TRACE=1")
+endif()
+
 add_executable(test-mul-mat-convrot test-mul-mat-convrot.cpp)
 target_link_libraries(test-mul-mat-convrot PRIVATE ggml)
 if (NOT GGML_BACKEND_DL)
