@@ -1,0 +1,34 @@
+common --enable_platform_specific_config
+
+build --compilation_mode=opt
+build --incompatible_strict_action_env
+
+test --test_output=errors
+test --test_verbose_timeout_warnings
+
+build:native --//bazel:native_cpu
+
+build:sanitizer --strip=never
+build:sanitizer --copt=-fno-omit-frame-pointer
+build:sanitizer --copt=-g
+
+build:asan --config=sanitizer
+build:asan --copt=-fsanitize=address
+build:asan --linkopt=-fsanitize=address
+
+build:ubsan --config=sanitizer
+build:ubsan --copt=-fsanitize=undefined
+build:ubsan --copt=-fno-sanitize-recover=all
+build:ubsan --linkopt=-fsanitize=undefined
+
+build:tsan --config=sanitizer
+build:tsan --copt=-fsanitize=thread
+build:tsan --linkopt=-fsanitize=thread
+
+build:ci --announce_rc
+build:ci --color=yes
+build:ci --curses=no
+build:ci --show_progress_rate_limit=15
+build:ci --verbose_failures
+
+try-import %workspace%/user.bazelrc

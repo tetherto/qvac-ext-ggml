@@ -1,0 +1,73 @@
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//bazel:ggml_options.bzl", "CXX_STANDARD_OPTS", "dynamic_backends_only")
+load(":backend_loader_stub.bzl", "backend_loader_stub")
+
+cc_test(
+    name = "test-convrot",
+    size = "small",
+    srcs = ["test-convrot.cpp"],
+    cxxopts = CXX_STANDARD_OPTS,
+    deps = ["//:ggml"],
+)
+
+cc_test(
+    name = "test-diffusion-batch-ops",
+    size = "small",
+    srcs = ["test-diffusion-batch-ops.cpp"],
+    cxxopts = CXX_STANDARD_OPTS,
+    deps = ["//:ggml"],
+)
+
+cc_test(
+    name = "test-mul-mat-convrot",
+    size = "small",
+    srcs = ["test-mul-mat-convrot.cpp"],
+    cxxopts = CXX_STANDARD_OPTS,
+    deps = ["//:ggml"],
+)
+
+cc_test(
+    name = "test-mul-mat-convrot-h256-hint",
+    size = "small",
+    srcs = ["test-mul-mat-convrot-h256-hint.cpp"],
+    cxxopts = CXX_STANDARD_OPTS,
+    deps = ["//:ggml"],
+)
+
+backend_loader_stub(
+    name = "libtest-backend-loader-stub-zero.so",
+    score = 0,
+    stub_name = "STUB_ZERO",
+)
+
+backend_loader_stub(
+    name = "libtest-backend-loader-stub-ok.so",
+    score = 5,
+    stub_name = "STUB_OK",
+)
+
+backend_loader_stub(
+    name = "libtest-backend-loader-stub-failed.so",
+    fail_init = True,
+    score = 10,
+    stub_name = "STUB_FAILED",
+)
+
+cc_test(
+    name = "test-backend-loader",
+    size = "small",
+    srcs = ["test-backend-loader.cpp"],
+    cxxopts = CXX_STANDARD_OPTS,
+    data = [
+        ":libtest-backend-loader-stub-failed.so",
+        ":libtest-backend-loader-stub-ok.so",
+        ":libtest-backend-loader-stub-zero.so",
+    ],
+    local_defines = [
+        'STUB_FAILED_PATH=\\"$(rootpath :libtest-backend-loader-stub-failed.so)\\"',
+        'STUB_OK_PATH=\\"$(rootpath :libtest-backend-loader-stub-ok.so)\\"',
+        'STUB_ZERO_PATH=\\"$(rootpath :libtest-backend-loader-stub-zero.so)\\"',
+    ],
+    target_compatible_with = dynamic_backends_only(),
+    deps = ["//:ggml"],
+)

@@ -1,0 +1,111 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load(
+    "//bazel:ggml_options.bzl",
+    "ggml_base_linkopts",
+    "ggml_base_private_defines",
+    "ggml_base_public_defines",
+    "ggml_c_opts",
+    "ggml_cpu_arch_srcs",
+    "ggml_cpu_isa_opts",
+    "ggml_cpu_linkopts",
+    "ggml_cpu_private_defines",
+    "ggml_cpu_public_defines",
+    "ggml_cxx_opts",
+    "ggml_optimization_opts",
+    "ggml_registry_linkopts",
+    "ggml_registry_private_defines",
+    "supported_platforms",
+)
+
+package(default_visibility = ["//visibility:public"])
+
+GGML_BASE_SRCS = [
+    "src/ggml.c",
+    "src/ggml.cpp",
+    "src/ggml-alloc.c",
+    "src/ggml-backend.cpp",
+    "src/ggml-backend-meta.cpp",
+    "src/ggml-opt.cpp",
+    "src/ggml-threading.cpp",
+    "src/ggml-quants.c",
+    "src/gguf.cpp",
+    "src/uint8-buff-stream.cpp",
+]
+
+GGML_REGISTRY_SRCS = [
+    "src/ggml-backend-dl.cpp",
+    "src/ggml-backend-reg.cpp",
+]
+
+CPU_HEADERS_USED_BY_BASE = ["src/ggml-cpu/ggml-cpu-impl.h"]
+
+cc_library(
+    name = "ggml-internal-headers",
+    hdrs = glob(["src/*.h"]) + CPU_HEADERS_USED_BY_BASE,
+    includes = ["src"],
+    target_compatible_with = supported_platforms(),
+    visibility = ["//tests:__pkg__"],
+)
+
+cc_library(
+    name = "ggml-cpu-internal-headers",
+    hdrs = glob(
+        ["src/ggml-cpu/**/*.h"],
+        exclude = CPU_HEADERS_USED_BY_BASE,
+    ),
+    includes = ["src/ggml-cpu"],
+    target_compatible_with = supported_platforms(),
+    visibility = ["//visibility:private"],
+)
+
+cc_library(
+    name = "ggml-base",
+    srcs = GGML_BASE_SRCS,
+    hdrs = glob(["include/*.h"]),
+    conlyopts = ggml_c_opts(),
+    copts = ggml_optimization_opts(),
+    cxxopts = ggml_cxx_opts(),
+    defines = ggml_base_public_defines(),
+    implementation_deps = [":ggml-internal-headers"],
+    includes = ["include"],
+    linkopts = ggml_base_linkopts(),
+    local_defines = ggml_base_private_defines(),
+    target_compatible_with = supported_platforms(),
+)
+
+cc_library(
+    name = "ggml-cpu",
+    srcs = glob([
+        "src/ggml-cpu/*.c",
+        "src/ggml-cpu/*.cpp",
+        "src/ggml-cpu/amx/*.cpp",
+    ]) + ggml_cpu_arch_srcs(),
+    conlyopts = ggml_c_opts(),
+    copts = ggml_optimization_opts() + ggml_cpu_isa_opts(),
+    cxxopts = ggml_cxx_opts(),
+    defines = ggml_cpu_public_defines(),
+    implementation_deps = [
+        ":ggml-cpu-internal-headers",
+        ":ggml-internal-headers",
+    ],
+    linkopts = ggml_cpu_linkopts(),
+    local_defines = ggml_cpu_private_defines(),
+    target_compatible_with = supported_platforms(),
+    deps = [":ggml-base"],
+)
+
+cc_library(
+    name = "ggml",
+    srcs = GGML_REGISTRY_SRCS,
+    copts = ggml_optimization_opts(),
+    cxxopts = ggml_cxx_opts(),
+    defines = ["GGML_USE_CPU"],
+    implementation_deps = [":ggml-internal-headers"],
+    linkopts = ggml_registry_linkopts(),
+    local_defines = ggml_registry_private_defines(),
+    target_compatible_with = supported_platforms(),
+    deps = [
+        ":ggml-base",
+        ":ggml-cpu",
+    ],
+)
