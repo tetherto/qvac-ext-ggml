@@ -1,0 +1,52 @@
+name: Bazel C++ tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.config }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            config: opt
+          - os: ubuntu-24.04-arm
+            config: opt
+          - os: macos-15
+            config: opt
+          - os: ubuntu-24.04
+            config: asan
+          - os: ubuntu-24.04
+            config: ubsan
+          - os: ubuntu-24.04
+            config: tsan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bazel with cached downloads and actions
+        uses: bazel-contrib/setup-bazel@0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ matrix.os }}-${{ matrix.config }}
+          repository-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build and run every test target
+        env:
+          SANITIZER_CONFIG: ${{ matrix.config != 'opt' && format('--config={0}', matrix.config) || '' }}
+        run: bazel test --config=ci $SANITIZER_CONFIG //...
