@@ -1,5 +1,11 @@
 find_library(MATH_LIBRARY m)
 
+foreach(TEST_TARGET IN ITEMS test-xdna-repack test-xdna-head-rows test-xdna-match)
+    if (TARGET ${TEST_TARGET})
+        add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+    endif()
+endforeach()
+
 # check systems
 if (NOT UNAME_S)
     execute_process(COMMAND uname -s OUTPUT_VARIABLE UNAME_S)
