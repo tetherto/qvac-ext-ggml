@@ -129,7 +129,31 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
         extern const char ggml_metallib_start[];
         extern const char ggml_metallib_end[];
 
-        src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];
+#if GGML_METAL_EMBED_PRECOMPILED
+        if (ggml_metal_device_get_props(dev)->has_bfloat && !ggml_metal_device_get_props(dev)->has_tensor) {
+            extern const char ggml_metal_precompiled_start[];
+            extern const char ggml_metal_precompiled_end[];
+            dispatch_data_t data = dispatch_data_create(ggml_metal_precompiled_start,
+                    ggml_metal_precompiled_end - ggml_metal_precompiled_start,
+                    dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{});
+            if (data != nil) {
+                NSError * precompiled_error = nil;
+                library = [device newLibraryWithData:data error:&precompiled_error];
+                if (library != nil) {
+                    GGML_LOG_INFO("%s: using embedded precompiled Metal library\n", __func__);
+                } else {
+                    GGML_LOG_WARN("%s: precompiled Metal library unavailable, compiling source: %s\n",
+                            __func__, [[precompiled_error localizedDescription] UTF8String]);
+                }
+#if !__has_feature(objc_arc)
+                dispatch_release(data);
+#endif
+            }
+        }
+#endif
+        if (library == nil) {
+            src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];
+        }
 #else
 
 #ifdef SWIFT_PACKAGE
