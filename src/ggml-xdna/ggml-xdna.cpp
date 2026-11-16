@@ -2981,6 +2981,10 @@ static void xdna_model_use(ggml_backend_xdna_context * ctx, const void * model) 
 // releases it.
 static void xdna_model_drop(ggml_backend_xdna_context * ctx, const void * model) {
     std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
+    xdna_ops_finalize(&ctx->ops);
+    xdna_pending_wait(ctx);
+    xdna_ops_release_weights(&ctx->ops);
+    xdna_pgemm_release();
     ctx->model_misfit.erase(model);
     ctx->host_prefill_models.erase(model);
     if (model == ctx->cur_model) {
