@@ -755,3 +755,22 @@ if (GGML_VULKAN)
     target_link_libraries(test-vulkan-view-alignment PRIVATE ggml)
     add_test(NAME test-vulkan-view-alignment COMMAND $<TARGET_FILE:test-vulkan-view-alignment>)
 endif()
+
+if (GGML_VULKAN)
+    add_executable(test-vulkan-teardown test-vulkan-teardown.cpp)
+    target_link_libraries(test-vulkan-teardown PRIVATE ggml)
+    add_test(NAME test-vulkan-teardown COMMAND $<TARGET_FILE:test-vulkan-teardown>)
+    add_test(NAME test-vulkan-teardown-kept-buffer COMMAND $<TARGET_FILE:test-vulkan-teardown> --keep-buffer)
+    add_test(NAME test-vulkan-teardown-free-after-teardown COMMAND $<TARGET_FILE:test-vulkan-teardown> --free-after-teardown)
+
+    find_path(VULKAN_VALIDATION_LAYER_DIR VkLayer_khronos_validation.json
+              HINTS $ENV{VULKAN_SDK}/share/vulkan/explicit_layer.d
+              PATHS /usr/share/vulkan/explicit_layer.d /usr/local/share/vulkan/explicit_layer.d /etc/vulkan/explicit_layer.d)
+    find_library(VULKAN_VALIDATION_LAYER_LIBRARY VkLayer_khronos_validation HINTS $ENV{VULKAN_SDK}/lib)
+    if (VULKAN_VALIDATION_LAYER_DIR AND VULKAN_VALIDATION_LAYER_LIBRARY)
+        get_filename_component(VULKAN_VALIDATION_LAYER_LIBRARY_DIR ${VULKAN_VALIDATION_LAYER_LIBRARY} DIRECTORY)
+        set_tests_properties(test-vulkan-teardown test-vulkan-teardown-kept-buffer test-vulkan-teardown-free-after-teardown PROPERTIES
+            ENVIRONMENT "VK_ADD_LAYER_PATH=${VULKAN_VALIDATION_LAYER_DIR};VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation;LD_LIBRARY_PATH=${VULKAN_VALIDATION_LAYER_LIBRARY_DIR}:$ENV{LD_LIBRARY_PATH}"
+            FAIL_REGULAR_EXPRESSION "VUID-vkDestroy")
+    endif()
+endif()
