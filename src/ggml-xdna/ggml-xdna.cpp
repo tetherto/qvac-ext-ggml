@@ -9,6 +9,7 @@
 #include "xdna-conv-prefill.h"
 #include "xdna-gdn-mm.h"
 #include "xdna-head.h"
+#include "xdna-host-threads.h"
 #include "xdna-match.h"
 #include "xdna-norm.h"
 #include "xdna-ops.h"
@@ -1869,6 +1870,11 @@ static int xdna_host_decode_threads(void) {
     return n;
 }
 
+static int xdna_host_compute_threads(void) {
+    static const int n = xdna_host_compute_thread_count(xdna_host_decode_threads(), xdna_host_decode_default());
+    return n;
+}
+
 // n allowed CPUs, one a core, filling one L3 domain before the next; empty when
 // there are fewer cores or no topology.
 static std::vector<int> xdna_decode_cpus(int n) {
@@ -1906,7 +1912,7 @@ static const xdna_host_cpu & xdna_host_decode_cpu(void) {
         if (h.backend == nullptr) {
             return h;
         }
-        const int n = xdna_host_decode_threads();
+        const int n = xdna_host_compute_threads();
         ggml_backend_cpu_set_n_threads(h.backend, n);
         const std::vector<int> cpus = xdna_host_decode_pin() ? xdna_decode_cpus(n) : std::vector<int>();
         if (!cpus.empty()) {
@@ -1947,7 +1953,7 @@ static enum ggml_status xdna_host_decode_run(ggml_backend_xdna_context * ctx, st
     // the host rewrites cache rows the decode attention pool may hold
     ctx->att_flushed.clear();
     const std::vector<cpu_set_t> saved =
-        xdna_host_decode_pin() ? xdna_affinity_save(xdna_host_decode_threads()) : std::vector<cpu_set_t>();
+        xdna_host_decode_pin() ? xdna_affinity_save(xdna_host_compute_threads()) : std::vector<cpu_set_t>();
     const xdna_host_cpu & cpu = xdna_host_decode_cpu();
     if (cpu.backend == nullptr) {
         return GGML_STATUS_FAILED;

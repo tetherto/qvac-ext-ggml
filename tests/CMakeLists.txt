@@ -750,6 +750,9 @@ endif()
 add_executable(test-backend-nmse test-backend-nmse.cpp)
 add_test(NAME test-backend-nmse COMMAND $<TARGET_FILE:test-backend-nmse>)
 
+add_executable(test-xdna-host-threads test-xdna-host-threads.cpp)
+add_test(NAME test-xdna-host-threads COMMAND $<TARGET_FILE:test-xdna-host-threads>)
+
 if (GGML_VULKAN)
     add_executable(test-vulkan-view-alignment test-vulkan-view-alignment.cpp)
     target_link_libraries(test-vulkan-view-alignment PRIVATE ggml)
