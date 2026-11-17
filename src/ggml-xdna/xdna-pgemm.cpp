@@ -9,6 +9,7 @@
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
 #include "xdna-util.h"
+#include "xdna-weight-cache.h"
 
 #include <immintrin.h>
 
@@ -114,6 +115,8 @@ w_plan plan_of(const xdna_gemv_geom & g) {
 }
 
 struct weights {
+    xdna_weight_signature signature;
+    xdna_weight_signature up_signature;
     xdna_gemv_geom geom;
     w_plan         plan;
     xdna_buffer *  bo = nullptr;
@@ -533,13 +536,21 @@ weights * weights_for(xdna_kernel_pool *  pool,
                       const ggml_tensor * w,
                       const ggml_tensor * up  = nullptr,
                       bool                cat = false) {
+    const xdna_weight_signature signature(w);
+    const xdna_weight_signature up_signature(up);
     const std::tuple<const void *, const void *, bool> key{ w->data, up ? up->data : nullptr, cat };
     auto                                               it = g_pg.w.find(key);
     if (it != g_pg.w.end()) {
-        return &it->second;
+        if (signature == it->second.signature && (!up || up_signature == it->second.up_signature)) {
+            return &it->second;
+        }
+        xdna_buffer_free(it->second.bo);
+        g_pg.w.erase(it);
     }
     const int N = (int) w->ne[1];
     weights   ws;
+    ws.signature = signature;
+    ws.up_signature = up_signature;
     ws.geom = cat ? geom_of(w, N + up->ne[1]) :
               up  ? xdna_gemv_variant(w->type, w->ne[0], (int64_t) 2 * N, false, XDNA_GEMV_SPLIT_FUSED, true) :
                     geom_of(w);
