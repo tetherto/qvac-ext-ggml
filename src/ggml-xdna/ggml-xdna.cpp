@@ -8,6 +8,7 @@
 #include "xdna-attn-mm.h"
 #include "xdna-conv-prefill.h"
 #include "xdna-gdn-mm.h"
+#include "xdna-glue.h"
 #include "xdna-head.h"
 #include "xdna-match.h"
 #include "xdna-norm.h"
@@ -85,25 +86,7 @@ static bool xdna_glue_active(void) {
 // one NPU region instead of splitting a chunk at every backend change; claimed
 // ops run on the host (CPU backend) from within the XDNA chunk.
 static bool xdna_glue_claims(const struct ggml_tensor * op) {
-    if (!xdna_glue_active()) {
-        return false;
-    }
-    if (op->op == GGML_OP_NONE || ggml_xdna_is_view_op(op->op)) {
-        return false;
-    }
-    // The KV append writes llama's f16 cache, which this backend's buffers
-    // hold. Left to the CPU backend it split the graph at every attention
-    // layer - seven graph_compute calls a token - and an attention layer
-    // could never be one region. The CPU's own set_rows runs it here.
-    if (op->op == GGML_OP_SET_ROWS) {
-        return op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
-               (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
-    }
-    // Host-fallback writes op->data; only claim plain contiguous f32 tensors.
-    if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
-        return false;
-    }
-    return true;
+    return xdna_glue_active() && xdna_glue_supports_op(op);
 }
 
 // Fast path for the concat the glue claims. ggml's generic concat copies one

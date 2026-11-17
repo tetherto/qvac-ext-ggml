@@ -11,6 +11,7 @@
 #include "xdna-quant.h"
 #include "xdna-runtime.h"
 #include "xdna-util.h"
+#include "xdna-weight-cache.h"
 
 #include <algorithm>
 #include <climits>
@@ -223,8 +224,7 @@ static xdna_gemm_geom xdna_pick_geom(const xdna_ops * ops, int M, int K, int N, 
 
 // Return the device BO holding the packed [K_pad x N] bf16 weight for `src0`,
 // built and cached on first use. K_pad rounds K up to the GEMM block, so every
-// K-block reads a valid slice. Weights are immutable, so the transpose + bf16
-// conversion runs once.
+// K-block reads a valid slice.
 
 static void f32_to_bf16_run(const float * src, ggml_bf16_t * dst, int64_t n) {
     uint16_t * d = (uint16_t *) dst;
@@ -234,12 +234,20 @@ static void f32_to_bf16_run(const float * src, ggml_bf16_t * dst, int64_t n) {
 }
 
 static xdna_buffer * gemm_weight_bo(xdna_ops * ops, const struct ggml_tensor * src0, int K, int N) {
+    const xdna_weight_signature signature(src0);
     const xdna_ops::weight_key key = { src0->data, K, N };
     {
         std::lock_guard<std::mutex> lock(ops->weight_mutex);
         auto                        it = ops->weight_bo.find(key);
         if (it != ops->weight_bo.end()) {
-            return it->second;
+            if (signature == it->second.signature) {
+                return it->second.buffer;
+            }
+            if (!xdna_ops_finalize(ops)) {
+                return nullptr;
+            }
+            xdna_buffer_free(it->second.buffer);
+            ops->weight_bo.erase(it);
         }
     }
 
@@ -292,7 +300,7 @@ static xdna_buffer * gemm_weight_bo(xdna_ops * ops, const struct ggml_tensor * s
     }
 
     std::lock_guard<std::mutex> lock(ops->weight_mutex);
-    ops->weight_bo.emplace(key, bo_w);
+    ops->weight_bo.emplace(key, xdna_ops::cached_weight{ bo_w, signature });
     return bo_w;
 }
 
@@ -344,17 +352,27 @@ static void gemm_int8_pack_col(const struct ggml_tensor * src0, int n, int K, fl
 }
 
 static xdna_ops::int8_wbo * gemm_int8_weight_bo(xdna_ops * ops, const struct ggml_tensor * src0, int K, int N) {
+    const xdna_weight_signature signature(src0);
     const xdna_ops::weight_key key = { src0->data, K, N };
     {
         std::lock_guard<std::mutex> lock(ops->int8_mutex);
         auto                        it = ops->int8_wbo_map.find(key);
         if (it != ops->int8_wbo_map.end()) {
-            return it->second;
+            if (signature == it->second->signature) {
+                return it->second;
+            }
+            if (!xdna_ops_finalize(ops)) {
+                return nullptr;
+            }
+            xdna_buffer_free(it->second->bo);
+            delete it->second;
+            ops->int8_wbo_map.erase(it);
         }
     }
 
     const int            K_pad = (K + GEMM_K_MAX - 1) / GEMM_K_MAX * GEMM_K_MAX;
     xdna_ops::int8_wbo * wb    = new xdna_ops::int8_wbo;
+    wb->signature              = signature;
     wb->bo                     = xdna_buffer_alloc(ops->pool->device, (size_t) K_pad * N);
     wb->K                      = K;
     wb->N                      = N;
@@ -917,11 +935,19 @@ static xdna_gemv * xdna_gemv_get(xdna_ops *                         ops,
                                  const struct ggml_tensor * const * ws,
                                  int                                n_w,
                                  const xdna_gemv_geom &             geom) {
+    std::vector<xdna_weight_signature> signatures;
+    for (int i = 0; i < n_w; i++) {
+        signatures.emplace_back(ws[i]);
+    }
     {
         std::lock_guard<std::mutex> lock(ops->gemv_mutex);
         auto                        it = ops->gemv.find(ws[0]->data);
         if (it != ops->gemv.end()) {
-            return it->second;
+            if (signatures == it->second.signatures) {
+                return it->second.runner;
+            }
+            xdna_gemv_free(it->second.runner);
+            ops->gemv.erase(it);
         }
     }
     std::vector<uint8_t> packed;
@@ -931,7 +957,7 @@ static xdna_gemv * xdna_gemv_get(xdna_ops *                         ops,
     }
     xdna_gemv *                 g = xdna_gemv_create(ops->pool, geom, packed);
     std::lock_guard<std::mutex> lock(ops->gemv_mutex);
-    ops->gemv.emplace(ws[0]->data, g);
+    ops->gemv.emplace(ws[0]->data, xdna_ops::cached_gemv{ g, std::move(signatures) });
     return g;
 }
 
@@ -1159,7 +1185,7 @@ void xdna_ops_release_weights(xdna_ops * ops) {
     {
         std::lock_guard<std::mutex> lock(ops->weight_mutex);
         for (auto & kv : ops->weight_bo) {
-            xdna_buffer_free(kv.second);
+            xdna_buffer_free(kv.second.buffer);
         }
         ops->weight_bo.clear();
     }
@@ -1176,7 +1202,7 @@ void xdna_ops_release_weights(xdna_ops * ops) {
     {
         std::lock_guard<std::mutex> lock(ops->gemv_mutex);
         for (auto & kv : ops->gemv) {
-            xdna_gemv_free(kv.second);
+            xdna_gemv_free(kv.second.runner);
         }
         ops->gemv.clear();
     }

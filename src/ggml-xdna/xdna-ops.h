@@ -9,6 +9,7 @@
 #include "xdna-runtime.h"
 #include "xdna-seq.h"
 #include "xdna-types.h"
+#include "xdna-weight-cache.h"
 
 #include <map>
 #include <mutex>
@@ -52,8 +53,7 @@ struct xdna_ops {
 
     // Packed-weight cache: tensor data pointer + K + N -> device BO holding the
     // transposed [K_pad x N] bf16 weights (K_pad = K rounded up to the GEMM
-    // block). Weights are immutable, so the pack (transpose + bf16 conversion)
-    // is done once per tensor and reused; kernels point into it via B offsets.
+    // block). Kernels point into it via B offsets.
     struct weight_key {
         const void * data = nullptr;
         int          K    = 0;
@@ -71,13 +71,18 @@ struct xdna_ops {
         }
     };
 
-    std::unordered_map<weight_key, xdna_buffer *, weight_hash> weight_bo;
+    struct cached_weight {
+        xdna_buffer * buffer = nullptr;
+        xdna_weight_signature signature;
+    };
+    std::unordered_map<weight_key, cached_weight, weight_hash> weight_bo;
     std::mutex                                                 weight_mutex;
 
     // Native int8 weight cache for quantized (Q4_K/Q5_K/Q6_K) prefill: packed
     // [K_pad x N] int8 codes (1 B/val vs 2 for the bf16 dequant stream) plus
     // per-column scales, keyed like the gemm weights.
     struct int8_wbo {
+        xdna_weight_signature signature;
         xdna_buffer *      bo = nullptr;  // [K_pad x N] int8 codes
         std::vector<float> dw;            // per-column scale (N)
         int                K = 0;
@@ -115,9 +120,12 @@ struct xdna_ops {
     std::vector<pending_op> pending;
 
     // Decode GEMV runners, keyed by the first weight of the dispatch. The
-    // packed weights live in the runner's device buffer for the process
-    // lifetime, so the pack cost is paid once.
-    std::unordered_map<const void *, xdna_gemv *> gemv;
+    // packed weights live in the runner's device buffer.
+    struct cached_gemv {
+        xdna_gemv * runner = nullptr;
+        std::vector<xdna_weight_signature> signatures;
+    };
+    std::unordered_map<const void *, cached_gemv> gemv;
     std::mutex                                    gemv_mutex;
 
     // Projections that share an activation run as one dispatch: their weights
