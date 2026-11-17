@@ -759,6 +759,9 @@ add_test(NAME test-backend-nmse COMMAND $<TARGET_FILE:test-backend-nmse>)
 add_executable(test-xdna-host-threads test-xdna-host-threads.cpp)
 add_test(NAME test-xdna-host-threads COMMAND $<TARGET_FILE:test-xdna-host-threads>)
 
+add_executable(test-xdna-rec-host test-xdna-rec-host.cpp)
+add_test(NAME test-xdna-rec-host COMMAND $<TARGET_FILE:test-xdna-rec-host>)
+
 if (GGML_VULKAN)
     add_executable(test-vulkan-view-alignment test-vulkan-view-alignment.cpp)
     target_link_libraries(test-vulkan-view-alignment PRIVATE ggml)

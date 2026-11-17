@@ -16,6 +16,7 @@
 #include "xdna-pgemm.h"
 #include "xdna-prof.h"
 #include "xdna-rec-gemv.h"
+#include "xdna-rec-host.h"
 #include "xdna-rec.h"
 #include "xdna-runtime.h"
 #include "xdna-types.h"
@@ -1948,6 +1949,21 @@ static void xdna_affinity_restore(const std::vector<cpu_set_t> & masks) {
 static enum ggml_status xdna_host_decode_run(ggml_backend_xdna_context * ctx, struct ggml_cgraph * cgraph) {
     if (!xdna_ops_finalize(&ctx->ops) || !xdna_pending_wait(ctx)) {
         ctx->pending_failed = false;
+        return GGML_STATUS_FAILED;
+    }
+    const auto read_state = [](xdna_rec_session & session) {
+        const size_t ns = (size_t) xdna_rec_pack::state_floats();
+        const size_t nr = (size_t) 3 * xdna_rec_pack::CH;
+        if (!session.core || !session.own_s || !session.own_r || session.row < 0 ||
+            session.own_s_b / sizeof(float) / ns <= (size_t) session.row ||
+            session.own_r_b / sizeof(float) / nr <= (size_t) session.row) {
+            return false;
+        }
+        return xdna_rec_core_read_state(session.core, session.own_r + (size_t) session.row * nr,
+                                        session.own_s + (size_t) session.row * ns);
+    };
+    if (!xdna_rec_prepare_host(ctx->rec, ctx->cur_backend, read_state)) {
+        GGML_LOG_ERROR("%s: recurrent state readback before host execution failed\n", "ggml-xdna");
         return GGML_STATUS_FAILED;
     }
     // the host rewrites cache rows the decode attention pool may hold
