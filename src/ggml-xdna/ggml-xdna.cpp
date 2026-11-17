@@ -10,12 +10,14 @@
 #include "xdna-gdn-mm.h"
 #include "xdna-glue.h"
 #include "xdna-head.h"
+#include "xdna-host-threads.h"
 #include "xdna-match.h"
 #include "xdna-norm.h"
 #include "xdna-ops.h"
 #include "xdna-pgemm.h"
 #include "xdna-prof.h"
 #include "xdna-rec-gemv.h"
+#include "xdna-rec-host.h"
 #include "xdna-rec.h"
 #include "xdna-runtime.h"
 #include "xdna-types.h"
@@ -692,6 +694,7 @@ struct ggml_backend_xdna_context {
     // Whether each model's residual stream is wider than the fused designs'
     // (xdna_wants_host_decode), once a chunk with a layer norm said so.
     std::map<const void *, bool>           model_misfit;
+    std::set<const void *>                 host_prefill_models;
     // The node the dispatch loop is on, so the exception boundary in
     // ggml_backend_xdna_graph_compute can name it. Null outside a graph.
     const struct ggml_tensor * cur_node   = nullptr;
@@ -1851,6 +1854,11 @@ static int xdna_host_decode_threads(void) {
     return n;
 }
 
+static int xdna_host_compute_threads(void) {
+    static const int n = xdna_host_compute_thread_count(xdna_host_decode_threads(), xdna_host_decode_default());
+    return n;
+}
+
 // n allowed CPUs, one a core, filling one L3 domain before the next; empty when
 // there are fewer cores or no topology.
 static std::vector<int> xdna_decode_cpus(int n) {
@@ -1888,7 +1896,7 @@ static const xdna_host_cpu & xdna_host_decode_cpu(void) {
         if (h.backend == nullptr) {
             return h;
         }
-        const int n = xdna_host_decode_threads();
+        const int n = xdna_host_compute_threads();
         ggml_backend_cpu_set_n_threads(h.backend, n);
         const std::vector<int> cpus = xdna_host_decode_pin() ? xdna_decode_cpus(n) : std::vector<int>();
         if (!cpus.empty()) {
@@ -1926,10 +1934,25 @@ static enum ggml_status xdna_host_decode_run(ggml_backend_xdna_context * ctx, st
         ctx->pending_failed = false;
         return GGML_STATUS_FAILED;
     }
+    const auto read_state = [](xdna_rec_session & session) {
+        const size_t ns = (size_t) xdna_rec_pack::state_floats();
+        const size_t nr = (size_t) 3 * xdna_rec_pack::CH;
+        if (!session.core || !session.own_s || !session.own_r || session.row < 0 ||
+            session.own_s_b / sizeof(float) / ns <= (size_t) session.row ||
+            session.own_r_b / sizeof(float) / nr <= (size_t) session.row) {
+            return false;
+        }
+        return xdna_rec_core_read_state(session.core, session.own_r + (size_t) session.row * nr,
+                                        session.own_s + (size_t) session.row * ns);
+    };
+    if (!xdna_rec_prepare_host(ctx->rec, ctx->cur_backend, read_state)) {
+        GGML_LOG_ERROR("%s: recurrent state readback before host execution failed\n", "ggml-xdna");
+        return GGML_STATUS_FAILED;
+    }
     // the host rewrites cache rows the decode attention pool may hold
     ctx->att_flushed.clear();
     const std::vector<cpu_set_t> saved =
-        xdna_host_decode_pin() ? xdna_affinity_save(xdna_host_decode_threads()) : std::vector<cpu_set_t>();
+        xdna_host_decode_pin() ? xdna_affinity_save(xdna_host_compute_threads()) : std::vector<cpu_set_t>();
     const xdna_host_cpu & cpu = xdna_host_decode_cpu();
     if (cpu.backend == nullptr) {
         return GGML_STATUS_FAILED;
@@ -2962,6 +2985,7 @@ static void xdna_model_drop(ggml_backend_xdna_context * ctx, const void * model)
     xdna_ops_release_weights(&ctx->ops);
     xdna_pgemm_release();
     ctx->model_misfit.erase(model);
+    ctx->host_prefill_models.erase(model);
     if (model == ctx->cur_model) {
         xdna_model_objs_free(ctx);
         return;
@@ -3257,7 +3281,7 @@ static enum ggml_status xdna_graph_compute_impl(ggml_backend_xdna_context * ctx,
     // and steady/warm-up classification it sets. It wraps the entire rest of
     // this function via RAII (destructor fires on every return path).
     xdna_prof::call_timer xdna_prof_call(g_glue_n_tokens == 1);
-    if (xdna_wants_host_decode(ctx, cgraph)) {
+    if (ctx->host_prefill_models.count(ctx->cur_model) || xdna_wants_host_decode(ctx, cgraph)) {
         return xdna_host_decode_run(ctx, cgraph);
     }
 
@@ -4941,9 +4965,25 @@ static ggml_backend_dev_t ggml_backend_xdna_reg_get_device(ggml_backend_reg_t re
     return &ggml_backend_xdna_device;
 }
 
+static bool ggml_backend_xdna_set_host_prefill(ggml_backend_buffer_t weights, bool enabled) {
+    if (!weights || weights->iface.free_buffer != xdna_hb_free) {
+        return false;
+    }
+    ggml_backend_xdna_context * ctx = ggml_xdna_device_context();
+    std::lock_guard<std::recursive_mutex> compute(ctx->compute_mutex);
+    if (enabled) {
+        ctx->host_prefill_models.insert(weights);
+    } else {
+        ctx->host_prefill_models.erase(weights);
+    }
+    return true;
+}
+
 static void * ggml_backend_xdna_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (strcmp(name, "ggml_backend_xdna_set_host_prefill") == 0) {
+        return (void *) ggml_backend_xdna_set_host_prefill;
+    }
     return NULL;
 }
 
