@@ -1,10 +1,28 @@
 find_library(MATH_LIBRARY m)
 
+if (UNIX AND NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME test-xdna-artifact-install
+        COMMAND ${CMAKE_COMMAND}
+            -DGGML_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/..
+            -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/xdna-artifact-install
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-xdna-artifact-install.cmake)
+endif()
+
+add_executable(test-xdna-weight-cache ../src/ggml-xdna/tests/test-xdna-weight-cache.cpp)
+target_link_libraries(test-xdna-weight-cache PRIVATE ggml-base)
+add_test(NAME test-xdna-weight-cache COMMAND $<TARGET_FILE:test-xdna-weight-cache>)
+
 foreach(TEST_TARGET IN ITEMS test-xdna-repack test-xdna-head-rows test-xdna-match)
     if (TARGET ${TEST_TARGET})
         add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
     endif()
 endforeach()
+
+if (GGML_CPU AND (NOT GGML_BACKEND_DL OR GGML_CPU_STATIC))
+    add_executable(test-xdna-glue ../src/ggml-xdna/tests/test-xdna-glue.cpp)
+    target_link_libraries(test-xdna-glue PRIVATE ggml)
+    add_test(NAME test-xdna-glue COMMAND $<TARGET_FILE:test-xdna-glue>)
+endif()
 
 # check systems
 if (NOT UNAME_S)

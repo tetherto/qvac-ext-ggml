@@ -495,11 +495,10 @@ if (GGML_XDNA_BUILD_KERNELS)
             list(APPEND XDNA_INSTALL_ARTIFACTS "${A}")
         endif()
     endforeach()
-    # The backend looks for them next to its module, so a DL build installs them
-    # where ggml_add_backend_library installs the module, in the same component.
+    # Keep artifacts beside the backend library, or executable for static builds.
     if (GGML_BACKEND_DL AND GGML_BACKEND_DIR)
         set(XDNA_ARTIFACT_DIR ${GGML_BACKEND_DIR})
-    elseif (GGML_BACKEND_DL)
+    elseif (GGML_BACKEND_DL OR BUILD_SHARED_LIBS)
         set(XDNA_ARTIFACT_DIR ${CMAKE_INSTALL_LIBDIR})
     else()
         set(XDNA_ARTIFACT_DIR ${CMAKE_INSTALL_BINDIR})
