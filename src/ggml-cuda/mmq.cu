@@ -76,8 +76,11 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+template <bool input_affine, bool input_swiglu = false, bool upstream_affine = false>
+static void ggml_cuda_mul_mat_q_impl(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const float input_scale, const float input_bias) {
+    static_assert(!upstream_affine || input_swiglu, "upstream scaling requires SwiGLU");
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -95,6 +98,11 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+    if constexpr (input_affine) {
+        GGML_ASSERT(!ids && src0->type == GGML_TYPE_Q4_K);
+    }
+    GGML_UNUSED(input_scale);
+    GGML_UNUSED(input_bias);
 
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
@@ -135,7 +143,19 @@ void ggml_cuda_mul_mat_q(
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
-            if (use_native_fp4) {
+            if constexpr (input_affine) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                if constexpr (input_swiglu) {
+                    quantize_mmq_q8_1_swiglu_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13,
+                                                ne10_padded, ne11, ne12, ne13, input_scale, input_bias, stream, upstream_affine);
+                } else {
+                    quantize_mmq_q8_1_affine_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13,
+                                                ne10_padded, ne11, ne12, ne13, input_scale, input_bias, stream);
+                }
+#else
+                static_assert(!input_affine, "affine MMQ input quantization is CUDA-only");
+#endif
+            } else if (use_native_fp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
@@ -236,6 +256,33 @@ void ggml_cuda_mul_mat_q(
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_impl<false>(ctx, src0, src1, ids, dst, 1.0f, 0.0f);
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+void ggml_cuda_mul_mat_q_affine(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        ggml_tensor * dst, const float input_scale, const float input_bias) {
+    ggml_cuda_mul_mat_q_impl<true>(ctx, src0, src1, nullptr, dst, input_scale, input_bias);
+}
+
+void ggml_cuda_mul_mat_q_swiglu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weight, const ggml_tensor * packed,
+        const ggml_tensor * activation, ggml_tensor * dst, const float input_scale, const float input_bias, const bool upstream_affine) {
+    ggml_tensor input = *activation;
+    input.data = packed->data;
+    memcpy(input.nb, packed->nb, sizeof(input.nb));
+    if (upstream_affine) {
+        ggml_cuda_mul_mat_q_impl<true, true, true>(ctx, weight, &input, nullptr, dst, input_scale, input_bias);
+    } else {
+        ggml_cuda_mul_mat_q_impl<true, true>(ctx, weight, &input, nullptr, dst, input_scale, input_bias);
+    }
+}
+#endif
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS

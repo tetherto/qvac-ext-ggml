@@ -26,6 +26,60 @@ static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <bool modulation>
+static __global__ void h3_segment_f32(const float4 * base, const float4 * update,
+                                     const float4 * scale, const float4 * shift, float4 * output,
+                                     int width, int tokens,
+                                     int64_t b1, int64_t b2, int64_t u1, int64_t u2) {
+    ggml_cuda_pdl_lc();
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    ggml_cuda_pdl_sync();
+    if (col >= width) {
+        return;
+    }
+    const float4 x = update[int64_t(blockIdx.z) * u2 + int64_t(blockIdx.y) * u1 + col];
+    const float4 g = scale[col];
+    const float4 b = modulation ? x : base[int64_t(blockIdx.z) * b2 + int64_t(blockIdx.y) * b1 + col];
+    float4 result;
+    result.x = __fadd_rn(b.x, __fmul_rn(x.x, g.x));
+    result.y = __fadd_rn(b.y, __fmul_rn(x.y, g.y));
+    result.z = __fadd_rn(b.z, __fmul_rn(x.z, g.z));
+    result.w = __fadd_rn(b.w, __fmul_rn(x.w, g.w));
+    if constexpr (modulation) {
+        const float4 s = shift[col];
+        result.x = __fadd_rn(result.x, s.x);
+        result.y = __fadd_rn(result.y, s.y);
+        result.z = __fadd_rn(result.z, s.z);
+        result.w = __fadd_rn(result.w, s.w);
+    }
+    output[(int64_t(blockIdx.z) * tokens + blockIdx.y) * width + col] = result;
+}
+
+void ggml_cuda_op_h3_segment(ggml_backend_cuda_context & ctx,
+                            const ggml_tensor * base, const ggml_tensor * update,
+                            const ggml_tensor * scale, const ggml_tensor * shift, ggml_tensor * output) {
+    const int width = (int) update->ne[0] / 4;
+    const ggml_cuda_kernel_launch_params launch = {
+        dim3((width + 255) / 256, (unsigned int) update->ne[1], (unsigned int) update->ne[2]),
+        dim3(256), 0, ctx.stream()
+    };
+    if (shift) {
+        ggml_cuda_kernel_launch(h3_segment_f32<true>, launch,
+            (const float4 *) base->data, (const float4 *) update->data,
+            (const float4 *) scale->data, (const float4 *) shift->data, (float4 *) output->data,
+            width, (int) update->ne[1], (int64_t) (base->nb[1] / 16), (int64_t) (base->nb[2] / 16),
+            (int64_t) (update->nb[1] / 16), (int64_t) (update->nb[2] / 16));
+    } else {
+        ggml_cuda_kernel_launch(h3_segment_f32<false>, launch,
+            (const float4 *) base->data, (const float4 *) update->data,
+            (const float4 *) scale->data, (const float4 *) nullptr, (float4 *) output->data,
+            width, (int) update->ne[1], (int64_t) (base->nb[1] / 16), (int64_t) (base->nb[2] / 16),
+            (int64_t) (update->nb[1] / 16), (int64_t) (update->nb[2] / 16));
+    }
+}
+#endif
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
