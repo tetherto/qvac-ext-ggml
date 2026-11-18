@@ -5919,8 +5919,27 @@ static int ggml_backend_cuda_physical_device_count(void) {
     return ggml_cuda_info().physical_device_count;
 }
 
+// Private capability query for the engine's opt-in H3 residual cache. Use the
+// same process-cached graph policy as execution, including environment changes
+// made after backend initialization; a late override must not bypass capture.
+static bool ggml_backend_cuda_h3_direct_supported(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) return false;
+    const auto * ctx = static_cast<const ggml_backend_cuda_context *>(backend->context);
+    const int cc = ggml_cuda_info().devices[ctx->device].cc;
+    if (cc != GGML_CUDA_CC_BLACKWELL || ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_BLACKWELL) return false;
+#ifdef USE_CUDA_GRAPH
+    const ggml_cuda_graph policy;
+    return !policy.is_enabled();
+#else
+    return true;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_h3_direct_supported") == 0) {
+        return (void *) ggml_backend_cuda_h3_direct_supported;
+    }
     if (strcmp(name, "ggml_backend_cuda_physical_device_count") == 0) {
         return (void *) ggml_backend_cuda_physical_device_count;
     }

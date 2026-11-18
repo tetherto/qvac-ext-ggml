@@ -8,7 +8,7 @@
 
 namespace ggml_cuda_h3 {
 
-static inline bool fattn_tuning_supported(const ggml_tensor * output) {
+static inline bool fattn_tuning_supported(const ggml_tensor * output, int64_t max_tokens = 32768) {
     if (!output || output->op != GGML_OP_FLASH_ATTN_EXT || output->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(output) || output->view_src || output->src[3] || output->src[4] ||
         ggml_flash_attn_ext_get_prec(output) != GGML_PREC_F32) {
@@ -20,7 +20,7 @@ static inline bool fattn_tuning_supported(const ggml_tensor * output) {
     if (!q || !k || !v || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         !ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) ||
         !ggml_are_same_shape(q, k) || !ggml_are_same_shape(q, v) ||
-        q->ne[0] != 128 || q->ne[1] < 1024 || q->ne[1] > 32768 || q->ne[2] != 56 || q->ne[3] != 1) {
+        q->ne[0] != 128 || q->ne[1] < 1024 || q->ne[1] > max_tokens || q->ne[2] != 56 || q->ne[3] != 1) {
         return false;
     }
     if (output->ne[0] != 128 || output->ne[1] != 56 || output->ne[2] != q->ne[1] || output->ne[3] != 1) {

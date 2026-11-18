@@ -46,9 +46,13 @@ static void require(bool condition, const char *message) {
 }
 
 static std::atomic<int> replayed_fusions{0};
+static std::atomic<int> compact_selections{0};
 static int fusions_per_replay = 0;
 
 static void log_fusions(ggml_log_level, const char *text, void *user_data) {
+    if (std::strstr(text, "h3_norm_rope_compact threads=128")) {
+        ++compact_selections;
+    }
     if (std::strstr(text, "h3_norm_rope_fusion ")) {
         ++*static_cast<std::atomic<int> *>(user_data);
     }
@@ -208,11 +212,14 @@ int main(int argc, char **argv) {
         require(backend != nullptr, "CUDA0 unavailable");
         bool full = false;
         bool expect_fusion = false;
+        bool expect_compact = false;
         for (int i = 1; i < argc; ++i) {
             if (std::string(argv[i]) == "--full-shape") {
                 full = true;
             } else if (std::string(argv[i]) == "--expect-fusion") {
                 expect_fusion = true;
+            } else if (std::string(argv[i]) == "--expect-compact") {
+                expect_compact = true;
             } else {
                 throw std::runtime_error("unknown argument");
             }
@@ -234,6 +241,7 @@ int main(int argc, char **argv) {
         require((expect_fusion ? fusion_launches.load() + replayed_fusions.load() : fusion_launches.load()) ==
                     (expect_fusion ? (full ? 3 : 45) : 0),
                 "unexpected actual fusion launch count; enable fusion and tracing for --expect-fusion");
+        require((compact_selections.load() > 0) == expect_compact, "unexpected compact normalization selection");
         std::printf("NORM_ROPE host_dispatches=%d replayed_fusions=%d\n", fusion_launches.load(), replayed_fusions.load());
         ggml_log_set(nullptr, nullptr);
         ggml_backend_free(backend);

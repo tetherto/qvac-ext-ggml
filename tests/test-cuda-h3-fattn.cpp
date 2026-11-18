@@ -18,9 +18,11 @@ static void require(bool ok, const char * message) {
 }
 
 static std::atomic<int> graph_replays{0};
+static std::atomic<int> wide_launches{0};
 
 static void log_tuning(ggml_log_level, const char * message, void * opaque) {
     if (std::strstr(message, "h3_fattn_prefetch ")) ++*static_cast<std::atomic<int> *>(opaque);
+    if (std::strstr(message, "h3_fattn_prefetch ") && std::strstr(message, "wide=1")) ++wide_launches;
     if (std::strstr(message, "cuda_graph_execute ") && std::strstr(message, "mode=replay")) ++graph_replays;
     std::fputs(message, stderr);
 }
@@ -99,7 +101,16 @@ static void run_case(ggml_backend_t backend, int tokens, bool enabled) {
 
 int main(int argc, char ** argv) {
     try {
-        const bool enabled = argc == 2 && std::strcmp(argv[1], "--expect-prefetch") == 0;
+        bool enabled = false, wide = false;
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--expect-prefetch") == 0) {
+                enabled = true;
+            } else if (std::strcmp(argv[i], "--expect-wide") == 0) {
+                wide = true;
+            } else {
+                throw std::runtime_error("unknown argument");
+            }
+        }
         if (!getenv("CUDA_VISIBLE_DEVICES") || std::strcmp(getenv("CUDA_VISIBLE_DEVICES"), "0") != 0) return 77;
         int count = 0; cudaDeviceProp prop;
         if (cudaGetDeviceCount(&count) != cudaSuccess || count != 1 ||
@@ -108,10 +119,13 @@ int main(int argc, char ** argv) {
         ggml_backend_load_all();
         auto backend = ggml_backend_init_by_name("CUDA0", nullptr);
         require(backend != nullptr, "CUDA0 backend unavailable");
-        for (int tokens : {1024, 1025, 3073}) run_case(backend, tokens, enabled);
-        require(enabled ? launches + graph_replays == 9 : launches == 0,
+        for (int tokens : {1024, 1025, 1087, 1151, 2048, 3073}) run_case(backend, tokens, enabled);
+        require(enabled ? launches + graph_replays == 18 : launches == 0,
             "unexpected number of tuned attention dispatches plus captured replays");
-        std::printf("PREFETCH host_dispatches=%d graph_replays=%d\n", launches.load(), graph_replays.load());
+        require(wide ? wide_launches == 18 : wide_launches == 0,
+            "unexpected number of wide attention dispatches");
+        std::printf("PREFETCH host_dispatches=%d graph_replays=%d wide_dispatches=%d\n",
+            launches.load(), graph_replays.load(), wide_launches.load());
         ggml_backend_free(backend); ggml_log_set(nullptr, nullptr);
         return 0;
     } catch (const std::exception & error) {

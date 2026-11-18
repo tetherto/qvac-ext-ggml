@@ -35,6 +35,23 @@ if (GGML_CUDA AND TARGET ggml-cuda)
     set_tests_properties(test-cuda-h3-fattn-disabled PROPERTIES
         ENVIRONMENT "GGML_CUDA_H3_FATTN_PREFETCH=0;GGML_CUDA_H3_FATTN_TRACE=1")
     set_tests_properties(test-cuda-h3-fattn-default PROPERTIES ENVIRONMENT "GGML_CUDA_H3_FATTN_TRACE=1")
+    set_property(TEST test-cuda-h3-fattn-enabled test-cuda-h3-fattn-disabled test-cuda-h3-fattn-default
+        APPEND PROPERTY ENVIRONMENT "GGML_CUDA_H3_FATTN_WIDE=0")
+    add_test(NAME test-cuda-h3-fattn-wide COMMAND test-cuda-h3-fattn --expect-prefetch --expect-wide)
+    add_test(NAME test-cuda-h3-fattn-wide-prefetch-disabled COMMAND test-cuda-h3-fattn)
+    set_tests_properties(test-cuda-h3-fattn-wide test-cuda-h3-fattn-wide-prefetch-disabled
+        PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-cuda-h3-fattn-wide PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_FATTN_WIDE=1;GGML_CUDA_H3_FATTN_PREFETCH=1;GGML_CUDA_H3_FATTN_TRACE=1;GGML_CUDA_DISABLE_GRAPHS=1")
+    set_tests_properties(test-cuda-h3-fattn-wide-prefetch-disabled PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_FATTN_WIDE=1;GGML_CUDA_H3_FATTN_PREFETCH=0;GGML_CUDA_H3_FATTN_TRACE=1;GGML_CUDA_DISABLE_GRAPHS=1")
+    if (GGML_CUDA_GRAPHS)
+        add_test(NAME test-cuda-h3-fattn-wide-graph-fallback
+            COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_CUDA_DISABLE_GRAPHS
+            $<TARGET_FILE:test-cuda-h3-fattn> --expect-prefetch)
+        set_tests_properties(test-cuda-h3-fattn-wide-graph-fallback PROPERTIES SKIP_RETURN_CODE 77
+            ENVIRONMENT "GGML_CUDA_H3_FATTN_WIDE=1;GGML_CUDA_H3_FATTN_PREFETCH=1;GGML_CUDA_H3_FATTN_TRACE=1;GGML_CUDA_GRAPH_TRACE=1")
+    endif()
     add_executable(test-cuda-h3-segment test-cuda-h3-segment.cpp)
     target_include_directories(test-cuda-h3-segment PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-cuda-h3-segment PRIVATE ggml CUDA::cudart)
@@ -79,6 +96,24 @@ if (GGML_CUDA AND TARGET ggml-cuda)
         ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_FUSION=1;GGML_CUDA_H3_NORM_ROPE_TRACE=1")
     set_tests_properties(test-cuda-h3-norm-rope-disabled PROPERTIES
         ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_FUSION=0;GGML_CUDA_H3_NORM_ROPE_TRACE=1")
+    set_property(TEST test-cuda-h3-norm-rope test-cuda-h3-norm-rope-disabled
+        APPEND PROPERTY ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_COMPACT=0")
+    add_test(NAME test-cuda-h3-norm-rope-compact
+        COMMAND test-cuda-h3-norm-rope --expect-fusion --expect-compact)
+    add_test(NAME test-cuda-h3-norm-rope-compact-fusion-disabled COMMAND test-cuda-h3-norm-rope)
+    set_tests_properties(test-cuda-h3-norm-rope-compact test-cuda-h3-norm-rope-compact-fusion-disabled
+        PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-cuda-h3-norm-rope-compact PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_COMPACT=1;GGML_CUDA_H3_NORM_ROPE_FUSION=1;GGML_CUDA_H3_NORM_ROPE_TRACE=1;GGML_CUDA_GRAPH_TRACE=1")
+    set_tests_properties(test-cuda-h3-norm-rope-compact-fusion-disabled PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_COMPACT=1;GGML_CUDA_H3_NORM_ROPE_FUSION=0;GGML_CUDA_H3_NORM_ROPE_TRACE=1;GGML_CUDA_GRAPH_TRACE=1")
+    if (GGML_CUDA_GRAPHS)
+        add_test(NAME test-cuda-h3-norm-rope-compact-graph
+            COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_CUDA_DISABLE_GRAPHS
+            $<TARGET_FILE:test-cuda-h3-norm-rope> --expect-fusion --expect-compact)
+        set_tests_properties(test-cuda-h3-norm-rope-compact-graph PROPERTIES SKIP_RETURN_CODE 77
+            ENVIRONMENT "GGML_CUDA_H3_NORM_ROPE_COMPACT=1;GGML_CUDA_H3_NORM_ROPE_FUSION=1;GGML_CUDA_H3_NORM_ROPE_TRACE=1;GGML_CUDA_GRAPH_TRACE=1")
+    endif()
     set_property(TEST test-cuda-h3-fattn-enabled test-cuda-h3-fattn-disabled test-cuda-h3-fattn-default
         test-cuda-h3-segment test-cuda-h3-segment-default test-cuda-h3-segment-disabled
         test-cuda-h3-segment-global-disabled test-cuda-h3-segment-concurrent-fallback
@@ -254,6 +289,39 @@ endif()
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    add_executable(test-cuda-h3-sol test_cuda_h3_sol.cpp)
+    target_include_directories(test-cuda-h3-sol PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-cuda-h3-sol PRIVATE ggml ggml-cuda)
+    if (GGML_CUDA_GRAPHS)
+        add_test(NAME test-cuda-h3-sol COMMAND ${CMAKE_COMMAND} -E env --unset=GGML_CUDA_DISABLE_GRAPHS $<TARGET_FILE:test-cuda-h3-sol> --dense-fallback)
+        add_test(NAME test-cuda-h3-sol-direct COMMAND test-cuda-h3-sol)
+        set_tests_properties(test-cuda-h3-sol-direct PROPERTIES
+            ENVIRONMENT "GGML_CUDA_H3_SOL_ATTN_TRACE=1;GGML_CUDA_GRAPH_TRACE=1;GGML_CUDA_DISABLE_GRAPHS=1" SKIP_RETURN_CODE 77)
+    else()
+        add_test(NAME test-cuda-h3-sol COMMAND test-cuda-h3-sol)
+    endif()
+    set_tests_properties(test-cuda-h3-sol PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_SOL_ATTN_TRACE=1;GGML_CUDA_GRAPH_TRACE=1" SKIP_RETURN_CODE 77)
+    foreach(h3_primitive math routing bf16 fused)
+        add_executable(test-cuda-h3-sol-${h3_primitive} test_cuda_h3_sol_${h3_primitive}.cu)
+        target_include_directories(test-cuda-h3-sol-${h3_primitive} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        target_link_libraries(test-cuda-h3-sol-${h3_primitive} PRIVATE ggml ggml-cuda CUDA::cublas)
+        set_target_properties(test-cuda-h3-sol-${h3_primitive} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
+        add_test(NAME test-cuda-h3-sol-${h3_primitive} COMMAND test-cuda-h3-sol-${h3_primitive})
+        set_tests_properties(test-cuda-h3-sol-${h3_primitive} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
+    add_test(NAME test-cuda-h3-sol-fused-backend COMMAND test-cuda-h3-sol)
+    set_tests_properties(test-cuda-h3-sol-fused-backend PROPERTIES
+        ENVIRONMENT "GGML_CUDA_H3_SOL_FUSED_ROUTING=1;GGML_CUDA_H3_SOL_ATTN_TRACE=1;GGML_CUDA_DISABLE_GRAPHS=1" SKIP_RETURN_CODE 77)
+    foreach(h3_target test-cuda-h3-sol test-cuda-h3-sol-math test-cuda-h3-sol-routing test-cuda-h3-sol-bf16 test-cuda-h3-sol-fused)
+        if (GGML_STATIC)
+            target_link_libraries(${h3_target} PRIVATE CUDA::cudart_static)
+            set_target_properties(${h3_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+        else()
+            target_link_libraries(${h3_target} PRIVATE CUDA::cudart)
+            set_target_properties(${h3_target} PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+        endif()
+    endforeach()
     add_executable(test-cuda-mmq-scale test-cuda-mmq-scale.cu)
     add_executable(test-cuda-h3-swiglu-quant test-cuda-h3-swiglu-quant.cu)
     if (GGML_CUDA_GRAPHS)

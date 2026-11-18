@@ -155,6 +155,7 @@ static __global__ void rms_norm_f32(const float * x,
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template<int block_size>
 static __global__ void h3_norm_rope_f32(
         const float * input, const float * weight, const float * pe, float * output,
         int ncols, int nheads, int ntokens, int rotation, float eps,
@@ -170,12 +171,12 @@ static __global__ void h3_norm_rope_f32(
     float * dst = output + ((int64_t(batch) * nheads + head) * ntokens + token) * ncols;
     float tmp = 0.f;
     ggml_cuda_pdl_sync();
-    for (int col = tid; col < ncols; col += 256) {
+    for (int col = tid; col < ncols; col += block_size) {
         const float xi = x[col];
         tmp += xi * xi;
     }
     extern __shared__ float s_sum[];
-    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
     const float mean = tmp / ncols;
     const float scale = rsqrtf(mean + eps);
     const int half = rotation / 2;
@@ -200,11 +201,25 @@ void ggml_cuda_op_h3_norm_rope(ggml_backend_cuda_context & ctx,
                                const ggml_tensor * pe,
                                ggml_tensor * output,
                                int rotation, float eps) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_H3_NORM_ROPE_COMPACT");
+        return value && strcmp(value, "1") == 0;
+    }();
+    const bool compact = enabled && input->ne[0] == 128 &&
+        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL;
+    if (compact) {
+        static const bool logged = [] {
+            GGML_LOG_INFO("h3_norm_rope_compact threads=128\n");
+            return true;
+        }();
+        GGML_UNUSED(logged);
+    }
     const int64_t rows = input->ne[1] * input->ne[2] * input->ne[3];
     const ggml_cuda_kernel_launch_params launch = {
-        dim3((unsigned int) rows), dim3(256), 32 * sizeof(float), ctx.stream()
+        dim3((unsigned int) rows), dim3(compact ? 128 : 256), 32 * sizeof(float), ctx.stream()
     };
-    ggml_cuda_kernel_launch(h3_norm_rope_f32, launch,
+    auto kernel = compact ? h3_norm_rope_f32<128> : h3_norm_rope_f32<256>;
+    ggml_cuda_kernel_launch(kernel, launch,
         (const float *) input->data, (const float *) weight->data, (const float *) pe->data,
         (float *) output->data, (int) input->ne[0], (int) input->ne[1], (int) input->ne[2], rotation, eps,
         (int64_t) (input->nb[1] / sizeof(float)), (int64_t) (input->nb[2] / sizeof(float)),
