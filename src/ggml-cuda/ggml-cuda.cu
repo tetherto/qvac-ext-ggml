@@ -3482,9 +3482,11 @@ static bool ggml_cuda_can_fuse_scale_residual_gfx1151(ggml_backend_cuda_context 
             return false;
         }
     }
-    if (value->ne[0] != 5376 || value->ne[1] < 1 || value->ne[1] > 15429 ||
+    if (value->ne[0] != GGML_CUDA_H3_HIDDEN_SIZE ||
+        value->ne[1] < 1 || value->ne[1] > GGML_CUDA_H3_MAX_VALIDATED_ROWS ||
         value->ne[2] != 1 || value->ne[3] != 1 ||
-        scale->ne[0] != 5376 || scale->ne[1] != 1 || scale->ne[2] != 1 || scale->ne[3] != 1 ||
+        scale->ne[0] != GGML_CUDA_H3_HIDDEN_SIZE ||
+        scale->ne[1] != 1 || scale->ne[2] != 1 || scale->ne[3] != 1 ||
         !ggml_are_same_shape(value, product) || !ggml_are_same_shape(value, dst)) {
         return false;
     }

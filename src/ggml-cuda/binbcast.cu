@@ -7,10 +7,10 @@ static __global__ void scale_residual_gfx1151(const float * value, const float *
 #if defined(__gfx1151__)
     const unsigned int column = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int row = blockIdx.y;
-    if (column >= 5376 || row >= (unsigned int) rows) {
+    if (column >= GGML_CUDA_H3_HIDDEN_SIZE || row >= (unsigned int) rows) {
         return;
     }
-    const size_t index = size_t(row) * 5376 + column;
+    const size_t index = size_t(row) * GGML_CUDA_H3_HIDDEN_SIZE + column;
     const float x = value[index];
     const float s = scale[column];
     float product, result;
@@ -33,8 +33,10 @@ void ggml_cuda_op_scale_residual_gfx1151(ggml_backend_cuda_context & ctx,
                                       const ggml_tensor * value,
                                       const ggml_tensor * scale,
                                       ggml_tensor * dst) {
-    const ggml_cuda_kernel_launch_params launch_params(dim3(21, (unsigned int) dst->ne[1], 1),
-                                                       dim3(256, 1, 1), size_t(0), ctx.stream());
+    constexpr unsigned int threads = 256;
+    constexpr unsigned int blocks = (GGML_CUDA_H3_HIDDEN_SIZE + threads - 1) / threads;
+    const ggml_cuda_kernel_launch_params launch_params(dim3(blocks, (unsigned int) dst->ne[1], 1),
+                                                       dim3(threads, 1, 1), size_t(0), ctx.stream());
     ggml_cuda_kernel_launch(scale_residual_gfx1151, launch_params,
                            (const float *) value->data, (const float *) scale->data,
                            (float *) dst->data, (int) dst->ne[1]);

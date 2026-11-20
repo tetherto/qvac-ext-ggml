@@ -1201,7 +1201,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
-            if constexpr (DKQ == 128 && DV == 128 && ncols2 == 1 && !use_logit_softcap) {
+            if constexpr ((DKQ | DV) == 128 && ncols2 == 1 && !use_logit_softcap) {
                 // gfx1151 H3 requests F32 accumulation for the long, maskless equal-head path.
                 if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32 &&
                     dst->src[3] == nullptr && dst->src[4] == nullptr && Q->ne[2] == dst->src[1]->ne[2]) {
