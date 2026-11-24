@@ -2120,6 +2120,15 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // With split_half=true, rotate corresponding elements from the two channel
+    // halves and retain that ordering in the result, avoiding layout copies.
+    // split_half=false is equivalent to ggml_rope_flux.
+    GGML_API struct ggml_tensor * ggml_rope_flux_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            bool                  split_half);
+
     // compute correction dims for YaRN RoPE scaling
     GGML_API void ggml_rope_yarn_corr_dims(
         int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, float dims[2]);

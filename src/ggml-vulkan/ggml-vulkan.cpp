@@ -20852,7 +20852,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_ROPE_FLUX: {
             const ggml_tensor * x = op->src[0];
             const ggml_tensor * pe = op->src[1];
-            if (!x || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+            if (op->op_params[0] != 0 || !x || x->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
                 !ggml_is_contiguous(op) || x->ne[0] <= 0 || (x->ne[0] % 2) != 0 ||
                 op->ne[0] != x->ne[0] || op->ne[1] != x->ne[2] ||
                 op->ne[2] != x->ne[1] * x->ne[3] || op->ne[3] != 1 ||
@@ -22377,7 +22377,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (tensor->op == GGML_OP_DIAG_MASK_INF) {
             tensor_clone = ggml_diag_mask_inf(ggml_ctx, src_clone[0], tensor->op_params[0]);
         } else if (tensor->op == GGML_OP_ROPE_FLUX) {
-            tensor_clone = ggml_rope_flux(ggml_ctx, src_clone[0], src_clone[1]);
+            tensor_clone = ggml_rope_flux_ext(ggml_ctx, src_clone[0], src_clone[1], tensor->op_params[0] != 0);
         } else if (tensor->op == GGML_OP_ROPE || tensor->op == GGML_OP_ROPE_BACK) {
             const int n_dims      = ((int32_t *) tensor->op_params)[1];
             const int mode        = ((int32_t *) tensor->op_params)[2];
