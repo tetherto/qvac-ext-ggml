@@ -1537,7 +1537,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROPE_BACK:
             return true;
         case GGML_OP_ROPE_FLUX:
-            if (op->src[0] == nil || op->src[0]->type != GGML_TYPE_F32 ||
+            if (op->op_params[0] != 0 || op->src[0] == nil || op->src[0]->type != GGML_TYPE_F32 ||
                     op->src[0]->ne[0] <= 0 || op->src[0]->ne[1] <= 0 || op->src[0]->ne[2] <= 0 || op->src[0]->ne[3] <= 0 ||
                     op->src[0]->ne[0] % 2 != 0 ||
                     ggml_nelements(op) > INT32_MAX) {

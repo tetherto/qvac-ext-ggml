@@ -4724,10 +4724,11 @@ static float ggml_rope_yarn_corr_dim(int n_dims, int n_ctx_orig, float n_rot, fl
     return n_dims * logf(n_ctx_orig / (n_rot * 2 * (float)M_PI)) / (2 * logf(base));
 }
 
-struct ggml_tensor * ggml_rope_flux(
+struct ggml_tensor * ggml_rope_flux_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
+        struct ggml_tensor  * b,
+        bool                  split_half) {
     // a: [d_head, n_head, L, N]
     // b: [2, 2, d_head/2, L] (precomputed PE), or NULL for permute-only (no rotation)
     // result: [d_head, L, N*n_head]
@@ -4757,7 +4758,17 @@ struct ggml_tensor * ggml_rope_flux(
     result->src[0] = a;
     result->src[1] = b;
 
+    const int32_t mode = split_half ? 1 : 0;
+    ggml_set_op_params(result, &mode, sizeof(mode));
+
     return result;
+}
+
+struct ggml_tensor * ggml_rope_flux(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    return ggml_rope_flux_ext(ctx, a, b, false);
 }
 
 void ggml_rope_yarn_corr_dims(

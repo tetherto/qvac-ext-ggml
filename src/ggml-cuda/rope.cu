@@ -20,7 +20,7 @@ static __device__ __forceinline__ float rope_flux_dot(float x0, float p0, float 
 #endif
 }
 
-template <bool has_pe>
+template <bool has_pe, bool split_half = false>
 static __global__ void rope_flux_f32(
         const char * x, const char * pe, float * dst,
         const int d_head, const int n_head, const int length,
@@ -33,11 +33,15 @@ static __global__ void rope_flux_f32(
     const int pair = i % (d_head / 2);
     const int token = (i / (d_head / 2)) % length;
     const int batch_head = i / ((d_head / 2) * length);
+    const int d0 = split_half ? pair : 2 * pair;
+    const int d1 = split_half ? pair + d_head / 2 : 2 * pair + 1;
     const size_t offset = (batch_head / n_head) * strides.x[3] +
         token * strides.x[2] + (batch_head % n_head) * strides.x[1] +
-        (2 * pair) * strides.x[0];
+        d0 * strides.x[0];
     const float even = *reinterpret_cast<const float *>(x + offset);
-    const float odd = *reinterpret_cast<const float *>(x + offset + strides.x[0]);
+    const float odd = *reinterpret_cast<const float *>(x + offset + (d1 - d0) * strides.x[0]);
+    const int out0 = split_half ? (i / (d_head / 2)) * d_head + d0 : 2 * i;
+    const int out1 = split_half ? out0 + d_head / 2 : 2 * i + 1;
 
     if (has_pe) {
         const char * p = pe + token * strides.pe[3] + pair * strides.pe[2];
@@ -46,11 +50,11 @@ static __global__ void rope_flux_f32(
         const float p10 = *reinterpret_cast<const float *>(p + strides.pe[1]);
         const float p11 = *reinterpret_cast<const float *>(p + strides.pe[0] + strides.pe[1]);
         // Preserve the separate products and sum used by the unfused graph.
-        dst[2 * i]     = rope_flux_dot(even, p00, odd, p01);
-        dst[2 * i + 1] = rope_flux_dot(even, p10, odd, p11);
+        dst[out0] = rope_flux_dot(even, p00, odd, p01);
+        dst[out1] = rope_flux_dot(even, p10, odd, p11);
     } else {
-        dst[2 * i] = even;
-        dst[2 * i + 1] = odd;
+        dst[out0] = even;
+        dst[out1] = odd;
     }
 }
 
@@ -69,7 +73,17 @@ void ggml_cuda_op_rope_flux(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int pairs = ggml_nelements(dst) / 2;
     const dim3 blocks((pairs + CUDA_ROPE_BLOCK_SIZE - 1) / CUDA_ROPE_BLOCK_SIZE);
     const char * x_data = static_cast<const char *>(x->data);
-    if (pe) {
+    if (dst->op_params[0] != 0) {
+        if (pe) {
+            rope_flux_f32<true, true><<<blocks, CUDA_ROPE_BLOCK_SIZE, 0, ctx.stream()>>>(
+                    x_data, static_cast<const char *>(pe->data), static_cast<float *>(dst->data),
+                    x->ne[0], x->ne[1], x->ne[2], pairs, strides);
+        } else {
+            rope_flux_f32<false, true><<<blocks, CUDA_ROPE_BLOCK_SIZE, 0, ctx.stream()>>>(
+                    x_data, nullptr, static_cast<float *>(dst->data),
+                    x->ne[0], x->ne[1], x->ne[2], pairs, strides);
+        }
+    } else if (pe) {
         GGML_ASSERT(pe->type == GGML_TYPE_F32);
         rope_flux_f32<true><<<blocks, CUDA_ROPE_BLOCK_SIZE, 0, ctx.stream()>>>(
             x_data, static_cast<const char *>(pe->data), static_cast<float *>(dst->data),

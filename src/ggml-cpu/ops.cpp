@@ -6838,6 +6838,7 @@ void ggml_compute_forward_rope_flux(
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    const bool split_half = dst->op_params[0] != 0;
 
     GGML_ASSERT(src0 != NULL);
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
@@ -6892,21 +6893,23 @@ void ggml_compute_forward_rope_flux(
         }
 
         for (int64_t pair = 0; pair < d_head / 2; ++pair) {
-            const char * src0_pair = src0_row + (2 * pair) * src0->nb[0];
+            const int64_t d0 = split_half ? pair : 2 * pair;
+            const int64_t d1 = split_half ? pair + d_head / 2 : 2 * pair + 1;
+            const char * src0_pair = src0_row + d0 * src0->nb[0];
             const char * src1_pair = src1_data +
                 l * src1->nb[3] +
                 pair * src1->nb[2];
 
             const float x_even = *(const float *) src0_pair;
-            const float x_odd  = *(const float *) (src0_pair + src0->nb[0]);
+            const float x_odd  = *(const float *) (src0_row + d1 * src0->nb[0]);
 
             const float pe_00 = *(const float *) src1_pair;
             const float pe_10 = *(const float *) (src1_pair + src1->nb[0]);
             const float pe_01 = *(const float *) (src1_pair + src1->nb[1]);
             const float pe_11 = *(const float *) (src1_pair + src1->nb[1] + src1->nb[0]);
 
-            dst_row[2 * pair]     = x_even * pe_00 + x_odd * pe_10;
-            dst_row[2 * pair + 1] = x_even * pe_01 + x_odd * pe_11;
+            dst_row[d0] = x_even * pe_00 + x_odd * pe_10;
+            dst_row[d1] = x_even * pe_01 + x_odd * pe_11;
         }
     }
 }
