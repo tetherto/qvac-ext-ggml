@@ -1427,6 +1427,13 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#ifdef GGML_CUDA_CUDNN_SDPA
+struct ggml_cuda_cudnn_sdpa_plan;
+struct ggml_cuda_cudnn_sdpa_deleter {
+    void operator()(ggml_cuda_cudnn_sdpa_plan * plan) const;
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1436,6 +1443,9 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+#ifdef GGML_CUDA_CUDNN_SDPA
+    std::unique_ptr<ggml_cuda_cudnn_sdpa_plan, ggml_cuda_cudnn_sdpa_deleter> cudnn_sdpa;
+#endif
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

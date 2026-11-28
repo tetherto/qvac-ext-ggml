@@ -88,6 +88,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -974,6 +975,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+#ifdef GGML_CUDA_CUDNN_SDPA
+    if (cudnn_sdpa) {
+        ggml_cuda_set_device(device);
+        cudnn_sdpa.reset();
+    }
+#endif
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -2130,6 +2137,39 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+#if defined(GGML_CUDA_CUDNN_SDPA) && !defined(GGML_CUDA_FORCE_MMQ)
+static bool ggml_cuda_h3_bf16_projection_enabled(
+        const ggml_backend_cuda_context & ctx, const ggml_tensor * weights, const ggml_tensor * input) {
+    if (weights->type != GGML_TYPE_Q4_K || input->ne[1] < 1024 || input->ne[2] != 1 || input->ne[3] != 1 ||
+        weights->ne[2] != 1 || weights->ne[3] != 1 || ctx.curr_stream_no != 0 ||
+        !ggml_cuda_h3_cudnn_sdpa_enabled(ctx.device)) {
+        return false;
+    }
+    constexpr char prefix[] = "model.diffusion_model.blocks.";
+    const char * name = ggml_get_name(weights);
+    if (std::strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+        return false;
+    }
+    const char * layer = name + sizeof(prefix) - 1;
+    const size_t digits = std::strspn(layer, "0123456789");
+    if (digits == 0) {
+        return false;
+    }
+    const char * projection = layer + digits;
+    const int64_t k = weights->ne[0];
+    const int64_t rows = weights->ne[1];
+    const bool qualified =
+        (k == 5376 && rows == 21504 && std::strcmp(projection, ".attn.qkv_proj.weight") == 0) ||
+        (k == 7168 && rows ==  5376 && std::strcmp(projection, ".attn.out_proj.weight") == 0) ||
+        (k == 5376 && rows == 28672 && std::strcmp(projection, ".mlp.fc1.weight") == 0) ||
+        (k == 14336 && rows == 5376 && std::strcmp(projection, ".mlp.fc2.weight") == 0);
+    const char * enable = std::getenv("GGML_CUDA_H3_BF16_PROJECTIONS");
+    const char * precision = std::getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+    return qualified && (!enable || std::strcmp(enable, "1") == 0) &&
+        (!precision || std::strcmp(precision, "auto") == 0);
+}
+#endif
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2168,6 +2208,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+#if defined(GGML_CUDA_CUDNN_SDPA) && !defined(GGML_CUDA_FORCE_MMQ)
+    if (dst->op_params[0] != GGML_PREC_F32 && ggml_cuda_h3_bf16_projection_enabled(ctx, src0, src1)) {
+        static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+        if (!logged.test_and_set(std::memory_order_relaxed)) {
+            GGML_LOG_INFO("H3 BF16 cuBLAS projections active on Spark\n");
+        }
+        ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst);
+        return;
+    }
+#endif
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -5735,8 +5785,20 @@ static int ggml_backend_cuda_physical_device_count(void) {
     return ggml_cuda_info().physical_device_count;
 }
 
+#ifdef GGML_CUDA_CUDNN_SDPA
+static bool ggml_backend_cuda_h3_cudnn_sdpa_enabled(ggml_backend_dev_t dev) {
+    const auto * ctx = static_cast<const ggml_backend_cuda_device_context *>(dev->context);
+    return ggml_cuda_h3_cudnn_sdpa_enabled(ctx->device);
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifdef GGML_CUDA_CUDNN_SDPA
+    if (strcmp(name, "ggml_backend_cuda_h3_cudnn_sdpa_enabled") == 0) {
+        return (void *) ggml_backend_cuda_h3_cudnn_sdpa_enabled;
+    }
+#endif
     if (strcmp(name, "ggml_backend_cuda_physical_device_count") == 0) {
         return (void *) ggml_backend_cuda_physical_device_count;
     }
